@@ -39,8 +39,8 @@ crate at a release's git tag and compile it themselves; the web gets a WebAssemb
 
 ## Using a call
 
-A native app builds the engine (sidevoice-engine's README says how), a microphone and speaker (`AudioIo`), and a
-configuration, and runs the call on its Tokio runtime:
+A native app builds the engine (sidevoice-engine's README says how) and a configuration, and runs the call on its
+Tokio runtime with the device's own microphone and speaker (`NativeIo`, or any other `AudioIo`):
 
 ```rust
 let config: VoiceConfig = serde_json::from_value(json!({
@@ -49,7 +49,7 @@ let config: VoiceConfig = serde_json::from_value(json!({
     "tts": {"model": "kokoro-82m-v1.0", "voice": "ef_dora"},
     "patience": "normal",
 }))?;
-let (call, mut events) = VoiceCall::new(engine, io, config);
+let (call, mut events) = VoiceCall::new(engine, Box::new(NativeIo::new()), config);
 call.start(); // loads the models, opens the microphone and the speaker, listens
 while let Some(event) = events.next().await {
     match event {
@@ -79,6 +79,23 @@ mirror the Rust methods (`src/web.rs`).
 - **`AudioIo`** is the microphone and the speaker: capture arrives as 16 kHz mono samples with the echo of the call's
   own playback already cancelled, and the speaker plays a reply's chunks in order and says when each starts and ends
   (that is the clock of the heard position).
+
+## Echo cancellation
+
+The call cancels the echo of its own playback, never relying on the operating system's (sidevoice-core#89).
+
+- **Natively** (`NativeIo`, `src/io/native.rs`), WebRTC's AEC3 (`webrtc-audio-processing`, its C++ built with the
+  crate). The microphone's samples go to mono, to 16 kHz and into 10 ms frames, and each frame passes AEC3 before
+  the detector. The reference is the playback itself, taken at the moment the speaker's callback takes it (the same
+  moment that moves the heard position), at the speaker's rate, to 16 kHz. Capture and reference go in step; AEC3
+  estimates the delay left between them (the output buffer, the room, the input buffer). The same processing applies
+  the high-pass filter, moderate noise suppression and the adaptive digital gain, as the browser does with its
+  constraints. The devices' callbacks only move samples through lock-free rings; the C++ runs on the module's audio
+  thread, never in a callback. A device that changes under a stream starts the canceller over; one that goes away
+  stops the call with `audio-device-unavailable`.
+- **In the browser**, the browser's own: the page's microphone asks `getUserMedia` for `echoCancellation`, and no
+  canceller is linked into the wasm32 build, so audio is never processed twice.
+- **Windows** is out of the beta: the canceller's C++ does not build there yet.
 
 ## What the call does
 
@@ -122,8 +139,8 @@ and lets every other room message through.
 
 The state machine and its task, with the engine on both platforms: natively the engine crate, in the browser the
 page's `WebEngine`. The engine is pinned to sidevoice-engine#71 (the `vad` capability) until a release carries it.
-Still to come: the native microphone and speaker with echo cancellation (cpal and WebRTC AEC3), the browser's
-(`getUserMedia` and Web Audio), and the npm package.
+The device's microphone and speaker natively, with AEC3 (macOS and Linux). Still to come: the browser's (`getUserMedia`
+and Web Audio), and the npm package.
 
 ## Layout
 
@@ -141,7 +158,11 @@ src/            the crate sidevoice-voice
   voice_call.rs   VoiceCall, the task around the state machine
   models.rs       the models as the task uses them; models/engine.rs (native: the engine crate),
                   models/web.rs (wasm32: the page's WebEngine)
-  io.rs           AudioIo, the microphone and the speaker
+  io.rs           AudioIo, the microphone and the speaker; io/native.rs, NativeIo (cpal), with io/native/output.rs
+                  (what the output callback plays, and where each chunk is) and io/native/pipeline.rs (the capture
+                  through the echo canceller)
+  audio.rs        mono, resampling and 10 ms frames, natively
+  echo.rs         echo cancellation: echo/native.rs (AEC3), echo/web.rs (the browser's)
   runtime.rs      spawning, sleeping and clocks; runtime/native.rs (Tokio), runtime/web.rs (the browser)
   web.rs          the bridge to JavaScript, only in the wasm32 build
   maybe_send.rs   Send and Sync in native builds only
@@ -153,11 +174,15 @@ build.rs        the two cfg aliases: web, native
 
 You need Rust 1.98.1 (the version `.github/actions/setup` installs). A native build compiles sidevoice-engine with
 it, and so needs what the engine's does (its README, "Build and test"): CMake, a C++ compiler and libclang for
-whisper.cpp, and the libstdc++ ABI line of `.cargo/config.toml` on Linux x86_64. The wasm32 build links no engine:
-it reaches the page's.
+whisper.cpp, and the libstdc++ ABI line of `.cargo/config.toml` on Linux x86_64. WebRTC's audio processing needs meson,
+ninja and pkg-config, and cpal needs ALSA's development files on Linux (`libasound2-dev`). The wasm32 build links no
+engine and no canceller: it reaches the page's.
 
 The tests drive the state machine with the recorded clips of `tests/fixtures` and a detector on energy, and the task
-with fake models and a fake microphone and speaker; nothing is downloaded. The whole call with real models, on the
+with fake models and a fake microphone and speaker; nothing is downloaded. The echo canceller runs on the same clips:
+one plays as the reply and comes back through a room with reflections, the other speaks over it. The native
+microphone and speaker are tested without devices: what the output callback plays, how a stop fades and what it
+drops, when each chunk starts and ends, and the capture through the canceller at the devices' rates. The whole call with real models, on the
 same clips, is ignored unless asked for (about 300 MB of models the first time, kept in `$SIDEVOICE_TEST_MODELS`);
 CI runs it on macOS and Linux:
 

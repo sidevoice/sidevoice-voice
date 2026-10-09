@@ -1,8 +1,8 @@
 name: Set up the Rust build
 description: >-
-  Installs the pinned Rust toolchain (with rustfmt and Clippy) and restores the build cache. With `wasm: true`, also
-  the wasm32 target and the wasm-bindgen CLI (`wasm-bindgen`, and `wasm-bindgen-test-runner`, the wasm32 tests' runner
-  in .cargo/config.toml).
+  Installs the pinned Rust toolchain (with rustfmt and Clippy) and the native build's system tools (meson, ninja,
+  pkg-config, and ALSA on Linux), and restores the build cache. With `wasm: true`, also the wasm32 target and the
+  wasm-bindgen CLI (`wasm-bindgen`, and `wasm-bindgen-test-runner`, the wasm32 tests' runner in .cargo/config.toml).
 
 inputs:
   wasm:
@@ -22,6 +22,15 @@ runs:
         rustup toolchain install "$RUST_VERSION" --profile minimal --component clippy --component rustfmt
         if [ "$WASM" = true ]; then rustup target add --toolchain "$RUST_VERSION" wasm32-unknown-unknown; fi
         echo "RUSTUP_TOOLCHAIN=$RUST_VERSION" >> "$GITHUB_ENV"
+    # The native build's system tools: WebRTC's audio processing builds its C++ with meson and ninja (the
+    # `bundled` switch of webrtc-audio-processing), and cpal links ALSA on Linux. CMake, a C++ compiler and libclang
+    # (whisper.cpp, through the engine) are on the runners already.
+    - if: runner.os == 'Linux'
+      shell: bash
+      run: sudo apt-get update -qq && sudo apt-get install -y -qq meson ninja-build pkg-config libasound2-dev
+    - if: runner.os == 'macOS'
+      shell: bash
+      run: brew install meson ninja pkg-config
     - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       with:
         key: ${{ inputs.wasm == 'true' && 'wasm' || '' }}
