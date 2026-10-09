@@ -47,7 +47,8 @@ const io = {
   stop() {},
 };
 
-const config = { vad: { model: vad }, stt: { model: stt }, tts: { model: tts } };
+// Models that leave memory as the call stops, so no timer of theirs keeps Node running after the last check.
+const config = { vad: { model: vad }, stt: { model: stt }, tts: { model: tts }, idle_unload_minutes: 0 };
 const call = VoiceCall.create(engine, config, { io });
 let state = null;
 const errors = [];
@@ -76,9 +77,17 @@ host.unknown = await code(voice.setSettings({ stt: { model: "nope" }, tts: { mod
 host.wrongTask = await code(voice.setSettings({ stt: { model: tts }, tts: { model: tts } }));
 host.buildUnfit = await code(voice.setSettings({ stt: { model: stt, build: "nope" }, tts: { model: tts } }));
 host.smartTurn = await code(voice.setSettings({ stt: { model: stt }, tts: { model: tts }, end_of_turn: "smart-turn" }));
-await voice.setSettings({ stt: { model: stt, build: stt + "/smoke", language: "es" }, tts: { model: tts }, patience: "fast" });
+await voice.setSettings({
+  stt: { model: stt, build: stt + "/smoke", language: "es" }, tts: { model: tts }, patience: "fast", idle_unload_minutes: 0,
+});
 host.started = await code(voice.start());
 host.again = await code(voice.start());
+await voice.stop();
+await new Promise((resolve) => setTimeout(resolve, 50));
+// With 0 idle minutes the models left memory as the call stopped: the next start loads the three stages again.
+const loadsBefore = loaded.length;
+await voice.start();
+host.reloaded = loaded.length - loadsBefore;
 await voice.stop();
 await new Promise((resolve) => setTimeout(resolve, 50));
 host.states = states;

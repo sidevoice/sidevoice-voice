@@ -86,6 +86,7 @@ export function createVoiceHost(engine, options = {}) {
         stt: { model: stt.model, build: stt.build ?? null, language: stt.language ?? null },
         tts: { model: tts.model, build: tts.build ?? null, voice: tts.voice ?? null, speed: tts.speed ?? 1 },
         end_of_turn: endOfTurn,
+        ...(settings.idle_unload_minutes != null ? { idle_unload_minutes: settings.idle_unload_minutes } : {}),
         ...(settings.patience ? { patience: settings.patience } : {}),
       };
       if (call) {

@@ -35,8 +35,8 @@ remote alike, and holds no socket: the app carries its messages to the room and 
 | [sidevoice-web](https://github.com/sidevoice/sidevoice-web) | The call interface the app bundles; in a browser it runs this crate's WebAssembly build, `@sidevoice/voice`. |
 
 One Rust repository, one version, shaped like sidevoice-engine. Native consumers (the desktop app) depend on the
-crate at a release's git tag and compile it themselves; the web gets a WebAssembly build, published on npm as
-`@sidevoice/voice`. The design is [sidevoice-core#89](https://github.com/sidevoice/sidevoice-core/issues/89).
+crate at a release's git tag and compile it themselves; the web gets a WebAssembly build on npm as `@sidevoice/voice`,
+staged by each release and approved by the operator (RELEASING.md). The design is [sidevoice-core#89](https://github.com/sidevoice/sidevoice-core/issues/89).
 
 ## Using a call
 
@@ -90,11 +90,13 @@ Their failures are errors with stable codes: `microphone-denied`, `microphone-un
 - **The configuration** (`VoiceConfig`, read strictly from JSON) names the engine model of each stage (`vad`, `stt`,
   `tts`, with an optional `build`, and the language, voice and speed), what ends a turn (`end_of_turn`: `silence`, or
   `smart-turn` once the engine has it, sidevoice-engine#69), the `patience` (`fast`, `normal`, `calm`), the grace before
-  a reply (`audio_grace_ms`, 1 s) and the listening bar. Local and remote models are configured alike: the engine
+  a reply (`audio_grace_ms`, 1 s), the listening bar, and how long the models stay in memory with the call stopped
+  (`idle_unload_minutes`, 10; 0 unloads them as it stops). Local and remote models are configured alike: the engine
   has one catalogue for both, and a remote provider's key goes from the app's key store to the engine, never here.
 - **`start` loads the models**, installing them if they are not; to show download progress, install them through
-  the engine first. A model that cannot load, and every other failure a person may be told of, is a
-  `VoiceEvent::Error` with a stable code.
+  the engine first. They stay loaded across stops, and leave memory once the call has been stopped for
+  `idle_unload_minutes`; the next start loads them again, on the web as natively. A model that cannot load, and
+  every other failure a person may be told of, is a `VoiceEvent::Error` with a stable code.
 - **`AudioIo`** is the microphone and the speaker: capture arrives as 16 kHz mono samples with the echo of the call's
   own playback already cancelled, and the speaker plays a reply's chunks in order and says when each starts and ends
   (that is the clock of the heard position).
@@ -136,8 +138,8 @@ What both promise, beyond the types:
 - **Settings** name a model per stage and optionally its build (one of the model's `available` builds, else
   `build-unfit`), the language, voice and speed, the patience and the end of turn (`smart-turn` only with a model of
   the `end-of-turn` capability, else `end-of-turn-unavailable`). A rejected `setSettings` changes nothing. While the
-  call runs, a change to any stage restarts it (the open turn cancelled, the reply interrupted); patience and end of
-  turn apply live.
+  call runs, a change to any stage restarts it (the open turn cancelled, the reply interrupted); patience, end of
+  turn and `idle_unload_minutes` (how long the models stay in memory with the call stopped; 10 by default) apply live.
 - **`models()`** is `WebEngine.models()`'s list on both hosts. A remote build has `accelerator: "remote"`, and its
   `backend` is the provider id that `setProviderKey` takes (`openai`, `elevenlabs`); its `installed` says whether the
   host has that key. The engine asks the host for a key each time it needs one, so a key set takes effect at once.

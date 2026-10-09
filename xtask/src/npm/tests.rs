@@ -7,9 +7,40 @@ fn a_release_goes_to_latest_and_a_candidate_to_next() {
 }
 
 #[test]
-fn trusted_publishing_needs_npm_11_5_1() {
-    assert!(npm_can_publish("11.5.1") && npm_can_publish("11.10.0"));
-    assert!(!npm_can_publish("11.5.0") && !npm_can_publish("10.9.2"));
+fn the_stage_id_is_read_from_npm_s_report() {
+    let report = r#"{"@sidevoice/voice": {"id": "@sidevoice/voice@0.1.0", "stageId": "abc-123"}}"#;
+    assert_eq!(stage_id(report).as_deref(), Some("abc-123"));
+    assert_eq!(stage_id("not json"), None);
+}
+
+#[test]
+fn a_staged_version_is_found_unless_rejected_or_approved() {
+    let list = r#"[
+        {"id": "s-1", "packageName": "@sidevoice/voice", "version": "0.1.0", "status": "rejected", "shasum": "aa"},
+        {"id": "s-2", "packageName": "@sidevoice/engine", "version": "0.1.0", "status": "pending", "shasum": "bb"},
+        {"id": "s-3", "packageName": "@sidevoice/voice", "version": "0.1.0", "status": "pending", "shasum": "cc"}
+    ]"#;
+    let found = staged(list, "0.1.0").unwrap();
+    assert_eq!((found.id.as_str(), found.shasum.as_str()), ("s-3", "cc"));
+    assert_eq!(staged(list, "0.2.0"), None);
+    assert_eq!(staged("[]", "0.1.0"), None);
+    assert_eq!(staged("not json", "0.1.0"), None);
+}
+
+#[test]
+fn a_conflict_means_the_version_is_staged_already() {
+    assert!(already_staged(
+        "npm error code E409\nnpm error 409 Conflict - PUT https://registry.npmjs.org/-/stage"
+    ));
+    assert!(already_staged("this version is already staged"));
+    assert!(!already_staged(
+        "npm error code E403\nnpm error 403 Forbidden"
+    ));
+}
+
+#[test]
+fn the_shasum_is_npm_s_sha1() {
+    assert_eq!(sha1_hex(b"abc"), "a9993e364706816aba3e25717850c26c9cd0d89d");
 }
 
 #[test]
@@ -54,7 +85,7 @@ fn a_smoke_report_must_show_a_running_call() {
         "webAudioIo": "function",
         "host": {
             "missing": "settings-missing", "unknown": "model-unknown", "wrongTask": "model-wrong-task",
-            "buildUnfit": "build-unfit", "smartTurn": "end-of-turn-unavailable",
+            "buildUnfit": "build-unfit", "smartTurn": "end-of-turn-unavailable", "reloaded": 3,
             "started": "resolved", "again": "resolved", "states": ["idle", "listening", "idle"],
             "keys": [true, "sk-smoke", false], "seam": SEAM,
         },
@@ -76,6 +107,7 @@ fn a_smoke_report_must_show_a_running_call() {
         ("states", json!(["idle", "listening"])),
         ("keys", json!([false, null, false])),
         ("seam", json!(["start"])),
+        ("reloaded", json!(0)),
     ] {
         let mut report = ran.clone();
         report["host"][key] = value;

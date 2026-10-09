@@ -4,8 +4,8 @@ name: release
 # the vX.Y.Z tag it created. The build tooling's tests and the wasm32 tests, then `cargo xtask npm` (the npm package
 # `@sidevoice/voice`, packed) and `cargo xtask npm-smoke` (installed as a consumer installs it and run in Node). Then
 # `cargo xtask manifest` (SHA256SUMS), one attestation over the assets, and `cargo xtask publish` (attach, read back,
-# verify, publish); for a vX.Y.Z release, `cargo xtask npm-publish` then puts it on npm. The native tests are
-# ci.yml's, on every PR. RELEASING.md.
+# verify, publish); for a vX.Y.Z release, `cargo xtask npm-publish` then stages it on npm for the operator to
+# approve. The native tests are ci.yml's, on every PR. RELEASING.md.
 on:
   push:
     branches: [main]
@@ -89,9 +89,10 @@ jobs:
       - run: cargo xtask publish dist "$TAG"
 
   # Versioned releases only, never the nightly: the npm tarball the Release just published (read back and checked
-  # against SHA256SUMS and the attestation), by trusted publishing (OIDC; no token exists). RELEASING.md.
-  publish-npm:
-    name: Publish to npm
+  # against SHA256SUMS and the attestation), STAGED by trusted publishing (OIDC; no token exists): the operator
+  # approves it on npmjs.com. RELEASING.md.
+  stage-npm:
+    name: Stage on npm
     needs: publish-release
     if: inputs.tag
     runs-on: ubuntu-24.04
@@ -106,8 +107,8 @@ jobs:
         with:
           ref: ${{ inputs.tag }}
       - uses: ./.github/actions/setup
-      # Node.js 24 brings npm 11, which trusted publishing needs (11.5.1 or later; `cargo xtask npm-publish` checks it).
-      # No registry-url, so no .npmrc and no token.
+      # Node.js 24 runs the npm CLI `cargo xtask npm-publish` pins (`npm stage`). No registry-url, so no .npmrc and no
+      # token.
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "24"

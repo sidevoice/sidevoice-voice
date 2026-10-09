@@ -26,6 +26,10 @@ pub struct VoiceConfig {
     /// How long after a turn ends a reply waits before it starts, in milliseconds.
     #[serde(default = "default_audio_grace_ms")]
     pub audio_grace_ms: u32,
+    /// How long the models stay in memory while the call is stopped, in minutes (0: they leave as it stops). The next
+    /// start loads them again.
+    #[serde(default = "default_idle_unload_minutes")]
+    pub idle_unload_minutes: u32,
     /// How loud speech must be to count.
     #[serde(default)]
     pub listening_bar: ListeningBar,
@@ -142,6 +146,10 @@ impl Default for ListeningBar {
 
 fn default_audio_grace_ms() -> u32 {
     1_000
+}
+
+fn default_idle_unload_minutes() -> u32 {
+    10
 }
 
 fn default_speed() -> f32 {
