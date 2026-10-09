@@ -166,8 +166,10 @@ fn check_smoke(report: &Value) -> Result<()> {
     let host = &report["host"];
     let want = json!({
         "missing": "settings-missing", "unknown": "model-unknown", "reloaded": 1,
-        "smartMissing": "end-of-turn-missing", "catalogue": 2,
-        "started": "resolved", "again": "resolved", "states": host["states"], "keys": [true, "sk-smoke", false],
+        "smartMissing": "end-of-turn-missing", "catalogue": 2, "flags": ["muted", false],
+        "started": "resolved", "again": "resolved", "restarted": "resolved", "afterRestart": "listening",
+        "smartLive": ["listening", []],
+        "states": host["states"], "keys": [true, "sk-smoke", false],
         "seam": SEAM,
     });
     if *host != want {

@@ -60,41 +60,78 @@ call.stop();
 const callLoaded = loaded.slice();
 const callState = state;
 
-// The voice seam on a page's source of the same models: refusals by code, a start that resolves once listening and
-// at once after, the models loaded again after a stop with 0 idle minutes, smart-turn refused without an end-of-turn
-// model, and provider keys in the store it was given.
+// The voice seam on a page's source of the same models: refusals by code, flags set before the settings kept, a
+// start that resolves once listening and at once after, a start straight after a stop that listens, the models
+// loaded again after a stop with 0 idle minutes, a live switch to smart-turn with an end-of-turn model, smart-turn
+// refused without one, and provider keys in the store it was given.
 const code = (promise) => promise.then(() => "resolved", (error) => error.code);
 const source = {
   catalogue: async () => [{ id: "smoke-stt", capabilities: ["stt"] }, { id: "smoke-tts", capabilities: ["tts"] }],
   models: async (settings) => {
     if (settings.stt.model !== "smoke-stt") throw Object.assign(new Error("unknown"), { code: "model-unknown" });
-    return models;
+    // A build that comes with an end-of-turn model, for smart-turn.
+    return settings.stt.build === "ends-turns" ? ending : models;
+  },
+};
+const ending = {
+  async load() {
+    return { ...(await models.load()), endOfTurn: { endOfTurn: async () => 0.9 } };
   },
 };
 const stored = new Map();
 const keys = { get: (p) => stored.get(p) ?? null, set: (p, k) => (k == null ? stored.delete(p) : stored.set(p, k)) };
 const voice = createVoiceHost(source, { io, keys });
 const states = [];
-voice.onState((s) => states.push(s.listening));
+const seen = [];
+const hostErrors = [];
+voice.onState((s) => {
+  states.push(s.listening);
+  seen.push(s);
+});
+voice.onError((e) => hostErrors.push(e.code));
+const until = async (done) => {
+  for (let waited = 0; !done() && waited < 5000; waited += 10) await new Promise((r) => setTimeout(r, 10));
+};
 const host = { missing: await code(voice.start()) };
+// Offline and muted before any settings: the call they create must start that way.
+voice.setOnline(false);
+voice.mute(true);
 host.unknown = await code(voice.setSettings({ stt: { model: "nope" }, tts: { model: "smoke-tts" } }));
 await voice.setSettings({
   stt: { model: "smoke-stt", language: "es" }, tts: { model: "smoke-tts" }, patience: "fast", idle_unload_minutes: 0,
 });
 host.started = await code(voice.start());
+const first = seen.find((s) => s.listening !== "idle");
+host.flags = [first?.listening, first?.online];
+voice.mute(false);
+voice.setOnline(true);
 host.again = await code(voice.start());
+// A stop and a start straight after it, both awaited, no pause: the call ends up listening.
 await voice.stop();
+host.restarted = await code(voice.start());
+await new Promise((resolve) => setTimeout(resolve, 100));
+host.afterRestart = states.at(-1);
+// Stopped with 0 idle minutes, the models leave memory; the next start loads them again.
+await voice.stop();
+await until(() => states.at(-1) === "idle");
 await new Promise((resolve) => setTimeout(resolve, 50));
 const loadsBefore = loaded.length;
 await voice.start();
 host.reloaded = (loaded.length - loadsBefore) / 3;
+// Silence → smart-turn on the live call, with models that end turns: it keeps listening.
+const errorsBefore = hostErrors.length;
+await voice.setSettings({
+  stt: { model: "smoke-stt", build: "ends-turns" }, tts: { model: "smoke-tts" }, end_of_turn: "smart-turn",
+  idle_unload_minutes: 0,
+});
+await new Promise((resolve) => setTimeout(resolve, 100));
+host.smartLive = [states.at(-1), hostErrors.slice(errorsBefore)];
 await voice.stop();
-await new Promise((resolve) => setTimeout(resolve, 50));
 await voice.setSettings({
   stt: { model: "smoke-stt" }, tts: { model: "smoke-tts" }, end_of_turn: "smart-turn", idle_unload_minutes: 0,
 });
 host.smartMissing = await code(voice.start());
-await new Promise((resolve) => setTimeout(resolve, 50));
+await until(() => states.at(-1) === "idle");
 host.states = states;
 await voice.setProviderKey("openai", "sk-smoke");
 host.keys = [await voice.hasProviderKey("openai"), stored.get("openai")];

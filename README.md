@@ -141,11 +141,13 @@ room.on("voice-reply", (data) => voice.speak(data));
 
 What both promise, beyond the types:
 
-- **`start()`** resolves at the first state whose `listening` is not `idle`, at once if the call listens already, and a
-  second `start` while one is pending settles with it. It rejects with `{code}`, and with `{code: "stopped"}` when
-  `stop()` comes first; `smart-turn` without an end-of-turn model rejects `end-of-turn-missing`. `stop()` is safe at
-  any time; `setSettings` rejects with the model source's `{code}` for settings it cannot fill (`model-unknown`,
-  `build-unfit`, …).
+- **`start()`** resolves once the microphone and the speaker work: at the first state whose `listening` is not `idle`,
+  at once if the call listens already, and a second `start` while one is pending settles with it. It rejects with
+  `{code}`, and with `{code: "stopped"}` when `stop()` comes first; `smart-turn` without an end-of-turn model rejects
+  `end-of-turn-missing`. `stop()` is safe at any time, and a `start` right after it, awaited or not, starts the call
+  again. `mute` and `setOnline` hold from the first call, even before `setSettings`. Settings that change the models
+  give the call the new models and configuration together (a live call restarts once); `setSettings` rejects with
+  the model source's `{code}` for settings it cannot fill (`model-unknown`, `build-unfit`, …).
 - **Events** reach the listeners subscribed when they are emitted, in the order the call emitted them; nothing is
   buffered. For each `turn_id`, `started` comes before exactly one `finished` or `cancelled`. A turn merged into the
   next is `cancelled` with `merged`, after that next turn's `started`. For each reply, `playing` (if it sounds) comes

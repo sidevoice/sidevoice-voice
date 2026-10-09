@@ -32,7 +32,14 @@ export function createVoiceHost(source, options = {}) {
     karaoke: new Set(), error: new Set() };
   let call = null;
   let chosen = null;
+  // What the page asked for before or after the call exists: every new call starts with it.
+  let online = true;
+  let muted = false;
+  // The lifecycle: a start asked for and not ended (`active`), the call's last state not idle (`listening`), and a
+  // the stops sent whose idle state has not come yet (`stopping`): until each comes, a state from before it is stale.
+  let active = false;
   let listening = false;
+  let stopping = 0;
   let waiting = [];
 
   const settle = (error) => {
@@ -46,10 +53,21 @@ export function createVoiceHost(source, options = {}) {
     let kind = event.type;
     let data = event.data;
     if (kind === "state") {
-      listening = data.listening !== "idle";
-      if (listening) settle(null);
+      const idle = data.listening === "idle";
+      if (stopping > 0) {
+        // Every stop is answered with an idle state, after all the call said before it.
+        if (idle) stopping--;
+      } else {
+        listening = !idle;
+        if (idle) active = false;
+        else settle(null);
+      }
     } else if (kind === "error") {
-      settle(fail(data.code));
+      // An error before the call listens ends the start that waits for it.
+      if (stopping === 0 && !listening) {
+        active = false;
+        settle(fail(data.code));
+      }
     } else if (kind === "room-message") {
       kind = { "voice-user-turn": "user-turn", "voice-playback": "playback" }[data.type];
       data = data.data;
@@ -84,26 +102,44 @@ export function createVoiceHost(source, options = {}) {
       if (!call) {
         call = WasmVoiceCall.create(models, io ?? createWebAudioIo(webAudio), config);
         call.onEvent(receive);
+        call.setOnline(online);
+        call.mute(muted);
+      } else if (models) {
+        // Other models with the configuration they go with, together: a live call restarts once, on both.
+        call.setModels(models, config);
       } else {
         call.setConfig(config);
-        if (models) call.setModels(models);
       }
       chosen = stages(settings);
     },
     start() {
       if (!call) return Promise.reject(fail("settings-missing", "set the voice settings first"));
-      if (listening) return Promise.resolve();
+      if (listening && stopping === 0) return Promise.resolve();
       const started = new Promise((resolve, reject) => waiting.push({ resolve, reject }));
-      if (waiting.length === 1) call.start();
+      if (!active) {
+        active = true;
+        call.start();
+      }
       return started;
     },
     async stop() {
       settle(fail("stopped"));
-      withCall((c) => c.stop());
+      if (!call) return;
+      // The start that may follow goes behind this stop, and waits for a state after its idle.
+      stopping++;
+      active = false;
+      listening = false;
+      call.stop();
     },
     speak: (reply) => withCall((c) => c.roomEvent({ type: "voice-reply", data: reply })),
-    setOnline: (online) => withCall((c) => c.setOnline(!!online)),
-    mute: (muted) => withCall((c) => c.mute(!!muted)),
+    setOnline(value) {
+      online = !!value;
+      withCall((c) => c.setOnline(online));
+    },
+    mute(value) {
+      muted = !!value;
+      withCall((c) => c.mute(muted));
+    },
     cancelInput: () => withCall((c) => c.cancelInput()),
     onUserTurn: on("user-turn"),
     onPlayback: on("playback"),

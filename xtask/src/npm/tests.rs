@@ -90,8 +90,10 @@ fn a_smoke_report_must_show_a_running_call() {
         "webAudioIo": "function",
         "host": {
             "missing": "settings-missing", "unknown": "model-unknown", "reloaded": 1,
-            "smartMissing": "end-of-turn-missing", "catalogue": 2,
-            "started": "resolved", "again": "resolved", "states": ["idle", "listening", "idle"],
+            "smartMissing": "end-of-turn-missing", "catalogue": 2, "flags": ["muted", false],
+            "started": "resolved", "again": "resolved", "restarted": "resolved", "afterRestart": "listening",
+            "smartLive": ["listening", []],
+            "states": ["idle", "listening", "idle"],
             "keys": [true, "sk-smoke", false], "seam": SEAM,
         },
     });
@@ -114,6 +116,9 @@ fn a_smoke_report_must_show_a_running_call() {
         ("keys", json!([false, null, false])),
         ("seam", json!(["start"])),
         ("reloaded", json!(0)),
+        ("flags", json!(["listening", true])),
+        ("afterRestart", json!("idle")),
+        ("smartLive", json!(["idle", ["end-of-turn-missing"]])),
     ] {
         let mut report = ran.clone();
         report["host"][key] = value;
