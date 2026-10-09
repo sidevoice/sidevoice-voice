@@ -44,19 +44,19 @@ impl RoomMessage {
 pub struct UserTurn {
     /// This message's id.
     pub client_msg_id: String,
-    /// The turn's id: the same in every phase of one turn.
+    /// The turn's id, made by the module as the turn starts: the same in every phase of one turn, and how the room
+    /// knows the turn (it answers `started` with it).
     pub turn_id: String,
     /// Where the turn is.
     pub phase: TurnPhase,
-    /// The latest room revision the module had seen on a reply when the turn started (0 before any).
-    pub revision: u64,
     /// What was said: in `finished`, and in a `cancelled` that was merged into the next turn.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
     /// The language the transcript is in, when the stage was told one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
-    /// Whether the room was out of reach when the module emitted it.
+    /// Whether the room was out of reach when the turn started. Such a turn is reported only as `finished`, which the
+    /// room takes as words said while away.
     pub offline: bool,
     /// When the person started speaking, in Unix milliseconds.
     pub started_at: u64,
@@ -145,9 +145,9 @@ pub enum PlaybackReason {
 pub enum RoomEvent {
     /// A reply to speak.
     Reply(Reply),
-    /// The room opened a turn of the person's: the revision it gave it. A reply written before it answers an older
-    /// turn.
-    TurnStarted { revision: u64 },
+    /// The room took a turn of the person's (`turn_id`, the module's own), at `revision`: the turn's boundary. A reply
+    /// written below it answers an older turn.
+    TurnStarted { turn_id: String, revision: u64 },
     /// Anything else the room sends, which the module does not use.
     Other,
 }
@@ -172,9 +172,11 @@ impl RoomEvent {
             "voice-user-turn" if envelope.data["phase"] == "started" => {
                 #[derive(Deserialize)]
                 struct Started {
+                    turn_id: String,
                     revision: u64,
                 }
                 Started::deserialize(envelope.data).map(|started| Self::TurnStarted {
+                    turn_id: started.turn_id,
                     revision: started.revision,
                 })
             }
