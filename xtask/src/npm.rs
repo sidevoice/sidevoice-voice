@@ -23,7 +23,7 @@ const SMOKE_JS: &str = include_str!("../npm/smoke.mjs");
 /// The slots the smoke test's models fill, recorded each time the call loads them.
 const SMOKE_SLOTS: [&str; 3] = ["vad", "transcriber", "speaker"];
 /// The calls of the voice seam, `VoiceHost` (js/voice-host.d.ts), sorted.
-const SEAM: [&str; 16] = [
+const SEAM: [&str; 17] = [
     "cancelInput",
     "hasProviderKey",
     "models",
@@ -40,6 +40,7 @@ const SEAM: [&str; 16] = [
     "speak",
     "start",
     "stop",
+    "turnStarted",
 ];
 
 fn parse(bytes: &[u8], what: &str) -> Result<Value> {

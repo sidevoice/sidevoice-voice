@@ -137,6 +137,7 @@ voice.onPlayback((report) => outbox.send({ type: "voice-playback", data: report 
 await voice.setSettings({ stt: { model: "whisper-base", language: "es" }, tts: { model: "kokoro-82m-v1.0", voice: "ef_dora" } });
 await voice.start();                                    // resolves once listening; rejects {code}
 room.on("voice-reply", (data) => voice.speak(data));
+room.on("voice-user-turn", (data) => data.phase === "started" && voice.turnStarted(data)); // the room's answer
 ```
 
 What both promise, beyond the types:
@@ -149,12 +150,14 @@ What both promise, beyond the types:
   give the call the new models and configuration together (a live call restarts once); `setSettings` rejects with
   the model source's `{code}` for settings it cannot fill (`model-unknown`, `build-unfit`, …).
 - **Events** reach the listeners subscribed when they are emitted, in the order the call emitted them; nothing is
-  buffered. For each `turn_id`, `started` comes before exactly one `finished` or `cancelled`. A turn merged into the
+  buffered. For each `turn_id`, `started` comes before exactly one `finished` or `cancelled`; a turn that started
+  offline is only `finished`. A turn merged into the
   next is `cancelled` with `merged`, after that next turn's `started`. For each reply, `playing` (if it sounds) comes
   before exactly one of `heard`, `interrupted`, `unplayed`, `failed`, and karaoke only follows replies given to
   `speak`.
-- **Every room message carries its own `client_msg_id`**, and turns emitted while `setOnline(false)` say
-  `offline: true`.
+- **Every room message carries its own `client_msg_id`**, and a turn started while `setOnline(false)` says
+  `offline: true`. The room's answer to a turn's `started` goes to `turnStarted`: it names the turn and the revision
+  that is its boundary for stale replies.
 - **Settings** name a model per stage and optionally its build, the language, voice and speed, the patience, the end
   of turn and `idle_unload_minutes` (how long the models stay loaded with the call stopped; 10 by default). A rejected
   `setSettings` changes nothing. A change to the models the settings choose (a stage, or the end of turn) gives the
@@ -191,23 +194,25 @@ time; a task around it (`src/voice_call.rs`) feeds it and does what it answers.
   reply sent again under the same id is ignored, unless it is a replay.
 - **The heard position** moves at chunk boundaries: a chunk counts once its last sample left the speaker, never in
   part. It is what `heard_chars` reports and what the karaoke shows.
-- **Offline** is a flag, not a state: everything goes on, and turns say `offline`; the host's outbox keeps the
-  messages until the room acknowledges them.
+- **Offline** is a flag, not a state: everything goes on, and a turn that starts offline is reported once, as
+  `finished` with `offline`; the host's outbox keeps the messages until the room acknowledges them.
 
 ## The room's messages
 
 The module holds no socket. It emits, each with a `client_msg_id` for the host's outbox and the room's `voice-ack`:
 
-- `voice-user-turn {turn_id, phase: started | cancelled | finished, revision, text?, language?, offline, started_at,
-  ended_at?, merged, timings_ms?}`. `finished` is what becomes the conversation's row; `revision` is the latest room
-  revision seen on a reply when the turn started.
+- `voice-user-turn {turn_id, phase: started | cancelled | finished, text?, language?, offline, started_at, ended_at?,
+  merged, timings_ms?}`. The module names each turn (`turn_id`, the same in every phase; turns may overlap), and the
+  room knows it by that name. `finished` is what becomes the conversation's row. A turn that started while the room
+  was out of reach is reported only as `finished`, with `offline: true`.
 - `voice-playback {utterance_id, status: playing | heard | interrupted | unplayed | failed, heard_chars, reason?,
   at}`, the input of the room's heard and unheard bookkeeping. `heard_chars` counts Unicode scalar values; `reason`
   is the room's word (`user_interrupted`, `newer_turn`, `call_ended`), and a failure has none.
 
 It consumes `voice-reply {utterance_id, revision, reply_revision, thread_id, history_id, text, language, replay?}`
-and the room's answer to a started turn, `voice-user-turn {phase: started, revision}` (a reply written below that
-revision is stale), and lets every other room message through.
+and the room's answer to a started turn, `voice-user-turn {phase: started, turn_id, revision}`: the revision the room
+gave that turn of this call is its boundary, and a reply written below it is stale. It lets every other room message
+through.
 
 ## Status
 

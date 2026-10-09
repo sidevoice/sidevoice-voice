@@ -132,6 +132,7 @@ export function createVoiceHost(source, options = {}) {
       call.stop();
     },
     speak: (reply) => withCall((c) => c.roomEvent({ type: "voice-reply", data: reply })),
+    turnStarted: (started) => withCall((c) => c.roomEvent({ type: "voice-user-turn", data: started })),
     setOnline(value) {
       online = !!value;
       withCall((c) => c.setOnline(online));

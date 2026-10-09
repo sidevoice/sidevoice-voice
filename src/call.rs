@@ -13,7 +13,7 @@
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use crate::config::{EndOfTurn, VoiceConfig};
 use crate::event::{CallState, Karaoke, Listening, VoiceError, VoiceEvent};
@@ -68,6 +68,9 @@ pub(crate) enum Input {
     },
 }
 
+/// How many of the latest turns' ids are kept, to match the room's answers to their `started`.
+const TURN_IDS_KEPT: usize = 16;
+
 /// The end-of-turn probability from which a paused turn is over.
 const END_OF_TURN_LIKELY: f32 = 0.5;
 
@@ -114,11 +117,12 @@ pub(crate) enum Effect {
     },
 }
 
-/// A turn the room was told of, until it is finished or cancelled.
+/// A turn of the person's, until it is finished or cancelled.
 #[derive(Debug)]
 struct Turn {
     id: String,
-    revision: u64,
+    /// Whether the room was out of reach as it started: then the room hears of it only as `finished`.
+    offline: bool,
     started_ms: u64,
     ended_ms: Option<u64>,
     audio_ms: u64,
@@ -142,6 +146,8 @@ pub(crate) struct Call {
     revision: u64,
     /// Replies written at a revision below this one answer an older turn than the person's latest.
     turn_boundary: u64,
+    /// The ids of the latest turns, whose `started` answers from the room count.
+    turn_ids: VecDeque<String>,
     segmenter: Segmenter,
     /// The turn being spoken.
     open: Option<usize>,
@@ -167,6 +173,7 @@ impl Call {
             online: true,
             revision: 0,
             turn_boundary: 0,
+            turn_ids: VecDeque::new(),
             open: None,
             turns: HashMap::new(),
             next_turn: 0,
@@ -210,8 +217,11 @@ impl Call {
                 self.act(now, actions, &mut out);
             }
             Input::Room(RoomEvent::Reply(reply)) => self.reply(now, reply, &mut out),
-            Input::Room(RoomEvent::TurnStarted { revision }) => {
-                self.turn_boundary = self.turn_boundary.max(revision);
+            Input::Room(RoomEvent::TurnStarted { turn_id, revision }) => {
+                // Only an answer about a turn of this call moves its boundary.
+                if self.turn_ids.contains(&turn_id) {
+                    self.turn_boundary = self.turn_boundary.max(revision);
+                }
             }
             Input::Room(RoomEvent::Other) => {}
             Input::Online(online) => self.online = online,
@@ -286,11 +296,16 @@ impl Call {
             Segment::Started => {
                 let number = self.next_turn;
                 self.next_turn += 1;
+                let id = format!("{}-turn-{number}", self.call_id);
+                self.turn_ids.push_back(id.clone());
+                if self.turn_ids.len() > TURN_IDS_KEPT {
+                    self.turn_ids.pop_front();
+                }
                 self.turns.insert(
                     number,
                     Turn {
-                        id: format!("{}-turn-{number}", self.call_id),
-                        revision: self.revision,
+                        id,
+                        offline: !self.online,
                         started_ms: now,
                         ended_ms: None,
                         audio_ms: 0,
@@ -299,7 +314,8 @@ impl Call {
                     },
                 );
                 self.open = Some(number);
-                // What the room wrote up to now answers what came before this turn.
+                // What the room wrote up to now answers what came before this turn; the room's answer to `started`
+                // gives the turn's own boundary.
                 self.turn_boundary = self.turn_boundary.max(self.revision + 1);
                 self.report_turn(number, TurnPhase::Started, None, false, out);
                 let mut actions = Vec::new();
@@ -509,6 +525,10 @@ impl Call {
         let Some(turn) = self.turns.get(&number) else {
             return;
         };
+        // A turn that started offline is never `started` to the room, so it has nothing to cancel there either.
+        if turn.offline && phase != TurnPhase::Finished {
+            return;
+        }
         let timings = turn.ended_ms.map(|ended| TurnTimings {
             audio_ms: turn.audio_ms,
             endpoint_silence_ms: turn.silence_ms,
@@ -520,10 +540,9 @@ impl Call {
             client_msg_id: String::new(),
             turn_id: turn.id.clone(),
             phase,
-            revision: turn.revision,
             language: text.as_ref().and(self.config.language.clone()),
             text,
-            offline: !self.online,
+            offline: turn.offline,
             started_at: self.epoch_unix_ms + turn.started_ms,
             ended_at: turn.ended_ms.map(|ended| self.epoch_unix_ms + ended),
             merged,

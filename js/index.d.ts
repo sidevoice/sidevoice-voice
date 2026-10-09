@@ -46,6 +46,7 @@ export type {
   VoiceModelSource,
   VoicePlayback,
   VoiceReply,
+  VoiceTurnStarted,
   VoiceSettings,
   VoiceState,
   VoiceUserTurn,
