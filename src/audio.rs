@@ -20,7 +20,7 @@ pub(crate) fn downmix(interleaved: &[f32], channels: usize, out: &mut Vec<f32>) 
     );
 }
 
-/// A streaming resampler: linear interpolation, after a fourth-order Butterworth low-pass below the new Nyquist
+/// A streaming resampler: linear interpolation, after an eighth-order Butterworth low-pass below the new Nyquist
 /// frequency when the rate goes down. It keeps its state between blocks, so a stream cut in blocks of any size comes
 /// out as if it were resampled whole.
 #[derive(Debug)]
@@ -30,17 +30,15 @@ pub(crate) struct Resampler {
     /// Where the next output sample sits, in input samples from the start of the next block (−1 is `previous`).
     position: f64,
     previous: f32,
-    filter: Option<[Biquad; 2]>,
+    filter: Option<[Biquad; 4]>,
 }
 
 impl Resampler {
     pub(crate) fn new(from: u32, to: u32) -> Self {
         let filter = (to < from).then(|| {
             let cutoff = 0.45 * f64::from(to);
-            [
-                Biquad::low_pass(f64::from(from), cutoff, 0.541_196_1),
-                Biquad::low_pass(f64::from(from), cutoff, 1.306_563),
-            ]
+            [0.509_795_6, 0.601_344_9, 0.899_976_1, 2.562_915_4]
+                .map(|q| Biquad::low_pass(f64::from(from), cutoff, q))
         });
         Self {
             step: f64::from(from) / f64::from(to),
@@ -61,7 +59,11 @@ impl Resampler {
             Some(filter) => {
                 filtered = input
                     .iter()
-                    .map(|&sample| filter[1].take(filter[0].take(sample)))
+                    .map(|&sample| {
+                        filter
+                            .iter_mut()
+                            .fold(sample, |low, section| section.take(low))
+                    })
                     .collect::<Vec<_>>();
                 &filtered
             }

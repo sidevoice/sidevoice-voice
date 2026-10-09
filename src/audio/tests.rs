@@ -41,7 +41,7 @@ fn speech_frequencies_pass_and_those_above_the_new_nyquist_are_cut() {
     assert!((rms(&low[4_000..]) - 0.5 / 2f32.sqrt()).abs() < 0.02);
     let mut high = Vec::new();
     Resampler::new(48_000, 16_000).process(&sine(12_000.0, 48_000), &mut high);
-    assert!(rms(&high[4_000..]) < 0.02, "{}", rms(&high[4_000..]));
+    assert!(rms(&high[4_000..]) < 0.01, "{}", rms(&high[4_000..]));
 }
 
 #[test]
@@ -56,9 +56,10 @@ fn going_up_keeps_the_signal() {
 fn frames_are_whole_and_the_rest_waits() {
     let mut framer = Framer::default();
     assert!(framer.push(&[0.0; FRAME - 1]).is_empty());
-    let frames = framer.push(&[1.0; FRAME + 1]);
+    let frames = framer.push(&[1.0; 2]);
     assert_eq!(frames.len(), 1);
     assert_eq!(frames[0][FRAME - 2], 0.0);
     assert_eq!(frames[0][FRAME - 1], 1.0);
-    assert_eq!(framer.push(&[1.0; FRAME - 2]).len(), 1);
+    assert!(framer.push(&[1.0; FRAME - 2]).is_empty());
+    assert_eq!(framer.push(&[1.0; 1]).len(), 1);
 }
