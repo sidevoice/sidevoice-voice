@@ -14,7 +14,6 @@ fn a_finished_turn_is_written_as_the_room_reads_it() {
         client_msg_id: "c-2".into(),
         turn_id: "c-turn-0".into(),
         phase: TurnPhase::Finished,
-        revision: 4,
         text: Some("hola".into()),
         language: Some("es".into()),
         offline: false,
@@ -31,7 +30,7 @@ fn a_finished_turn_is_written_as_the_room_reads_it() {
     assert_eq!(
         message.to_json(),
         json!({"type": "voice-user-turn", "data": {
-            "client_msg_id": "c-2", "turn_id": "c-turn-0", "phase": "finished", "revision": 4, "text": "hola",
+            "client_msg_id": "c-2", "turn_id": "c-turn-0", "phase": "finished", "text": "hola",
             "language": "es", "offline": false, "started_at": 10, "ended_at": 20, "merged": false,
             "timings_ms": {"audio_ms": 1000, "endpoint_silence_ms": 2700, "recognition_ms": 300}}})
     );
@@ -100,12 +99,20 @@ fn a_playback_reason_is_one_the_room_takes() {
 }
 
 #[test]
-fn the_rooms_answer_to_a_started_turn_gives_its_revision() {
+fn the_rooms_answer_to_a_started_turn_names_it_and_gives_its_revision() {
     let started = json!({"type": "voice-user-turn", "data": {
-        "session_id": "s", "phase": "started", "revision": 12, "thread_id": "t"}});
+        "session_id": "s", "phase": "started", "turn_id": "c-turn-0", "revision": 12, "thread_id": "t"}});
     assert_eq!(
         RoomEvent::from_json(&started).unwrap(),
-        RoomEvent::TurnStarted { revision: 12 }
+        RoomEvent::TurnStarted {
+            turn_id: "c-turn-0".into(),
+            revision: 12
+        }
+    );
+    let unnamed = json!({"type": "voice-user-turn", "data": {"phase": "started", "revision": 12}});
+    assert!(
+        RoomEvent::from_json(&unnamed).is_err(),
+        "a started answer names its turn"
     );
     let cancelled =
         json!({"type": "voice-user-turn", "data": {"phase": "cancelled", "revision": 12}});

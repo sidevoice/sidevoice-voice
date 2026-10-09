@@ -340,7 +340,12 @@ fn speech_over_a_reply_interrupts_it_and_drops_the_queue() {
     assert!(effects.contains(&Effect::StopPlayback));
     let turns = Run::turns(&effects);
     assert_eq!(turns[0].phase, TurnPhase::Started);
-    assert_eq!(turns[0].revision, 7);
+    assert_eq!(turns[0].turn_id, "c-turn-0", "the module names the turn");
+    let wire = RoomMessage::UserTurn(turns[0].clone()).to_json();
+    assert!(
+        wire["data"].get("revision").is_none(),
+        "no revision on a turn: {wire}"
+    );
     assert_eq!(
         Run::playbacks(&effects),
         [
@@ -578,12 +583,32 @@ fn muting_ends_the_turn_and_cancelling_drops_it() {
 }
 
 #[test]
-fn turns_spoken_offline_say_so() {
+fn a_turn_spoken_offline_is_only_finished_and_says_so() {
     let mut run = Run::new(config());
     run.input(Input::Online(false));
     run.hear(&speech());
+    assert!(
+        Run::turns(&run.take()).is_empty(),
+        "no started for a turn the room cannot hear of"
+    );
+    run.hear(&silence(3_000));
+    let (turn, _) = Run::transcribe(&run.take()).expect("transcribed");
+    // Back online before it is reported: it still started offline.
+    run.input(Input::Online(true));
+    run.transcribed(turn, "words said while away");
+    run.wait(2_000);
     let turns = Run::turns(&run.take());
-    assert!(turns[0].offline);
+    assert_eq!(turns.len(), 1);
+    assert_eq!(
+        (turns[0].phase, turns[0].offline),
+        (TurnPhase::Finished, true)
+    );
+
+    // One cancelled while offline says nothing at all.
+    run.input(Input::Online(false));
+    run.hear(&speech());
+    run.input(Input::Cancel);
+    assert!(Run::turns(&run.take()).is_empty());
 }
 
 #[test]
@@ -630,7 +655,7 @@ fn a_reply_written_before_the_persons_latest_turn_is_dropped_when_it_arrives() {
     run.reply("u1", "The first answer, seen at revision seven.");
     run.take();
     run.hear(&speech());
-    run.take();
+    let turn_id = Run::turns(&run.take())[0].turn_id.clone();
     // Written at revision 7, before the turn: it answers what came before.
     run.reply("u2", "A reply still in transport when the person spoke.");
     let effects = run.take();
@@ -638,8 +663,16 @@ fn a_reply_written_before_the_persons_latest_turn_is_dropped_when_it_arrives() {
         Run::reasons(&effects),
         [(PlaybackStatus::Unplayed, Some(PlaybackReason::NewerTurn))]
     );
-    // The room gave the turn revision 12: a reply written at 10 is stale too, one at 12 is not.
-    run.input(Input::Room(RoomEvent::TurnStarted { revision: 12 }));
+    // An answer about a turn of another call moves nothing.
+    run.input(Input::Room(RoomEvent::TurnStarted {
+        turn_id: "elsewhere-turn-0".into(),
+        revision: 50,
+    }));
+    // The room gave this turn revision 12: a reply written at 10 is stale too, one at 12 is not.
+    run.input(Input::Room(RoomEvent::TurnStarted {
+        turn_id,
+        revision: 12,
+    }));
     let mut stale = reply("u3", "Written at ten.");
     stale.revision = 10;
     run.input(Input::Room(RoomEvent::Reply(stale)));
