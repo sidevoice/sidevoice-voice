@@ -74,6 +74,6 @@ pub struct Karaoke {
 /// A failure a person may be told of, as a stable code the app translates.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct VoiceError {
-    /// The code: `transcription-queue-full`, or the engine's own (`transcription-failed`, `synthesis-failed`, ...).
+    /// The code: `transcription-queue-full`, or the app's models' own (`transcription-failed`, `speech-failed`, ...).
     pub code: String,
 }

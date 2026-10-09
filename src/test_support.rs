@@ -1,5 +1,5 @@
 //! Test doubles shared by the tests of every module: the recorded clips (`tests/fixtures`, compiled in so the wasm32
-//! tests read them too), a voice activity detector on energy that answers as the engine's streams do, and a
+//! tests read them too), a voice activity detector on energy that answers as a streaming detector does, and a
 //! configuration.
 
 use crate::config::VoiceConfig;
@@ -37,7 +37,7 @@ pub(crate) fn silence(ms: usize) -> Vec<f32> {
     vec![0.0; ms * 16]
 }
 
-/// A voice activity detector on energy, with the engine's stream semantics: speech is confirmed after
+/// A voice activity detector on energy, as a streaming detector answers: speech is confirmed after
 /// `min_speech_ms` above the threshold, and ends after `min_silence_ms` below it.
 pub(crate) struct EnergyVad {
     above: usize,

@@ -1,6 +1,6 @@
 //! When the call's models leave memory: once they have been idle, loaded while the call is stopped, for the
-//! configuration's `idle_unload_minutes` (0: as soon as it stops). Dropping them unloads them from the engine; the
-//! next start loads them again.
+//! configuration's `idle_unload_minutes` (0: as soon as it stops). Dropping them frees them (the app's models
+//! unload when dropped); the next start loads them again.
 
 #[cfg(test)]
 mod tests;
