@@ -126,6 +126,10 @@ export function createWebAudioIo(options = {}) {
     } catch {
       return current() && fail("audio-output-failed");
     }
+    if (current()) {
+      // The microphone, the worklet and the speaker all work: the call listens from now.
+      sink.ready();
+    }
   }
 
   return {

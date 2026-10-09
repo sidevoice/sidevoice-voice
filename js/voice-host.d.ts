@@ -55,7 +55,7 @@ export interface VoiceUserTurn {
   ended_at?: number;
   /** `finished`: it joined earlier turns. `cancelled`: it was joined into the next. */
   merged: boolean;
-  timings?: { audio_ms: number; endpoint_silence_ms: number; recognition_ms?: number };
+  timings_ms?: { audio_ms: number; endpoint_silence_ms: number; recognition_ms?: number };
 }
 
 /** What became of a reply: `voice-playback`'s `data`. Per utterance: `playing` (if it sounds), then exactly one of
@@ -66,8 +66,8 @@ export interface VoicePlayback {
   status: "playing" | "heard" | "interrupted" | "unplayed" | "failed";
   /** Characters (Unicode scalar values) of the text heard from its start, at chunk boundaries. */
   heard_chars: number;
-  /** Why it failed, as a stable code. */
-  reason?: string;
+  /** Why it stopped short or never played, in the room's words. A `failed` one has none: its code is an `error`. */
+  reason?: "user_interrupted" | "newer_turn" | "call_ended";
   /** Unix milliseconds. */
   at: number;
 }
@@ -151,18 +151,20 @@ export interface VoiceHost {
   /** Sets the person's choices; the first creates the call. Rejects `VoiceHostError`. */
   setSettings(settings: VoiceSettings): Promise<void>;
   /** Loads the models, opens the microphone and the speaker, listens. `smart-turn` without an end-of-turn model
-   *  rejects `{code: "end-of-turn-missing"}`. Resolves at the first
+   *  rejects `{code: "end-of-turn-missing"}`. Resolves once the microphone and the speaker work, at the first
    *  state whose `listening` is not `idle` (at once if the call listens already; a second `start` while one is pending
    *  settles with it). Rejects `VoiceHostError`; with `{code: "stopped"}` when `stop()` comes first. */
   start(): Promise<void>;
   /** Stops listening and speaking: the turn not reported is cancelled, the reply playing interrupted, the queue
-   *  dropped. The models stay loaded. Safe at any time. */
+   *  dropped. The models stay loaded. Safe at any time; a `start` after it, awaited or not, starts the call again. */
   stop(): Promise<void>;
   /** A room `voice-reply`'s `data`. A reply whose `utterance_id` was seen is ignored unless `replay`. */
   speak(reply: VoiceReply): void;
-  /** Whether the room is in reach: turns emitted while it is not carry `offline: true`. */
+  /** Whether the room is in reach: turns emitted while it is not carry `offline: true`. Kept from the first call, even
+   *  before `setSettings`. */
   setOnline(online: boolean): void;
-  /** Mutes or unmutes the microphone; muting ends the open turn with what was said. */
+  /** Mutes or unmutes the microphone; muting ends the open turn with what was said. Kept from the first call, even
+   *  before `setSettings`. */
   mute(muted: boolean): void;
   /** Cancels what the person said that is not reported yet. */
   cancelInput(): void;

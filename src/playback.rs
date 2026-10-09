@@ -1,5 +1,5 @@
 //! The playback queue: replies wait in order, the first is spoken chunk by chunk (each synthesized while the one
-//! before plays) and played, and its heard position moves as each chunk finishes playing at the speaker. A barge-in
+//! before plays, never further ahead: at most [`AHEAD`] chunks are at the output unplayed) and played, and its heard position moves as each chunk finishes playing at the speaker. A barge-in
 //! stops the reply that plays and drops every reply queued behind it; a reply that arrives again under an id already
 //! taken is ignored, unless it is a replay the person asked for.
 //!
@@ -12,8 +12,11 @@ mod tests;
 use std::collections::{HashSet, VecDeque};
 
 use crate::event::PlaybackState;
-use crate::room::{PlaybackStatus, Reply};
+use crate::room::{PlaybackReason, PlaybackStatus, Reply};
 use crate::speech::{chunks, Chunk};
+
+/// How many chunks of a reply may be synthesized and not yet played: the one at the output and the next.
+pub(crate) const AHEAD: usize = 2;
 
 /// A reply in the queue.
 #[derive(Debug)]
@@ -63,8 +66,10 @@ pub(crate) enum Action {
         utterance: String,
         status: PlaybackStatus,
         heard_chars: usize,
-        reason: Option<String>,
+        reason: Option<PlaybackReason>,
     },
+    /// A reply could not be spoken: the stable code of why, for the host.
+    Error(String),
     /// Where the reader is: the chunk sounding (its characters) and what was heard before it.
     Position {
         utterance: String,
@@ -99,6 +104,23 @@ impl Playback {
             chars: reply.text.chars().count(),
             chunks,
         });
+    }
+
+    /// Refuses a reply without queueing it: it is reported unplayed, for `reason`, and its id is taken.
+    pub(crate) fn refuse(
+        &mut self,
+        reply: &Reply,
+        reason: PlaybackReason,
+        actions: &mut Vec<Action>,
+    ) {
+        if self.seen.insert(reply.utterance_id.clone()) || reply.replay {
+            actions.push(ended(
+                &reply.utterance_id,
+                PlaybackStatus::Unplayed,
+                0,
+                reason,
+            ));
+        }
     }
 
     /// Whether a reply is being spoken.
@@ -171,17 +193,18 @@ impl Playback {
                 });
                 self.synthesize_next(actions);
             }
-            Err(reason) => {
+            Err(code) => {
                 let current = self.current.take().expect("the current reply");
-                if current.sounding.is_some() {
+                // Chunks handed to the output and not played to their end may sound yet: they go.
+                if current.next > current.played {
                     actions.push(Action::Stop);
                 }
-                actions.push(Action::Status {
-                    utterance: current.utterance.id.clone(),
-                    status: PlaybackStatus::Failed,
-                    heard_chars: heard(&current),
-                    reason: Some(reason),
-                });
+                actions.push(Action::Error(code));
+                actions.push(status(
+                    &current.utterance.id,
+                    PlaybackStatus::Failed,
+                    heard(&current),
+                ));
             }
         }
     }
@@ -232,6 +255,7 @@ impl Playback {
                 chunk: None,
                 heard_chars: heard(current),
             });
+            self.synthesize_next(actions);
             return;
         }
         let current = self.current.take().expect("the current reply");
@@ -244,20 +268,27 @@ impl Playback {
         actions.push(status(utterance, PlaybackStatus::Heard, chars));
     }
 
-    /// The person spoke over the playback, or the call stopped: the reply being spoken ends (interrupted if it had
-    /// sounded, unplayed if not) and every queued one is dropped as unplayed.
-    pub(crate) fn interrupt(&mut self, actions: &mut Vec<Action>) {
+    /// The person spoke over the playback (`stopped` false), or the call stopped: the reply being spoken ends
+    /// (interrupted if it had sounded, unplayed if not) and every queued one is dropped as unplayed. A barge-in cuts
+    /// the reply for the person (`user_interrupted`) and leaves the rest behind the newer turn (`newer_turn`); a stop
+    /// ends them all with the call (`call_ended`).
+    pub(crate) fn interrupt(&mut self, stopped: bool, actions: &mut Vec<Action>) {
+        let (cut, dropped) = if stopped {
+            (PlaybackReason::CallEnded, PlaybackReason::CallEnded)
+        } else {
+            (PlaybackReason::UserInterrupted, PlaybackReason::NewerTurn)
+        };
         if let Some(current) = self.current.take() {
             actions.push(Action::Stop);
-            let state = if current.started {
-                PlaybackStatus::Interrupted
+            let (state, reason) = if current.started {
+                (PlaybackStatus::Interrupted, cut)
             } else {
-                PlaybackStatus::Unplayed
+                (PlaybackStatus::Unplayed, dropped)
             };
-            actions.push(status(&current.utterance.id, state, heard(&current)));
+            actions.push(ended(&current.utterance.id, state, heard(&current), reason));
         }
         for utterance in self.queue.drain(..) {
-            actions.push(status(&utterance.id, PlaybackStatus::Unplayed, 0));
+            actions.push(ended(&utterance.id, PlaybackStatus::Unplayed, 0, dropped));
         }
     }
 
@@ -268,10 +299,14 @@ impl Playback {
             .filter(|current| current.utterance.id == utterance)
     }
 
+    /// Synthesizes the next chunk, unless one is under way or [`AHEAD`] are at the output unplayed.
     fn synthesize_next(&mut self, actions: &mut Vec<Action>) {
         let Some(current) = &mut self.current else {
             return;
         };
+        if current.synthesizing || current.next >= current.played + AHEAD {
+            return;
+        }
         let Some(chunk) = current.utterance.chunks.get(current.next) else {
             return;
         };
@@ -291,6 +326,20 @@ fn heard(current: &Current) -> usize {
         .played
         .checked_sub(1)
         .map_or(0, |last| current.utterance.chunks[last].chars.end)
+}
+
+fn ended(
+    utterance: &str,
+    status: PlaybackStatus,
+    heard_chars: usize,
+    reason: PlaybackReason,
+) -> Action {
+    Action::Status {
+        utterance: utterance.to_owned(),
+        status,
+        heard_chars,
+        reason: Some(reason),
+    }
 }
 
 fn status(utterance: &str, status: PlaybackStatus, heard_chars: usize) -> Action {

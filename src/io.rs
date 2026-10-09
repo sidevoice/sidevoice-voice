@@ -10,6 +10,8 @@ use crate::voice_call::Message;
 /// What the microphone and the speaker tell the call.
 #[derive(Debug, Clone, PartialEq)]
 pub enum IoEvent {
+    /// The microphone and the speaker are open: the call listens from now.
+    Ready,
     /// Captured audio: 16 kHz mono samples, in order, after echo cancellation.
     Captured(Vec<f32>),
     /// The first sample of a chunk reached the speaker.
@@ -44,7 +46,9 @@ impl IoSink {
 
 /// A microphone and a speaker for one call.
 pub trait AudioIo: MaybeSend {
-    /// Starts capturing and opens the speaker; every event goes to `sink`. Fails with a stable code.
+    /// Starts opening the microphone and the speaker; every event goes to `sink`. Once capture and playback work it
+    /// sends [`IoEvent::Ready`], or [`IoEvent::Failed`] if they cannot; the call listens only from `Ready`. Fails at
+    /// once with a stable code when it cannot even begin.
     ///
     /// # Errors
     ///

@@ -70,7 +70,8 @@ while let Some(event) = events.next().await {
     }
 }
 // What the room sends: call.room_event(RoomEvent::from_json(&message)?)
-// Other models (another transcriber, say): call.set_models(Arc::new(other)), which restarts a running call.
+// Other models (another transcriber, say), with the configuration they go with: call.set_models(Arc::new(other),
+// config), which restarts a running call once, on both.
 ```
 
 A page does the same with the npm package `@sidevoice/voice`, the WebAssembly build with the browser's microphone and
@@ -110,7 +111,8 @@ default). Their failures are errors with stable codes: `microphone-denied`, `mic
   person may be told of, is a `VoiceEvent::Error` with a stable code.
 - **`AudioIo`** is the microphone and the speaker: capture arrives as 16 kHz mono samples with the echo of the call's
   own playback already cancelled, and the speaker plays a reply's chunks in order and says when each starts and ends
-  (that is the clock of the heard position).
+  (that is the clock of the heard position). It says when both are ready (`IoEvent::Ready`), and only then does the
+  call listen.
 - **Which models, and their tuning, are the app's.** The detector's numbers core used and this module was written
   against: a probability of 0.6, speech confirmed after 400 ms, ended after 200 ms.
 
@@ -139,11 +141,13 @@ room.on("voice-reply", (data) => voice.speak(data));
 
 What both promise, beyond the types:
 
-- **`start()`** resolves at the first state whose `listening` is not `idle`, at once if the call listens already, and a
-  second `start` while one is pending settles with it. It rejects with `{code}`, and with `{code: "stopped"}` when
-  `stop()` comes first; `smart-turn` without an end-of-turn model rejects `end-of-turn-missing`. `stop()` is safe at
-  any time; `setSettings` rejects with the model source's `{code}` for settings it cannot fill (`model-unknown`,
-  `build-unfit`, …).
+- **`start()`** resolves once the microphone and the speaker work: at the first state whose `listening` is not `idle`,
+  at once if the call listens already, and a second `start` while one is pending settles with it. It rejects with
+  `{code}`, and with `{code: "stopped"}` when `stop()` comes first; `smart-turn` without an end-of-turn model rejects
+  `end-of-turn-missing`. `stop()` is safe at any time, and a `start` right after it, awaited or not, starts the call
+  again. `mute` and `setOnline` hold from the first call, even before `setSettings`. Settings that change the models
+  give the call the new models and configuration together (a live call restarts once); `setSettings` rejects with
+  the model source's `{code}` for settings it cannot fill (`model-unknown`, `build-unfit`, …).
 - **Events** reach the listeners subscribed when they are emitted, in the order the call emitted them; nothing is
   buffered. For each `turn_id`, `started` comes before exactly one `finished` or `cancelled`. A turn merged into the
   next is `cancelled` with `merged`, after that next turn's `started`. For each reply, `playing` (if it sounds) comes
@@ -176,11 +180,15 @@ time; a task around it (`src/voice_call.rs`) feeds it and does what it answers.
   when it is empty, written in no Latin letter for a language that is, or too unlikely; the turn is then
   `cancelled`. Otherwise it waits the merge window (none, 0.5 or 1.5 s by patience): a turn that follows within it
   joins it, and the earlier one is reported `cancelled` with `merged`.
-- **Playback.** A reply is cut into sentence chunks, each synthesized while the one before plays. A reply waits
-  while the person's turn is open or on its way to the room, and for the grace after it. A turn that opens while a
-  reply is on its way is a barge-in: the speaker stops with a short fade, the reply is `interrupted` (or `unplayed`
-  if it had not sounded) and every queued reply is dropped as `unplayed`. A reply sent again under the same id is
-  ignored, unless it is a replay.
+- **Playback.** A reply is cut into sentence chunks, each synthesized while the one before plays and never further
+  ahead (two chunks at most at the speaker unplayed). A reply waits while the person's turn is open or on its way to
+  the room, and for the grace after it. A turn that opens while a reply is on its way is a barge-in: the speaker
+  stops with a short fade, the reply is `interrupted` (`user_interrupted`; or `unplayed`, `newer_turn`, if it had not
+  sounded) and every queued reply is dropped as `unplayed` (`newer_turn`). A reply written before the person's latest
+  turn (its `revision` below the turn's) is dropped as it arrives, `unplayed` (`newer_turn`), unless it is a replay
+  the person asked for; one that arrives while the call is stopped is `unplayed` (`call_ended`) and never plays. A
+  reply that cannot be spoken is `failed`, what of it was at the speaker is flushed, and its code is an error. A
+  reply sent again under the same id is ignored, unless it is a replay.
 - **The heard position** moves at chunk boundaries: a chunk counts once its last sample left the speaker, never in
   part. It is what `heard_chars` reports and what the karaoke shows.
 - **Offline** is a flag, not a state: everything goes on, and turns say `offline`; the host's outbox keeps the
@@ -191,13 +199,15 @@ time; a task around it (`src/voice_call.rs`) feeds it and does what it answers.
 The module holds no socket. It emits, each with a `client_msg_id` for the host's outbox and the room's `voice-ack`:
 
 - `voice-user-turn {turn_id, phase: started | cancelled | finished, revision, text?, language?, offline, started_at,
-  ended_at?, merged, timings?}`. `finished` is what becomes the conversation's row; `revision` is the latest room
+  ended_at?, merged, timings_ms?}`. `finished` is what becomes the conversation's row; `revision` is the latest room
   revision seen on a reply when the turn started.
 - `voice-playback {utterance_id, status: playing | heard | interrupted | unplayed | failed, heard_chars, reason?,
-  at}`, the input of the room's heard and unheard bookkeeping. `heard_chars` counts Unicode scalar values.
+  at}`, the input of the room's heard and unheard bookkeeping. `heard_chars` counts Unicode scalar values; `reason`
+  is the room's word (`user_interrupted`, `newer_turn`, `call_ended`), and a failure has none.
 
 It consumes `voice-reply {utterance_id, revision, reply_revision, thread_id, history_id, text, language, replay?}`
-and lets every other room message through.
+and the room's answer to a started turn, `voice-user-turn {phase: started, revision}` (a reply written below that
+revision is stale), and lets every other room message through.
 
 ## Status
 
