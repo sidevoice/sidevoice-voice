@@ -4,7 +4,9 @@
 use super::{Call, Effect, Input, Transcript};
 use crate::config::{Patience, VoiceConfig};
 use crate::event::{Karaoke, Listening, VoiceEvent};
-use crate::room::{PlaybackStatus, Reply, RoomEvent, RoomMessage, TurnPhase, UserTurn};
+use crate::room::{
+    PlaybackReason, PlaybackStatus, Reply, RoomEvent, RoomMessage, TurnPhase, UserTurn,
+};
 use crate::test_support::{clip, config, silence, EnergyVad, FLEURS_ES, QUILTER, WINDOW};
 
 #[cfg(web)]
@@ -107,6 +109,19 @@ impl Run {
                     report.status,
                     report.heard_chars,
                 )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The playback reports among `effects`, as (status, reason).
+    fn reasons(effects: &[Effect]) -> Vec<(PlaybackStatus, Option<PlaybackReason>)> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Event(VoiceEvent::RoomMessage(RoomMessage::Playback(report))) => {
+                    Some((report.status, report.reason))
+                }
                 _ => None,
             })
             .collect()
@@ -586,4 +601,82 @@ fn stopping_cancels_the_turn_and_interrupts_the_reply() {
     );
     run.hear(&speech());
     assert!(Run::turns(&run.take()).is_empty(), "stopped");
+}
+
+#[test]
+fn a_reply_that_arrives_while_the_call_is_stopped_never_plays() {
+    let mut run = Run::new(config());
+    run.input(Input::Stop);
+    run.take();
+    run.reply(
+        "late",
+        "A reply the room sent before it heard the call stop.",
+    );
+    let effects = run.take();
+    assert!(Run::synthesize(&effects).is_empty());
+    assert_eq!(
+        Run::reasons(&effects),
+        [(PlaybackStatus::Unplayed, Some(PlaybackReason::CallEnded))]
+    );
+    // Starting again does not bring it back.
+    run.input(Input::Start);
+    run.wait(2_000);
+    assert!(Run::synthesize(&run.take()).is_empty());
+}
+
+#[test]
+fn a_reply_written_before_the_persons_latest_turn_is_dropped_when_it_arrives() {
+    let mut run = Run::new(config());
+    run.reply("u1", "The first answer, seen at revision seven.");
+    run.take();
+    run.hear(&speech());
+    run.take();
+    // Written at revision 7, before the turn: it answers what came before.
+    run.reply("u2", "A reply still in transport when the person spoke.");
+    let effects = run.take();
+    assert_eq!(
+        Run::reasons(&effects),
+        [(PlaybackStatus::Unplayed, Some(PlaybackReason::NewerTurn))]
+    );
+    // The room gave the turn revision 12: a reply written at 10 is stale too, one at 12 is not.
+    run.input(Input::Room(RoomEvent::TurnStarted { revision: 12 }));
+    let mut stale = reply("u3", "Written at ten.");
+    stale.revision = 10;
+    run.input(Input::Room(RoomEvent::Reply(stale)));
+    let mut fresh = reply("u4", "Written for the turn.");
+    fresh.revision = 12;
+    run.input(Input::Room(RoomEvent::Reply(fresh)));
+    let effects = run.take();
+    assert_eq!(
+        Run::reasons(&effects),
+        [(PlaybackStatus::Unplayed, Some(PlaybackReason::NewerTurn))]
+    );
+    // A replay the person asked for is never stale.
+    let mut replay = reply("u1", "The first answer, again.");
+    replay.replay = true;
+    run.input(Input::Room(RoomEvent::Reply(replay)));
+    assert!(Run::reasons(&run.take()).is_empty());
+}
+
+#[test]
+fn an_expired_grace_is_no_deadline_while_a_turn_holds_the_reply_back() {
+    let mut run = Run::new(config());
+    run.hear(&speech());
+    run.hear(&silence(3_000));
+    let (turn, _) = Run::transcribe(&run.take()).expect("transcribed");
+    run.transcribed(turn, "a question");
+    run.wait(500);
+    // A second turn opens and a reply waits for it, well past the first turn's grace.
+    run.hear(&speech());
+    let mut answer = reply("u1", "An answer written for the first turn.");
+    answer.revision = 20;
+    run.input(Input::Room(RoomEvent::Reply(answer)));
+    run.take();
+    assert!(run.now > 2_000);
+    assert!(
+        run.call
+            .deadline()
+            .is_none_or(|deadline| deadline > run.now),
+        "no expired deadline while the person speaks"
+    );
 }

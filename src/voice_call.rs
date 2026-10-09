@@ -2,8 +2,10 @@
 //! models ([`VoiceModels`]) as the call starts and drops them once it has been stopped for its idle minutes, opens
 //! the microphone and the speaker, feeds the capture to the detector and its windows to the state machine, runs each
 //! transcription, synthesis and end-of-turn question as a task of its own (so a long one never holds the detector
-//! back), and does what the state machine answers. Everything reaches it as messages on one channel; the
-//! host hears it through [`Events`].
+//! back), and does what the state machine answers. The owner's calls reach it on a channel only [`VoiceCall`] holds,
+//! and what the microphone, the speaker and the model tasks report on one of its own; the host hears it through
+//! [`Events`]. When the owner's channel closes (the [`VoiceCall`] was dropped) the task stops the call, drops the
+//! models and the microphone and speaker, and ends: what its tasks report after that goes nowhere.
 
 #[cfg(all(test, native))]
 mod tests;
@@ -13,8 +15,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use futures_channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
-use futures_util::future::{select, Either};
-use futures_util::StreamExt;
+use futures_util::future::{ready, select, Either};
+use futures_util::{stream, StreamExt};
 
 use crate::call::{Call, Effect, Input, Transcript};
 use crate::config::{EndOfTurn, VoiceConfig};
@@ -73,6 +75,7 @@ impl VoiceCall {
         config: VoiceConfig,
     ) -> (Self, Events) {
         let (messages, inbox) = unbounded();
+        let (internal, reported) = unbounded();
         let (events, received) = unbounded();
         let driver = Driver {
             call: Call::new(
@@ -88,10 +91,10 @@ impl VoiceCall {
             running: false,
             captured: VecDeque::new(),
             taken: 0,
-            messages: messages.clone(),
+            messages: internal,
             events,
         };
-        spawn(driver.run(inbox));
+        spawn(driver.run(inbox, reported));
         (Self { messages }, received)
     }
 
@@ -156,12 +159,20 @@ struct Driver {
     captured: VecDeque<f32>,
     /// The detector's position: samples taken into windows since its last reset.
     taken: u64,
+    /// The task's own channel, for what the microphone, the speaker and the model tasks report.
     messages: UnboundedSender<Message>,
     events: UnboundedSender<VoiceEvent>,
 }
 
 impl Driver {
-    async fn run(mut self, mut inbox: UnboundedReceiver<Message>) {
+    async fn run(
+        mut self,
+        owner: UnboundedReceiver<Message>,
+        reported: UnboundedReceiver<Message>,
+    ) {
+        // `None` once the owner's channel closed; the task's own channel never does, since the task holds a sender.
+        let owner = owner.map(Some).chain(stream::once(ready(None)));
+        let mut inbox = stream::select(owner, reported.map(Some));
         loop {
             let deadline = [self.call.deadline(), self.residency.deadline()]
                 .into_iter()
@@ -186,9 +197,10 @@ impl Driver {
                     }
                 }
             };
-            let Some(message) = message else {
+            let Some(Some(message)) = message else {
                 // The VoiceCall was dropped.
                 self.halt().await;
+                self.loaded = None;
                 return;
             };
             self.receive(message).await;
@@ -306,8 +318,9 @@ impl Driver {
             return;
         }
         self.running = false;
-        self.input(Input::Stop);
+        // The microphone and the speaker close before the call says it is idle.
         self.io.stop();
+        self.input(Input::Stop);
         self.captured.clear();
         self.taken = 0;
         if let Some(loaded) = &mut self.loaded {

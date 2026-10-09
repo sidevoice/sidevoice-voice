@@ -432,3 +432,42 @@ fn smart_turn_ends_a_turn_at_a_pause_its_model_says_is_the_end() {
         assert!(asked.load(Ordering::SeqCst) >= 1);
     });
 }
+
+#[test]
+fn dropping_the_call_closes_the_microphone_drops_the_models_and_ends_the_events() {
+    runtime().block_on(async {
+        let alive = Arc::new(AtomicUsize::new(0));
+        let (call, mut events, speakers) = call(FakeModels {
+            alive: Arc::clone(&alive),
+            ..FakeModels::default()
+        });
+        call.start();
+        next(&mut events, |event| match event {
+            VoiceEvent::State(state) if state.listening == crate::Listening::Listening => Some(()),
+            _ => None,
+        })
+        .await;
+        let sink = speakers.lock().unwrap().sink.clone().expect("listening");
+        // A reply is being synthesized: a model task is under way when the owner goes.
+        call.room_event(RoomEvent::Reply(Reply {
+            utterance_id: "u1".into(),
+            revision: 1,
+            reply_revision: 2,
+            thread_id: "t".into(),
+            history_id: "h".into(),
+            text: "A reply the owner never hears.".into(),
+            language: Some("en".into()),
+            replay: false,
+        }));
+        drop(call);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while events.next().await.is_some() {}
+        })
+        .await
+        .expect("the events end");
+        assert!(speakers.lock().unwrap().sink.is_none(), "the io stopped");
+        assert_eq!(alive.load(Ordering::SeqCst), 0, "the models were dropped");
+        // What the microphone still delivers goes nowhere.
+        sink.send(IoEvent::Captured(clip(QUILTER, 0.9)));
+    });
+}
