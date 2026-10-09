@@ -145,7 +145,7 @@ merge of that head into the PR's base, and published nowhere: a snapshot to try,
 From a PR to its package:
 
 ```sh
-sha=$(gh pr view 3 --repo sidevoice/sidevoice-voice --json headRefOid --jq .headRefOid)
+sha=$(gh pr view 4 --repo sidevoice/sidevoice-voice --json headRefOid --jq .headRefOid)
 gh api "repos/sidevoice/sidevoice-voice/actions/artifacts?name=voice-npm-$sha" \
   --jq '[.artifacts[] | select(.expired | not)][0].archive_download_url'
 ```
