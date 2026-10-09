@@ -1,0 +1,51 @@
+name: ci
+
+# Every pull request: format and Clippy (native and wasm32), the tests on macOS and Linux, and the wasm32 build.
+on:
+  # Into any branch, so a pull request stacked on another is checked before its base merges.
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: ./.github/actions/setup
+        with:
+          wasm: true
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo clippy --locked --all-targets --target wasm32-unknown-unknown -- -D warnings
+
+  test-native:
+    name: Test native (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: macos-aarch64, runner: macos-14 }
+          - { target: linux-x86_64, runner: ubuntu-24.04 }
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: ./.github/actions/setup
+      - run: cargo test --locked
+
+  build-wasm:
+    name: Build wasm
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: ./.github/actions/setup
+        with:
+          wasm: true
+      - run: cargo build --locked --target wasm32-unknown-unknown

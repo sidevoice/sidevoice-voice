@@ -1,0 +1,18 @@
+[package]
+name = "sidevoice-voice"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.98"
+# Shipped through git tags and the npm package, never crates.io.
+publish = false
+license = "Apache-2.0"
+repository = "https://github.com/sidevoice/sidevoice-voice"
+description = "Sidevoice voice: the call on the device, from the microphone to turns and from replies to the speaker"
+
+[lib]
+# cdylib: the wasm32 build that becomes the npm package. Native consumers depend on the crate as source and get the
+# rlib.
+crate-type = ["rlib", "cdylib"]
+
+[build-dependencies]
+cfg_aliases = "0.2.2"
