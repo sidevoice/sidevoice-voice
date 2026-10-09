@@ -137,6 +137,7 @@ voice.onPlayback((report) => outbox.send({ type: "voice-playback", data: report 
 await voice.setSettings({ stt: { model: "whisper-base", language: "es" }, tts: { model: "kokoro-82m-v1.0", voice: "ef_dora" } });
 await voice.start();                                    // resolves once listening; rejects {code}
 room.on("voice-reply", (data) => voice.speak(data));
+room.on("voice-user-turn", (data) => data.phase === "started" && voice.turnStarted(data)); // the room's answer
 ```
 
 What both promise, beyond the types:
@@ -149,12 +150,14 @@ What both promise, beyond the types:
   give the call the new models and configuration together (a live call restarts once); `setSettings` rejects with
   the model source's `{code}` for settings it cannot fill (`model-unknown`, `build-unfit`, …).
 - **Events** reach the listeners subscribed when they are emitted, in the order the call emitted them; nothing is
-  buffered. For each `turn_id`, `started` comes before exactly one `finished` or `cancelled`. A turn merged into the
+  buffered. For each `turn_id`, `started` comes before exactly one `finished` or `cancelled`; a turn that started
+  offline is only `finished`. A turn merged into the
   next is `cancelled` with `merged`, after that next turn's `started`. For each reply, `playing` (if it sounds) comes
   before exactly one of `heard`, `interrupted`, `unplayed`, `failed`, and karaoke only follows replies given to
   `speak`.
-- **Every room message carries its own `client_msg_id`**, and turns emitted while `setOnline(false)` say
-  `offline: true`.
+- **Every room message carries its own `client_msg_id`**, and a turn started while `setOnline(false)` says
+  `offline: true`. The room's answer to a turn's `started` goes to `turnStarted`: it names the turn and the revision
+  that is its boundary for stale replies.
 - **Settings** name a model per stage and optionally its build, the language, voice and speed, the patience, the end
   of turn and `idle_unload_minutes` (how long the models stay loaded with the call stopped; 10 by default). A rejected
   `setSettings` changes nothing. A change to the models the settings choose (a stage, or the end of turn) gives the

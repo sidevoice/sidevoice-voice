@@ -40,15 +40,14 @@ export interface VoiceSettings {
 export interface VoiceUserTurn {
   /** Unique per message: the outbox's id and what the room acknowledges. */
   client_msg_id: string;
-  /** The same on every phase of one turn. */
+  /** The call's name for the turn: the same in every phase, and how the room knows it. Turns may overlap. */
   turn_id: string;
+  /** A turn that started while offline is only ever `finished`. */
   phase: "started" | "cancelled" | "finished";
-  /** The latest room revision the call had seen on a reply when the turn started (0 before any). */
-  revision: number;
   /** In `finished`, and in a `cancelled` merged into the next turn. */
   text?: string;
   language?: string;
-  /** Emitted while `setOnline(false)`. */
+  /** The turn started while `setOnline(false)`: the room takes its `finished` as words said while away. */
   offline: boolean;
   /** Unix milliseconds. */
   started_at: number;
@@ -70,6 +69,16 @@ export interface VoicePlayback {
   reason?: "user_interrupted" | "newer_turn" | "call_ended";
   /** Unix milliseconds. */
   at: number;
+}
+
+/** The room's answer to a turn's `started`: `voice-user-turn`'s `data` with `phase: "started"`, as the room sent it. */
+export interface VoiceTurnStarted {
+  phase: "started";
+  /** The call's `turn_id`, echoed. */
+  turn_id: string;
+  /** The revision the room gave the turn: a reply written below it answers an older turn. */
+  revision: number;
+  thread_id?: string | null;
 }
 
 /** A reply the room wants spoken: `voice-reply`'s `data`, as the room sent it. */
@@ -160,6 +169,8 @@ export interface VoiceHost {
   stop(): Promise<void>;
   /** A room `voice-reply`'s `data`. A reply whose `utterance_id` was seen is ignored unless `replay`. */
   speak(reply: VoiceReply): void;
+  /** The room's answer to a turn's `started` (`VoiceTurnStarted`): the call drops replies written before that turn. */
+  turnStarted(started: VoiceTurnStarted): void;
   /** Whether the room is in reach: turns emitted while it is not carry `offline: true`. Kept from the first call, even
    *  before `setSettings`. */
   setOnline(online: boolean): void;
