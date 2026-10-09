@@ -1,0 +1,37 @@
+{
+  "name": "@sidevoice/voice",
+  "version": "0.0.0-stamped-by-cargo-xtask-npm",
+  "description": "Sidevoice voice for the web: the voice call in the browser, as WebAssembly, with its microphone and speaker.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./js/index.d.ts",
+      "default": "./js/index.js"
+    }
+  },
+  "types": "./js/index.d.ts",
+  "files": [
+    "dist/",
+    "js/"
+  ],
+  "keywords": [
+    "sidevoice",
+    "voice",
+    "call",
+    "speech",
+    "web-audio",
+    "wasm"
+  ],
+  "homepage": "https://github.com/sidevoice/sidevoice-voice#readme",
+  "bugs": {
+    "url": "https://github.com/sidevoice/sidevoice-voice/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sidevoice/sidevoice-voice.git"
+  },
+  "peerDependencies": {
+    "@sidevoice/engine": "*"
+  }
+}

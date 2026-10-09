@@ -1,3 +1,7 @@
+[alias]
+# Build tooling (the npm package, release assets, publishing): `cargo xtask <command>`, see xtask/src/main.rs.
+xtask = "run --quiet --locked --manifest-path xtask/Cargo.toml --"
+
 # `cargo test --target wasm32-unknown-unknown --lib` runs the module's tests in Node through the wasm-bindgen CLI's
 # test runner, which must be on the PATH at the version of `wasm-bindgen` in Cargo.lock (.github/actions/setup
 # installs it in CI). Doctests are left out: rustdoc cannot run them on wasm32.

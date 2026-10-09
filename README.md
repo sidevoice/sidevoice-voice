@@ -6,6 +6,7 @@
 </picture>
 
 <p>
+  <a href="https://github.com/sidevoice/sidevoice-voice/actions/workflows/release.yml"><picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/github/ci/sidevoice/sidevoice-voice.svg?variant=secondary&size=sm&workflow=release.yml&branch=main&mode=dark" /><img alt="release status" src="https://shieldcn.dev/github/ci/sidevoice/sidevoice-voice.svg?variant=secondary&size=sm&workflow=release.yml&branch=main&mode=light" /></picture></a>
   <a href="LICENSE"><picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/github/license/sidevoice/sidevoice-voice.svg?variant=secondary&size=sm&mode=dark" /><img alt="licence" src="https://shieldcn.dev/github/license/sidevoice/sidevoice-voice.svg?variant=secondary&size=sm&mode=light" /></picture></a>
   <picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/badge/status-skeleton.svg?variant=secondary&size=sm&mode=dark" /><img alt="status: skeleton" src="https://shieldcn.dev/badge/status-skeleton.svg?variant=secondary&size=sm&mode=light" /></picture>
 </p>
@@ -63,10 +64,28 @@ while let Some(event) = events.next().await {
 // What the room sends: call.room_event(RoomEvent::from_json(&message)?)
 ```
 
-A page does the same with the WebAssembly build: `VoiceCall.create(engine, io, config)`, where `engine` is a
-`WebEngine` of `@sidevoice/engine` and `io` a JavaScript microphone and speaker; `onEvent(listener)` hears the same
-events as `{type, data}`, and `roomEvent(message)`, `setConfig`, `setOnline`, `mute`, `cancelInput`, `start` and `stop`
-mirror the Rust methods (`src/web.rs`).
+A page does the same with the npm package `@sidevoice/voice`, the WebAssembly build with the browser's microphone and
+speaker. `engine` is a `WebEngine` of `@sidevoice/engine`, which the page brings (a peer dependency):
+
+```js
+import init, { VoiceCall } from "@sidevoice/voice";
+
+await init();
+const call = VoiceCall.create(engine, config); // the same configuration, as JSON
+call.onEvent(({ type, data }) => { /* "room-message", "state", "level", "karaoke", "error" */ });
+call.start(); // loads the models, asks for the microphone, listens
+// What the room sends: call.roomEvent(message)
+```
+
+`onEvent(listener)` hears the same events as `{type, data}`, and `roomEvent(message)`, `setConfig`, `setOnline`,
+`mute`, `cancelInput`, `start` and `stop` mirror the Rust methods (`src/web.rs`). The microphone is `getUserMedia`
+with the browser's echo cancellation, noise suppression and gain control, brought to 16 kHz mono in an AudioWorklet;
+the speaker is Web Audio (`js/web-audio-io.js`). `VoiceCall.create(engine, config, {outputDevice})` plays on another
+output where the browser lets an `AudioContext` choose one (a non-default output may escape the browser's canceller,
+an open point of sidevoice-core#89), and `{io}` brings a microphone and speaker of the page's own, with `start(sink)`,
+`play(utterance, chunk, samples, sampleRate)`, `stopPlayback()` and `stop()` (`createWebAudioIo` is the default).
+Their failures are errors with stable codes: `microphone-denied`, `microphone-unavailable`, `microphone-lost`,
+`audio-capture-failed`, `audio-output-failed`.
 
 - **The configuration** (`VoiceConfig`, read strictly from JSON) names the engine model of each stage (`vad`, `stt`,
   `tts`, with an optional `build`, and the language, voice and speed), what ends a turn (`end_of_turn`: `silence`, or
@@ -122,8 +141,10 @@ and lets every other room message through.
 
 The state machine and its task, with the engine on both platforms: natively the engine crate, in the browser the
 page's `WebEngine`. The engine is pinned to sidevoice-engine#71 (the `vad` capability) until a release carries it.
-Still to come: the native microphone and speaker with echo cancellation (cpal and WebRTC AEC3), the browser's
-(`getUserMedia` and Web Audio), and the npm package.
+The browser's microphone and speaker (`getUserMedia` and Web Audio) and the npm package `@sidevoice/voice`, built and
+smoke-tested on every pull request and released with release-please (RELEASING.md); whether a chosen output device
+stays in the browser's echo canceller is still to be checked per browser (sidevoice-core#89). Still to come: the
+native microphone and speaker with echo cancellation (cpal and WebRTC AEC3).
 
 ## Layout
 
@@ -147,6 +168,12 @@ src/            the crate sidevoice-voice
   maybe_send.rs   Send and Sync in native builds only
 tests/          recorded_call.rs, the whole call with real models; fixtures/, the recorded clips
 build.rs        the two cfg aliases: web, native
+js/             the npm package's JavaScript, shipped as it is (ES modules, no dependencies)
+  index.js        the entry point: the wasm build, and VoiceCall.create(engine, config, options?) on the browser's IO
+  web-audio-io.js the browser's microphone and speaker (createWebAudioIo); capture-worklet.js, its AudioWorklet
+  *.d.ts          their types
+npm/            the npm package's package.json (version stamped by xtask) and README
+xtask/          the build tooling, `cargo xtask`: the npm package, its smoke test, the release assets, publishing
 ```
 
 ## Build and test
@@ -171,6 +198,17 @@ The wasm32 tests run in Node and need the wasm32 target, Node.js, and the wasm-b
 
 ```sh
 cargo test --locked --target wasm32-unknown-unknown --lib
+```
+
+The npm package `@sidevoice/voice` is built and packed into `target/npm/` by `cargo xtask npm` (wasm-bindgen and npm
+on the `PATH` too), and `cargo xtask npm-smoke` installs it as a consumer does and runs a call from it in Node, on a
+fake engine and a fake microphone and speaker. The build tooling has tests of its own. How a version is released, on
+GitHub and npm, is in [`RELEASING.md`](RELEASING.md).
+
+```sh
+cargo test --locked --manifest-path xtask/Cargo.toml
+cargo xtask npm
+cargo xtask npm-smoke
 ```
 
 ## Contributing
