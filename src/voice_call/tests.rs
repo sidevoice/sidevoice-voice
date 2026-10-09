@@ -554,3 +554,24 @@ fn models_and_their_configuration_change_together_on_a_live_call() {
         assert_eq!(next(&mut events, listening).await, Ok(()));
     });
 }
+
+#[test]
+fn every_stop_is_answered_with_an_idle_state() {
+    runtime().block_on(async {
+        let (call, mut events, _speakers) = call(FakeModels::default());
+        // Never started: the stop still says idle.
+        call.stop();
+        next(&mut events, |event| match event {
+            VoiceEvent::State(state) if state.listening == crate::Listening::Idle => Some(()),
+            _ => None,
+        })
+        .await;
+        // Stopped twice: each stop is answered.
+        call.stop();
+        next(&mut events, |event| match event {
+            VoiceEvent::State(state) if state.listening == crate::Listening::Idle => Some(()),
+            _ => None,
+        })
+        .await;
+    });
+}
