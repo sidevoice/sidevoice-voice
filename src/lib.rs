@@ -19,6 +19,7 @@ mod maybe_send;
 mod models;
 mod playback;
 mod recognition;
+mod residency;
 mod room;
 mod runtime;
 mod speech;
