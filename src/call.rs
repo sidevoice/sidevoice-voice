@@ -15,7 +15,7 @@ mod tests;
 
 use std::collections::HashMap;
 
-use crate::config::VoiceConfig;
+use crate::config::{EndOfTurn, VoiceConfig};
 use crate::event::{CallState, Karaoke, Listening, VoiceError, VoiceEvent};
 use crate::playback::{Action, Playback};
 use crate::recognition::{accepted, Job, Outcome, Recognition};
@@ -58,7 +58,17 @@ pub(crate) enum Input {
     Mute(bool),
     /// The person cancels what they said that is not reported yet.
     Cancel,
+    /// What the end-of-turn model said of a turn's pause: the probability that the turn is over, or the stable code
+    /// of why there is none.
+    EndOfTurn {
+        turn: usize,
+        pause: u32,
+        result: Result<f32, String>,
+    },
 }
+
+/// The end-of-turn probability from which a paused turn is over.
+const END_OF_TURN_LIKELY: f32 = 0.5;
 
 /// A transcript as the recogniser gave it.
 #[derive(Debug, Clone, PartialEq)]
@@ -95,6 +105,12 @@ pub(crate) enum Effect {
     },
     /// Stop the output with a short fade and drop what it holds.
     StopPlayback,
+    /// Ask the end-of-turn model whether a paused turn is over, then feed [`Input::EndOfTurn`].
+    EndOfTurn {
+        turn: usize,
+        pause: u32,
+        pcm: Vec<f32>,
+    },
 }
 
 /// A turn the room was told of, until it is finished or cancelled.
@@ -206,6 +222,19 @@ impl Call {
                 }
             }
             Input::Cancel => self.cancel_input(now, &mut out),
+            Input::EndOfTurn {
+                turn,
+                pause,
+                result,
+            } => match result {
+                Ok(probability) if probability >= END_OF_TURN_LIKELY && self.open == Some(turn) => {
+                    if let Some(segment) = self.segmenter.end_paused(pause) {
+                        self.segment(now, segment, &mut out);
+                    }
+                }
+                Ok(_) => {}
+                Err(code) => self.error(&code, &mut out),
+            },
         }
         self.settle(now, &mut out);
         out
@@ -271,6 +300,11 @@ impl Call {
                 self.playback.interrupt(&mut actions);
                 self.act(now, actions, out);
             }
+            Segment::Paused { pcm, pause } => {
+                if let Some(turn) = self.open {
+                    out.push(Effect::EndOfTurn { turn, pause, pcm });
+                }
+            }
             Segment::Ended(ended) => {
                 let Some(number) = self.open.take() else {
                     return;
@@ -299,7 +333,7 @@ impl Call {
             out.push(Effect::Transcribe {
                 turn: job.turn,
                 pcm: job.pcm,
-                language: self.config.stt.language.clone(),
+                language: self.config.language.clone(),
             });
         }
     }
@@ -315,7 +349,7 @@ impl Call {
             return;
         }
         let next = self.recognition.done();
-        let language = self.config.stt.language.clone();
+        let language = self.config.language.clone();
         let text = match result {
             Ok(transcript) => accepted(&transcript.text, language.as_deref(), transcript.logprob),
             Err(code) => {
@@ -453,7 +487,7 @@ impl Call {
             turn_id: turn.id.clone(),
             phase,
             revision: turn.revision,
-            language: text.as_ref().and(self.config.stt.language.clone()),
+            language: text.as_ref().and(self.config.language.clone()),
             text,
             offline: !self.online,
             started_at: self.epoch_unix_ms + turn.started_ms,
@@ -545,8 +579,15 @@ impl Call {
 
 /// The numbers segmentation takes from a configuration.
 fn segmentation(config: &VoiceConfig) -> Segmentation {
+    let (pause, longest) = config.patience.smart_turn_ms();
+    let smart = config.end_of_turn == EndOfTurn::SmartTurn;
     Segmentation {
-        end_of_turn_silence_ms: config.patience.end_of_turn_silence_ms(),
+        end_of_turn_silence_ms: if smart {
+            longest
+        } else {
+            config.patience.end_of_turn_silence_ms()
+        },
+        pause_ms: smart.then_some(pause),
         quiet_bar: config.listening_bar.quiet,
         playing_bar: config.listening_bar.playing,
     }
