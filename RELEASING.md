@@ -88,7 +88,8 @@ only, as one step, `cargo xtask npm-publish vX.Y.Z`:
 3. A version **already published** with the same bytes (what `npm pack @sidevoice/voice@X.Y.Z` fetches) is skipped;
    with other bytes it fails: **npm versions are immutable**, so a bad release is fixed by the next version.
 4. A version **already staged** is skipped too: with the same bytes (its `shasum`, where `npm stage list` can be read)
-   or when npm refuses to stage it again (a conflict). With other bytes it fails and says to reject the staged one.
+   or when npm refuses to stage it again (`E409`, "Cannot publish over previously staged version"). With other bytes
+   it fails and says to reject the staged one.
 5. Otherwise it stages the tarball with `npm stage publish --access public --provenance --tag latest|next` and ends
    with the **stage id** and how to approve it.
 

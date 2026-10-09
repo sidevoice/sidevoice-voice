@@ -287,12 +287,12 @@ pub(crate) fn publish(tag: &str) -> Result<()> {
     Ok(())
 }
 
-/// Whether npm refused to stage a version because that version is staged already: the registry answers a conflict.
-/// The job cannot list staged versions itself (trusted publishing authenticates the publish only), so this is how a
-/// re-run of a release finds the version it staged before.
+/// Whether npm refused to stage a version because that version is staged already: the registry answers `E409` with
+/// "Cannot publish over previously staged version" (`STAGED_CONFLICT` in the tests, as npm said it). The job cannot list
+/// staged versions itself (trusted publishing authenticates the publish only), so this is how a re-run of a release
+/// finds the version it staged before.
 fn already_staged(error: &str) -> bool {
-    let error = error.to_ascii_lowercase();
-    error.contains("e409") || error.contains("already staged") || error.contains("conflict")
+    error.contains("E409") && error.to_ascii_lowercase().contains("previously staged")
 }
 
 /// What a maintainer does with a staged version.
