@@ -1,6 +1,5 @@
 Recorded speech the tests hear, 16 kHz mono 16-bit PCM WAV. The unit tests compile them in (`src/test_support.rs`),
-so the wasm32 tests read them too. Real models are the apps' to test (sidevoice-desktop feeds the first clip to the
-engine's models through its adapter).
+so the wasm32 tests read them too. Real models are the apps' to test.
 
 | File | What it is | Source | Licence | SHA-256 |
 |---|---|---|---|---|
