@@ -66,7 +66,7 @@ pub struct UserTurn {
     /// Whether this turn joined others (`finished`), or was joined into the next (`cancelled`).
     pub merged: bool,
     /// How long each part took, in milliseconds; present once the turn has ended.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "timings_ms", skip_serializing_if = "Option::is_none")]
     pub timings: Option<TurnTimings>,
 }
 
@@ -105,9 +105,9 @@ pub struct Playback {
     pub status: PlaybackStatus,
     /// How much of its text was heard, in characters (Unicode scalar values) from its start.
     pub heard_chars: usize,
-    /// Why it failed, as a stable code.
+    /// Why it stopped short or never played. A failure has none: its stable code goes to the host as an error.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
+    pub reason: Option<PlaybackReason>,
     /// When, in Unix milliseconds.
     pub at: u64,
 }
@@ -128,11 +128,26 @@ pub enum PlaybackStatus {
     Failed,
 }
 
+/// Why a reply stopped short or never played, in the room's words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlaybackReason {
+    /// The person spoke over it.
+    UserInterrupted,
+    /// The person started a turn after it was written, or before its turn came.
+    NewerTurn,
+    /// The call stopped.
+    CallEnded,
+}
+
 /// What the room sends that the module takes.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RoomEvent {
     /// A reply to speak.
     Reply(Reply),
+    /// The room opened a turn of the person's: the revision it gave it. A reply written before it answers an older
+    /// turn.
+    TurnStarted { revision: u64 },
     /// Anything else the room sends, which the module does not use.
     Other,
 }
@@ -154,6 +169,15 @@ impl RoomEvent {
         let envelope = Envelope::deserialize(message)?;
         match envelope.kind.as_str() {
             "voice-reply" => Reply::deserialize(envelope.data).map(Self::Reply),
+            "voice-user-turn" if envelope.data["phase"] == "started" => {
+                #[derive(Deserialize)]
+                struct Started {
+                    revision: u64,
+                }
+                Started::deserialize(envelope.data).map(|started| Self::TurnStarted {
+                    revision: started.revision,
+                })
+            }
             _ => Ok(Self::Other),
         }
     }

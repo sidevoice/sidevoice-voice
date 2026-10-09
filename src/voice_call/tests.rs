@@ -122,6 +122,8 @@ impl Speaker for FakeSpeaker {
 /// What the call did to the speaker, and the sink it was given.
 #[derive(Default)]
 struct Speakers {
+    /// Whether `start` leaves the microphone opening: the test says when it is ready.
+    opening: bool,
     sink: Option<IoSink>,
     played: Vec<(String, usize, usize, u32)>,
     stopped: usize,
@@ -131,7 +133,11 @@ struct FakeIo(Arc<Mutex<Speakers>>);
 
 impl AudioIo for FakeIo {
     fn start(&mut self, sink: IoSink) -> Result<(), String> {
-        self.0.lock().unwrap().sink = Some(sink);
+        let mut speakers = self.0.lock().unwrap();
+        if !speakers.opening {
+            sink.send(IoEvent::Ready);
+        }
+        speakers.sink = Some(sink);
         Ok(())
     }
 
@@ -430,5 +436,142 @@ fn smart_turn_ends_a_turn_at_a_pause_its_model_says_is_the_end() {
         .await;
         assert!(turn.text.is_some());
         assert!(asked.load(Ordering::SeqCst) >= 1);
+    });
+}
+
+#[test]
+fn dropping_the_call_closes_the_microphone_drops_the_models_and_ends_the_events() {
+    runtime().block_on(async {
+        let alive = Arc::new(AtomicUsize::new(0));
+        let (call, mut events, speakers) = call(FakeModels {
+            alive: Arc::clone(&alive),
+            ..FakeModels::default()
+        });
+        call.start();
+        next(&mut events, |event| match event {
+            VoiceEvent::State(state) if state.listening == crate::Listening::Listening => Some(()),
+            _ => None,
+        })
+        .await;
+        let sink = speakers.lock().unwrap().sink.clone().expect("listening");
+        // A reply is being synthesized: a model task is under way when the owner goes.
+        call.room_event(RoomEvent::Reply(Reply {
+            utterance_id: "u1".into(),
+            revision: 1,
+            reply_revision: 2,
+            thread_id: "t".into(),
+            history_id: "h".into(),
+            text: "A reply the owner never hears.".into(),
+            language: Some("en".into()),
+            replay: false,
+        }));
+        drop(call);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while events.next().await.is_some() {}
+        })
+        .await
+        .expect("the events end");
+        assert!(speakers.lock().unwrap().sink.is_none(), "the io stopped");
+        assert_eq!(alive.load(Ordering::SeqCst), 0, "the models were dropped");
+        // What the microphone still delivers goes nowhere.
+        sink.send(IoEvent::Captured(clip(QUILTER, 0.9)));
+    });
+}
+
+#[test]
+fn the_call_listens_only_once_its_microphone_and_speaker_are_ready() {
+    runtime().block_on(async {
+        let (call, mut events, speakers) = call(FakeModels::default());
+        speakers.lock().unwrap().opening = true;
+        call.start();
+        until(|| speakers.lock().unwrap().sink.is_some()).await;
+        // The permission prompt is still open: no state says it listens.
+        let early = tokio::time::timeout(Duration::from_millis(200), async {
+            loop {
+                if let Some(VoiceEvent::State(state)) = events.next().await {
+                    if state.listening != crate::Listening::Idle {
+                        return;
+                    }
+                }
+            }
+        })
+        .await;
+        assert!(early.is_err(), "listening before the microphone was ready");
+        let sink = speakers.lock().unwrap().sink.clone().unwrap();
+        sink.send(IoEvent::Ready);
+        next(&mut events, |event| match event {
+            VoiceEvent::State(state) if state.listening == crate::Listening::Listening => Some(()),
+            _ => None,
+        })
+        .await;
+
+        // A microphone refused while opening is an error, and the call never listened.
+        call.stop();
+        until(|| speakers.lock().unwrap().sink.is_none()).await;
+        call.start();
+        until(|| speakers.lock().unwrap().sink.is_some()).await;
+        let sink = speakers.lock().unwrap().sink.clone().unwrap();
+        sink.send(IoEvent::Failed("microphone-denied".into()));
+        let code = next(&mut events, |event| match event {
+            VoiceEvent::Error(error) => Some(error.code),
+            VoiceEvent::State(state) if state.listening == crate::Listening::Listening => {
+                Some("listened".into())
+            }
+            _ => None,
+        })
+        .await;
+        assert_eq!(code, "microphone-denied");
+        until(|| speakers.lock().unwrap().sink.is_none()).await;
+    });
+}
+
+#[test]
+fn models_and_their_configuration_change_together_on_a_live_call() {
+    runtime().block_on(async {
+        let (call, mut events, _speakers) = call(FakeModels::default());
+        let listening = |event| match event {
+            VoiceEvent::State(state) if state.listening == crate::Listening::Listening => {
+                Some(Ok(()))
+            }
+            VoiceEvent::Error(error) => Some(Err(error.code)),
+            _ => None,
+        };
+        call.start();
+        assert_eq!(next(&mut events, listening).await, Ok(()));
+        // Silence → smart-turn, with models that end turns: the call restarts on both and listens.
+        let smart = VoiceConfig {
+            end_of_turn: crate::EndOfTurn::SmartTurn,
+            ..config()
+        };
+        let ending = FakeModels {
+            end_of_turn: Some(Arc::new(Finished(Arc::default()))),
+            ..FakeModels::default()
+        };
+        call.set_models(Arc::new(ending), smart);
+        assert_eq!(next(&mut events, listening).await, Ok(()));
+        // Smart-turn → silence, with models that do not: the same.
+        call.set_models(Arc::new(FakeModels::default()), config());
+        assert_eq!(next(&mut events, listening).await, Ok(()));
+    });
+}
+
+#[test]
+fn every_stop_is_answered_with_an_idle_state() {
+    runtime().block_on(async {
+        let (call, mut events, _speakers) = call(FakeModels::default());
+        // Never started: the stop still says idle.
+        call.stop();
+        next(&mut events, |event| match event {
+            VoiceEvent::State(state) if state.listening == crate::Listening::Idle => Some(()),
+            _ => None,
+        })
+        .await;
+        // Stopped twice: each stop is answered.
+        call.stop();
+        next(&mut events, |event| match event {
+            VoiceEvent::State(state) if state.listening == crate::Listening::Idle => Some(()),
+            _ => None,
+        })
+        .await;
     });
 }

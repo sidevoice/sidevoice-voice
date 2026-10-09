@@ -5,7 +5,8 @@ use std::sync::atomic::Ordering;
 
 use rtrb::RingBuffer;
 
-use super::output::{Counters, Output, Schedule};
+use super::drain;
+use super::output::{Counters, Output, Queue, Schedule};
 use super::pipeline::Pipeline;
 use crate::io::IoEvent;
 use crate::test_support::{clip, QUILTER};
@@ -41,7 +42,6 @@ fn a_stop_fades_out_and_drops_only_what_was_queued_before_it() {
     for _ in 0..100 {
         playback.push(1.0).unwrap();
     }
-    counters.produced.store(100, Ordering::Release);
     assert_eq!(player.next(&counters), 1.0);
     counters.flush_to.store(100, Ordering::Release);
     // A chunk queued after the stop.
@@ -118,4 +118,90 @@ fn the_capture_comes_out_at_16_khz_in_frames_without_the_echo() {
     );
     let removed = 10.0 * (echo_in / echo_out.max(1e-12)).log10();
     assert!(removed > 10.0, "{removed:.1} dB of echo removed");
+}
+
+#[test]
+fn a_frame_the_microphone_has_only_begun_stays_for_the_next_drain() {
+    let (mut microphone, mut capture) = RingBuffer::new(16);
+    // Two stereo frames and the left sample of a third.
+    for sample in [0.1, 0.2, 0.3, 0.4, 0.5] {
+        microphone.push(sample).unwrap();
+    }
+    let mut heard = Vec::new();
+    drain(&mut capture, &mut heard, 2);
+    assert_eq!(heard, [0.1, 0.2, 0.3, 0.4]);
+    microphone.push(0.6).unwrap();
+    drain(&mut capture, &mut heard, 2);
+    assert_eq!(heard, [0.5, 0.6]);
+}
+
+#[test]
+fn a_chunk_the_ring_has_no_room_for_waits_whole_and_is_never_played_short() {
+    let (mut ring, mut speaker) = RingBuffer::new(100);
+    let mut queue = Queue::default();
+    queue.play("u".into(), 0, vec![0.5; 80]);
+    queue.play("u".into(), 1, vec![0.5; 80]);
+    queue.feed(&mut ring);
+    // Chunk 0 is in; chunk 1 is in by 20 samples only, so it is not scheduled yet.
+    let played = |events: &[IoEvent]| {
+        events
+            .iter()
+            .filter(|event| matches!(event, IoEvent::ChunkPlayed { .. }))
+            .count()
+    };
+    assert_eq!(played(&queue.schedule.due(80)), 1);
+    assert!(queue.schedule.due(100).is_empty(), "chunk 1 is not all in");
+    // The speaker takes 70 samples: the rest of chunk 1 goes in, and it ends at its own last sample.
+    for _ in 0..70 {
+        speaker.pop().unwrap();
+    }
+    queue.feed(&mut ring);
+    let events = queue.schedule.due(159);
+    assert_eq!(
+        events,
+        [IoEvent::ChunkStarted {
+            utterance: "u".into(),
+            chunk: 1
+        }]
+    );
+    assert_eq!(played(&queue.schedule.due(160)), 1);
+}
+
+#[test]
+fn an_empty_chunk_starts_and_ends_in_its_place() {
+    let (mut ring, _speaker) = RingBuffer::new(10);
+    let mut queue = Queue::default();
+    queue.play("u".into(), 0, Vec::new());
+    queue.feed(&mut ring);
+    assert_eq!(
+        queue.schedule.due(0),
+        [
+            IoEvent::ChunkStarted {
+                utterance: "u".into(),
+                chunk: 0
+            },
+            IoEvent::ChunkPlayed {
+                utterance: "u".into(),
+                chunk: 0
+            },
+        ]
+    );
+}
+
+#[test]
+fn a_stop_drops_what_waits_and_flushes_what_is_in_the_ring() {
+    let (mut ring, _speaker) = RingBuffer::new(10);
+    let mut queue = Queue::default();
+    let counters = Counters::default();
+    queue.play("u".into(), 0, vec![0.5; 8]);
+    queue.play("u".into(), 1, vec![0.5; 8]);
+    queue.feed(&mut ring);
+    queue.stop(&counters);
+    assert_eq!(counters.flush_to.load(Ordering::Acquire), 10);
+    assert!(queue.schedule.due(1_000).is_empty());
+    queue.feed(&mut ring);
+    assert!(
+        queue.schedule.due(1_000).is_empty(),
+        "nothing was left waiting"
+    );
 }

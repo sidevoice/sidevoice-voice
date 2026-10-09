@@ -5,8 +5,8 @@
 //! The device callbacks only move samples through lock-free rings: the input's into the capture ring, and the
 //! output's from the playback ring, copying what it plays into the reference ring (`output`). One audio thread of
 //! the module owns the devices' streams, takes both rings in step through the echo canceller (`pipeline`), sends the
-//! clean 16 kHz frames to the call, and tells it when each chunk starts and ends at the speaker. No C++ runs in a
-//! device callback.
+//! clean 16 kHz frames to the call, feeds the chunks it is handed into the playback ring as room frees up, and tells
+//! the call when each chunk starts and ends at the speaker. No C++ runs in a device callback.
 #![cfg(native)]
 
 mod output;
@@ -16,7 +16,7 @@ mod pipeline;
 mod tests;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex, PoisonError};
+use std::sync::{mpsc, Arc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -24,7 +24,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{ErrorKind, FromSample, SampleFormat, SizedSample, Stream, StreamConfig};
 use rtrb::{Consumer, Producer, RingBuffer};
 
-use self::output::{Counters, Output, Schedule};
+use self::output::{Counters, Output, Queue};
 use self::pipeline::Pipeline;
 use crate::audio::Resampler;
 use crate::io::{AudioIo, IoEvent, IoSink};
@@ -48,14 +48,24 @@ pub struct NativeIo {
 struct Running {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
-    playback: Producer<f32>,
+    speaker: mpsc::Sender<Command>,
     output_rate: u32,
-    counters: Arc<Counters>,
-    schedule: Arc<Mutex<Schedule>>,
 }
 
-/// What the audio thread hands back once the devices are open: the speaker's rate and the playback ring.
-type Opened = Result<(u32, Producer<f32>), String>;
+/// What the audio thread is told to do with the speaker, in order.
+enum Command {
+    /// Queue a chunk, at the output's rate.
+    Play {
+        utterance: String,
+        chunk: usize,
+        samples: Vec<f32>,
+    },
+    /// Stop with a fade and drop what is queued.
+    Stop,
+}
+
+/// What the audio thread hands back once the devices are open: the speaker's rate.
+type Opened = Result<u32, String>;
 
 impl NativeIo {
     /// The default devices, opened at `start`.
@@ -69,30 +79,23 @@ impl AudioIo for NativeIo {
     fn start(&mut self, sink: IoSink) -> Result<(), String> {
         self.stop();
         let stop = Arc::new(AtomicBool::new(false));
-        let counters = Arc::new(Counters::default());
-        let schedule = Arc::new(Mutex::new(Schedule::default()));
         let (opened, open) = mpsc::channel::<Opened>();
+        let (speaker, commands) = mpsc::channel::<Command>();
         let thread = {
-            let (stop, counters, schedule) = (
-                Arc::clone(&stop),
-                Arc::clone(&counters),
-                Arc::clone(&schedule),
-            );
+            let stop = Arc::clone(&stop);
             thread::Builder::new()
                 .name("sidevoice-voice-audio".into())
-                .spawn(move || run(&sink, &stop, &counters, &schedule, &opened))
+                .spawn(move || run(&sink, &stop, &commands, &opened))
                 .map_err(|_| "audio-thread-failed".to_owned())?
         };
-        let (output_rate, playback) = open
+        let output_rate = open
             .recv()
             .unwrap_or_else(|_| Err("audio-thread-failed".into()))?;
         self.running = Some(Running {
             stop,
             thread: Some(thread),
-            playback,
+            speaker,
             output_rate,
-            counters,
-            schedule,
         });
         Ok(())
     }
@@ -103,28 +106,17 @@ impl AudioIo for NativeIo {
         };
         let mut resampled = Vec::with_capacity(samples.len());
         Resampler::new(sample_rate, running.output_rate).process(&samples, &mut resampled);
-        let mut pushed = 0_u64;
-        for sample in resampled {
-            if running.playback.push(sample).is_err() {
-                break;
-            }
-            pushed += 1;
-        }
-        let start = running
-            .counters
-            .produced
-            .fetch_add(pushed, Ordering::AcqRel);
-        lock(&running.schedule).place(utterance, chunk, start, start + pushed);
+        let _ = running.speaker.send(Command::Play {
+            utterance: utterance.to_owned(),
+            chunk,
+            samples: resampled,
+        });
     }
 
     fn stop_playback(&mut self) {
-        let Some(running) = &self.running else {
-            return;
-        };
-        let mut schedule = lock(&running.schedule);
-        schedule.clear();
-        let produced = running.counters.produced.load(Ordering::Acquire);
-        running.counters.flush_to.store(produced, Ordering::Release);
+        if let Some(running) = &self.running {
+            let _ = running.speaker.send(Command::Stop);
+        }
     }
 
     fn stop(&mut self) {
@@ -147,12 +139,12 @@ impl Drop for NativeIo {
 fn run(
     sink: &IoSink,
     stop: &AtomicBool,
-    counters: &Arc<Counters>,
-    schedule: &Mutex<Schedule>,
+    commands: &mpsc::Receiver<Command>,
     opened: &mpsc::Sender<Opened>,
 ) {
     let changed = Arc::new(AtomicBool::new(false));
-    let devices = match Devices::open(sink, counters, &changed) {
+    let counters = Arc::new(Counters::default());
+    let devices = match Devices::open(sink, &counters, &changed) {
         Ok(devices) => devices,
         Err(code) => {
             let _ = opened.send(Err(code));
@@ -164,15 +156,30 @@ fn run(
         mut capture,
         mut reference,
         mut pipeline,
-        playback,
+        mut playback,
         output_rate,
+        channels,
     } = devices;
-    let _ = opened.send(Ok((output_rate, playback)));
+    let _ = opened.send(Ok(output_rate));
+    // Both streams play: the call listens from now.
+    sink.send(IoEvent::Ready);
+    let mut queue = Queue::default();
     let mut heard = Vec::new();
     let mut played = Vec::new();
     while !stop.load(Ordering::Acquire) {
-        drain(&mut reference, &mut played);
-        drain(&mut capture, &mut heard);
+        for command in commands.try_iter() {
+            match command {
+                Command::Play {
+                    utterance,
+                    chunk,
+                    samples,
+                } => queue.play(utterance, chunk, samples),
+                Command::Stop => queue.stop(&counters),
+            }
+        }
+        queue.feed(&mut playback);
+        drain(&mut reference, &mut played, 1);
+        drain(&mut capture, &mut heard, channels);
         if changed.swap(false, Ordering::AcqRel) {
             pipeline.reinitialize();
         }
@@ -181,7 +188,7 @@ fn run(
             sink.send(IoEvent::Captured(frame.to_vec()));
         }
         let consumed = counters.consumed.load(Ordering::Acquire);
-        for event in lock(schedule).due(consumed) {
+        for event in queue.schedule.due(consumed) {
             sink.send(event);
         }
         thread::sleep(TICK);
@@ -196,6 +203,8 @@ struct Devices {
     pipeline: Pipeline,
     playback: Producer<f32>,
     output_rate: u32,
+    /// The microphone's channels, interleaved in the capture ring.
+    channels: usize,
 }
 
 impl Devices {
@@ -259,6 +268,7 @@ impl Devices {
             pipeline,
             playback,
             output_rate,
+            channels,
         })
     }
 }
@@ -334,10 +344,12 @@ fn failure(sink: &IoSink, changed: &Arc<AtomicBool>) -> impl FnMut(cpal::Error) 
     }
 }
 
-/// Moves everything `ring` holds to the end of `out`, after clearing it.
-fn drain(ring: &mut Consumer<f32>, out: &mut Vec<f32>) {
+/// Moves what `ring` holds in whole frames of `channels` interleaved samples into `out`, after clearing it. A frame
+/// the callback has only begun to write stays in the ring for the next time.
+fn drain(ring: &mut Consumer<f32>, out: &mut Vec<f32>, channels: usize) {
     out.clear();
-    if let Ok(chunk) = ring.read_chunk(ring.slots()) {
+    let slots = ring.slots();
+    if let Ok(chunk) = ring.read_chunk(slots - slots % channels.max(1)) {
         let (first, second) = chunk.as_slices();
         out.extend_from_slice(first);
         out.extend_from_slice(second);
@@ -353,8 +365,4 @@ fn code(error: &cpal::Error) -> String {
         _ => "audio-device-failed",
     }
     .into()
-}
-
-fn lock(schedule: &Mutex<Schedule>) -> std::sync::MutexGuard<'_, Schedule> {
-    schedule.lock().unwrap_or_else(PoisonError::into_inner)
 }

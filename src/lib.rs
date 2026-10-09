@@ -44,6 +44,7 @@ pub use io::{AudioIo, IoEvent, IoSink};
 pub use maybe_send::{MaybeSend, MaybeSync};
 pub use models::{EndOfTurnModel, Models, Speaker, Transcriber, Vad, VadFrame, VoiceModels};
 pub use room::{
-    Playback, PlaybackStatus, Reply, RoomEvent, RoomMessage, TurnPhase, TurnTimings, UserTurn,
+    Playback, PlaybackReason, PlaybackStatus, Reply, RoomEvent, RoomMessage, TurnPhase,
+    TurnTimings, UserTurn,
 };
 pub use voice_call::{Events, VoiceCall};

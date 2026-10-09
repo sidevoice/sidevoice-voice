@@ -1,6 +1,9 @@
 use serde_json::json;
 
-use super::{Playback, PlaybackStatus, RoomEvent, RoomMessage, TurnPhase, TurnTimings, UserTurn};
+use super::{
+    Playback, PlaybackReason, PlaybackStatus, RoomEvent, RoomMessage, TurnPhase, TurnTimings,
+    UserTurn,
+};
 
 #[cfg(web)]
 use wasm_bindgen_test::wasm_bindgen_test as test;
@@ -30,7 +33,7 @@ fn a_finished_turn_is_written_as_the_room_reads_it() {
         json!({"type": "voice-user-turn", "data": {
             "client_msg_id": "c-2", "turn_id": "c-turn-0", "phase": "finished", "revision": 4, "text": "hola",
             "language": "es", "offline": false, "started_at": 10, "ended_at": 20, "merged": false,
-            "timings": {"audio_ms": 1000, "endpoint_silence_ms": 2700, "recognition_ms": 300}}})
+            "timings_ms": {"audio_ms": 1000, "endpoint_silence_ms": 2700, "recognition_ms": 300}}})
     );
 }
 
@@ -73,4 +76,38 @@ fn a_reply_is_read_and_other_room_messages_are_let_through() {
             .is_err()
     );
     assert!(RoomEvent::from_json(&json!("voice-reply")).is_err());
+}
+
+#[test]
+fn a_playback_reason_is_one_the_room_takes() {
+    let message = RoomMessage::Playback(Playback {
+        client_msg_id: "c-4".into(),
+        utterance_id: "u".into(),
+        status: PlaybackStatus::Unplayed,
+        heard_chars: 0,
+        reason: Some(PlaybackReason::NewerTurn),
+        at: 40,
+    });
+    assert_eq!(message.to_json()["data"]["reason"], "newer_turn");
+    // The room's vocabulary (sidevoice-core `control/room/playback.rs`, `REASONS`).
+    for (reason, word) in [
+        (PlaybackReason::UserInterrupted, "user_interrupted"),
+        (PlaybackReason::NewerTurn, "newer_turn"),
+        (PlaybackReason::CallEnded, "call_ended"),
+    ] {
+        assert_eq!(serde_json::to_value(reason).unwrap(), word);
+    }
+}
+
+#[test]
+fn the_rooms_answer_to_a_started_turn_gives_its_revision() {
+    let started = json!({"type": "voice-user-turn", "data": {
+        "session_id": "s", "phase": "started", "revision": 12, "thread_id": "t"}});
+    assert_eq!(
+        RoomEvent::from_json(&started).unwrap(),
+        RoomEvent::TurnStarted { revision: 12 }
+    );
+    let cancelled =
+        json!({"type": "voice-user-turn", "data": {"phase": "cancelled", "revision": 12}});
+    assert_eq!(RoomEvent::from_json(&cancelled).unwrap(), RoomEvent::Other);
 }
