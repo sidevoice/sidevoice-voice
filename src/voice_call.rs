@@ -1,7 +1,8 @@
-//! [`VoiceCall`]: one call, run as a task of its own around the state machine (`call`). The task loads the
-//! configuration's models, opens the microphone and the speaker, feeds the capture to the detector and its windows to
-//! the state machine, runs each transcription and each synthesis as a task of its own (so a long one never holds the
-//! detector back), and does what the state machine answers. Everything reaches it as messages on one channel; the
+//! [`VoiceCall`]: one call, run as a task of its own around the state machine (`call`). The task loads the app's
+//! models ([`VoiceModels`]) as the call starts and drops them once it has been stopped for its idle minutes, opens
+//! the microphone and the speaker, feeds the capture to the detector and its windows to the state machine, runs each
+//! transcription, synthesis and end-of-turn question as a task of its own (so a long one never holds the detector
+//! back), and does what the state machine answers. Everything reaches it as messages on one channel; the
 //! host hears it through [`Events`].
 
 #[cfg(all(test, native))]
@@ -19,10 +20,11 @@ use crate::call::{Call, Effect, Input, Transcript};
 use crate::config::{EndOfTurn, VoiceConfig};
 use crate::event::{VoiceError, VoiceEvent};
 use crate::io::{AudioIo, IoEvent, IoSink};
-use crate::models::{Loaded, Models};
+use crate::models::{Models, VadFrame, VoiceModels};
 use crate::residency::Residency;
 use crate::room::RoomEvent;
 use crate::runtime::{monotonic_ms, sleep, spawn, unix_ms};
+use crate::turns::RATE;
 
 /// What a call tells its host, in order.
 pub type Events = UnboundedReceiver<VoiceEvent>;
@@ -36,7 +38,13 @@ pub(crate) enum Message {
     Online(bool),
     Mute(bool),
     CancelInput,
+    Models(Arc<dyn VoiceModels>),
     Io(IoEvent),
+    EndOfTurn {
+        turn: usize,
+        pause: u32,
+        result: Result<f32, String>,
+    },
     Transcribed {
         turn: usize,
         result: Result<String, String>,
@@ -56,20 +64,11 @@ pub struct VoiceCall {
 }
 
 impl VoiceCall {
-    /// A call on `engine`'s models, the microphone and speaker of `io`, set up with `config`. It does nothing until
-    /// [`VoiceCall::start`]. Its task runs on the app's Tokio runtime, which the engine needs too.
-    #[cfg(native)]
+    /// A call on the app's `models`, the microphone and speaker of `io`, set up with `config`. It does nothing until
+    /// [`VoiceCall::start`]. Natively its task runs on the app's Tokio runtime.
     #[must_use]
     pub fn new(
-        engine: Arc<sidevoice_engine::Engine>,
-        io: Box<dyn AudioIo>,
-        config: VoiceConfig,
-    ) -> (Self, Events) {
-        Self::with_models(Arc::new(crate::models::EngineModels(engine)), io, config)
-    }
-
-    pub(crate) fn with_models(
-        models: Arc<dyn Models>,
+        models: Arc<dyn VoiceModels>,
         io: Box<dyn AudioIo>,
         config: VoiceConfig,
     ) -> (Self, Events) {
@@ -96,8 +95,7 @@ impl VoiceCall {
         (Self { messages }, received)
     }
 
-    /// Loads the models (installing them first if they are not: install them through the engine beforehand to show
-    /// the progress), opens the microphone and the speaker, and starts listening.
+    /// Loads the models if they are not, opens the microphone and the speaker, and starts listening.
     pub fn start(&self) {
         self.send(Message::Start);
     }
@@ -108,9 +106,15 @@ impl VoiceCall {
         self.send(Message::Stop);
     }
 
-    /// A new configuration. Changed stages are loaded again at once if the call is started, else at the next start.
+    /// A new configuration, in effect at once.
     pub fn set_config(&self, config: VoiceConfig) {
         self.send(Message::Config(Box::new(config)));
+    }
+
+    /// Other models: the ones loaded are dropped, and the new ones loaded at once if the call is started (it restarts:
+    /// the open turn is cancelled and the reply playing interrupted), else at the next start.
+    pub fn set_models(&self, models: Arc<dyn VoiceModels>) {
+        self.send(Message::Models(models));
     }
 
     /// A message the room sent.
@@ -142,9 +146,9 @@ impl VoiceCall {
 struct Driver {
     call: Call,
     config: VoiceConfig,
-    models: Arc<dyn Models>,
+    models: Arc<dyn VoiceModels>,
     io: Box<dyn AudioIo>,
-    loaded: Option<Loaded>,
+    loaded: Option<Models>,
     /// When the loaded models leave memory, the call stopped.
     residency: Residency,
     running: bool,
@@ -198,18 +202,21 @@ impl Driver {
             Message::Start => self.start().await,
             Message::Stop => self.halt().await,
             Message::Config(config) => {
-                let reload = self.config.vad != config.vad
-                    || self.config.stt != config.stt
-                    || self.config.tts != config.tts;
                 self.config = (*config).clone();
                 self.residency.set_minutes(config.idle_unload_minutes);
                 self.input(Input::Config(config));
-                if reload {
+                if self.running && self.end_of_turn_missing() {
+                    self.error("end-of-turn-missing".into());
+                    self.halt().await;
+                }
+            }
+            Message::Models(models) => {
+                self.models = models;
+                self.loaded = None;
+                if self.running {
+                    self.halt().await;
                     self.loaded = None;
-                    if self.running {
-                        self.halt().await;
-                        self.start().await;
-                    }
+                    self.start().await;
                 }
             }
             Message::Room(event) => self.input(Input::Room(event)),
@@ -243,25 +250,46 @@ impl Driver {
                 chunk,
                 result,
             }),
+            Message::EndOfTurn {
+                turn,
+                pause,
+                result,
+            } => {
+                self.input(Input::EndOfTurn {
+                    turn,
+                    pause,
+                    result,
+                });
+            }
         }
+    }
+
+    /// Whether the configuration asks for `smart-turn` and the loaded models have no end-of-turn classifier.
+    fn end_of_turn_missing(&self) -> bool {
+        let smart = self.config.end_of_turn == EndOfTurn::SmartTurn;
+        smart
+            && self
+                .loaded
+                .as_ref()
+                .is_some_and(|loaded| loaded.end_of_turn.is_none())
     }
 
     async fn start(&mut self) {
         if self.running {
             return;
         }
-        if self.config.end_of_turn == EndOfTurn::SmartTurn {
-            self.error("end-of-turn-unavailable".into());
-            return;
-        }
         if self.loaded.is_none() {
-            match self.models.load(&self.config).await {
+            match self.models.load().await {
                 Ok(loaded) => self.loaded = Some(loaded),
                 Err(code) => {
                     self.error(code);
                     return;
                 }
             }
+        }
+        if self.end_of_turn_missing() {
+            self.error("end-of-turn-missing".into());
+            return;
         }
         let sink = IoSink(self.messages.clone());
         if let Err(code) = self.io.start(sink) {
@@ -283,7 +311,7 @@ impl Driver {
         self.captured.clear();
         self.taken = 0;
         if let Some(loaded) = &mut self.loaded {
-            loaded.detector.reset().await;
+            loaded.vad.reset().await;
         }
     }
 
@@ -296,9 +324,9 @@ impl Driver {
             return;
         }
         self.captured.extend(pcm);
-        match loaded.detector.accept(pcm).await {
-            Ok(windows) => {
-                for (end, speech) in windows {
+        match loaded.vad.accept(pcm).await {
+            Ok(frames) => {
+                for VadFrame { end, speech, .. } in frames {
                     let take = (end.saturating_sub(self.taken) as usize).min(self.captured.len());
                     self.taken = end;
                     let window: Vec<f32> = self.captured.drain(..take).collect();
@@ -309,7 +337,7 @@ impl Driver {
                 }
             }
             Err(code) => {
-                loaded.detector.reset().await;
+                loaded.vad.reset().await;
                 self.captured.clear();
                 self.taken = 0;
                 self.error(code);
@@ -337,7 +365,7 @@ impl Driver {
                     let transcriber = Arc::clone(&loaded.transcriber);
                     let messages = self.messages.clone();
                     spawn(async move {
-                        let result = transcriber.transcribe(pcm, language).await;
+                        let result = transcriber.transcribe(pcm, RATE, language).await;
                         let _ = messages.unbounded_send(Message::Transcribed { turn, result });
                     });
                 }
@@ -350,8 +378,10 @@ impl Driver {
                     let Some(loaded) = &self.loaded else { continue };
                     let speaker = Arc::clone(&loaded.speaker);
                     let messages = self.messages.clone();
+                    let (voice, speed) = (self.config.voice.clone(), self.config.speed);
+                    let language = language.or_else(|| self.config.language.clone());
                     spawn(async move {
-                        let result = speaker.speak(text, language).await;
+                        let result = speaker.speak(text, voice, language, speed).await;
                         let _ = messages.unbounded_send(Message::Synthesized {
                             utterance,
                             chunk,
@@ -366,6 +396,22 @@ impl Driver {
                     sample_rate,
                 } => self.io.play(&utterance, chunk, samples, sample_rate),
                 Effect::StopPlayback => self.io.stop_playback(),
+                Effect::EndOfTurn { turn, pause, pcm } => {
+                    let model = self
+                        .loaded
+                        .as_ref()
+                        .and_then(|loaded| loaded.end_of_turn.clone());
+                    let Some(model) = model else { continue };
+                    let messages = self.messages.clone();
+                    spawn(async move {
+                        let result = model.end_of_turn(pcm, RATE).await;
+                        let _ = messages.unbounded_send(Message::EndOfTurn {
+                            turn,
+                            pause,
+                            result,
+                        });
+                    });
+                }
             }
         }
     }

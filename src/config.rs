@@ -1,22 +1,26 @@
-//! What a call is set up with ([`VoiceConfig`]): the engine model of each stage, how patient the end of a turn is,
-//! the grace before a reply, and the listening bar. Read from JSON strictly: an unknown or a missing key is an error.
+//! What a call is set up with ([`VoiceConfig`]): the language it listens for, the voice it speaks with, how patient
+//! the end of a turn is, the grace before a reply, the listening bar, and how long idle models stay loaded. It names
+//! no model: which models fill the call's slots is the app's ([`VoiceModels`](crate::VoiceModels)). Read from JSON
+//! strictly: an unknown key is an error.
 
 use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
 mod tests;
 
-/// How one call listens and speaks. The stages name engine models, local or remote alike: the engine has one
-/// catalogue for both.
+/// How one call listens and speaks.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VoiceConfig {
-    /// The voice activity detector.
-    pub vad: Stage,
-    /// Speech to text.
-    pub stt: SttStage,
-    /// Text to speech.
-    pub tts: TtsStage,
+    /// The language spoken, as a BCP 47 tag (`es`, `en-US`), given to the transcriber; `None` for it to detect it.
+    #[serde(default)]
+    pub language: Option<String>,
+    /// The speaker's voice, by the speaker's own id; `None` for its default.
+    #[serde(default)]
+    pub voice: Option<String>,
+    /// The speed of speech, 1.0 being the speaker's own.
+    #[serde(default = "default_speed")]
+    pub speed: f32,
     /// What ends a turn.
     #[serde(default)]
     pub end_of_turn: EndOfTurn,
@@ -26,8 +30,8 @@ pub struct VoiceConfig {
     /// How long after a turn ends a reply waits before it starts, in milliseconds.
     #[serde(default = "default_audio_grace_ms")]
     pub audio_grace_ms: u32,
-    /// How long the models stay in memory while the call is stopped, in minutes (0: they leave as it stops). The next
-    /// start loads them again.
+    /// How long the models stay loaded while the call is stopped, in minutes (0: they are dropped as it stops). The
+    /// next start loads them again.
     #[serde(default = "default_idle_unload_minutes")]
     pub idle_unload_minutes: u32,
     /// How loud speech must be to count.
@@ -35,61 +39,35 @@ pub struct VoiceConfig {
     pub listening_bar: ListeningBar,
 }
 
-/// An engine model, and optionally the build of it to load (the engine's recommended one otherwise).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Stage {
-    /// The model's id in the engine's catalogue.
-    pub model: String,
-    /// The build's id, or `None` for the one the engine picks.
-    #[serde(default)]
-    pub build: Option<String>,
-}
-
-/// The speech-to-text stage.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SttStage {
-    /// The model's id in the engine's catalogue.
-    pub model: String,
-    /// The build's id, or `None` for the one the engine picks.
-    #[serde(default)]
-    pub build: Option<String>,
-    /// The language spoken, as a BCP 47 tag (`es`, `en-US`), or `None` for the model to detect it.
-    #[serde(default)]
-    pub language: Option<String>,
-}
-
-/// The text-to-speech stage.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TtsStage {
-    /// The model's id in the engine's catalogue.
-    pub model: String,
-    /// The build's id, or `None` for the one the engine picks.
-    #[serde(default)]
-    pub build: Option<String>,
-    /// The voice's id among the model's voices, or `None` for its default.
-    #[serde(default)]
-    pub voice: Option<String>,
-    /// The speed, 1.0 being the model's own.
-    #[serde(default = "default_speed")]
-    pub speed: f32,
+impl Default for VoiceConfig {
+    fn default() -> Self {
+        Self {
+            language: None,
+            voice: None,
+            speed: default_speed(),
+            end_of_turn: EndOfTurn::default(),
+            patience: Patience::default(),
+            audio_grace_ms: default_audio_grace_ms(),
+            idle_unload_minutes: default_idle_unload_minutes(),
+            listening_bar: ListeningBar::default(),
+        }
+    }
 }
 
 /// What ends a turn.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum EndOfTurn {
-    /// A pause as long as the patience says.
+    /// A pause as long as the patience says, on the voice activity detector's output.
     #[default]
     Silence,
-    /// The engine's `end-of-turn` model, asked at each pause (sidevoice-engine#69).
+    /// The app's end-of-turn model ([`EndOfTurnModel`](crate::EndOfTurnModel)), asked at each pause; a pause as long
+    /// as the patience's longest ends the turn anyway.
     SmartTurn,
 }
 
 /// How patient the call is with pauses: one word for a person to choose, which sets the numbers
-/// ([`Patience::end_of_turn_silence_ms`], [`Patience::merge_window_ms`]).
+/// ([`Patience::end_of_turn_silence_ms`], [`Patience::smart_turn_ms`], [`Patience::merge_window_ms`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Patience {
@@ -110,6 +88,17 @@ impl Patience {
             Self::Fast => 2_000,
             Self::Normal => 2_500,
             Self::Calm => 3_500,
+        }
+    }
+
+    /// With `smart-turn`: how long a pause lasts, after the detector's own end of speech, before the end-of-turn model is
+    /// asked, and how long one ends the turn whatever the model says.
+    #[must_use]
+    pub fn smart_turn_ms(self) -> (u32, u32) {
+        match self {
+            Self::Fast => (600, 2_500),
+            Self::Normal => (900, 3_000),
+            Self::Calm => (1_300, 4_000),
         }
     }
 
