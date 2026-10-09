@@ -37,7 +37,8 @@ wasm-bindgen-futures = "0.4.79"
 # Every native build:
 # - the engine crate itself (src/models/engine.rs), and the app's Tokio runtime, on which the call runs its tasks and
 #   timers (src/runtime/native.rs). The engine is pinned to the head of sidevoice-engine#72 (remote backends and the
-#   host's credentials, stacked on #71 and its `vad` capability) until a release carries them; then to that tag.
+#   host's credentials, merged with #71 at 30fb5b0: `vad`, models whose futures are Send) until a release carries
+#   them; then to that tag.
 # - the device's microphone and speaker (src/io/native.rs). cpal opens the system's default devices
 #   (ALSA on Linux, which needs its development files to build; Core Audio on macOS), and their callbacks only move
 #   samples through rtrb's lock-free rings. WebRTC's audio processing cancels the echo (src/echo/native.rs), its C++
