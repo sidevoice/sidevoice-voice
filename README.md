@@ -175,7 +175,7 @@ and lets every other room message through.
 ## Status
 
 The state machine and its task, with the engine on both platforms: natively the engine crate, in the browser the
-page's `WebEngine`. The engine is pinned to sidevoice-engine#71 (the `vad` capability) until a release carries it.
+page's `WebEngine`. The engine is pinned to sidevoice-engine#71 (`vad`, at 30fb5b0) until a release carries it.
 The browser's microphone and speaker (`getUserMedia` and Web Audio) and the npm package `@sidevoice/voice`, built and
 smoke-tested on every pull request and released with release-please (RELEASING.md); whether a chosen output device
 stays in the browser's echo canceller is still to be checked per browser (sidevoice-core#89). Still to come: the
