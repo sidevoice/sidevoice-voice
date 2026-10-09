@@ -20,7 +20,7 @@ as it grows, the build tooling `cargo xtask` (`xtask/`). The design is sidevoice
 - **The module holds no socket.** What it reports to the room and what the room sends it are serde messages; the
   app carries them, keeps the outbox and the acknowledgements. Nothing here knows the room's address.
 - **The call is a pure state machine.** It is driven by events and a monotonic time argument, and answers with what
-  to do: no I/O, no clock, no threads in it. Capture, playback, the engine's models and the room are around it, and
+  to do: no I/O, no clock, no threads in it. Capture, playback, the app's models and the room are around it, and
   the tests drive it with recorded audio and fakes.
 - **The models are the app's.** Voice activity, speech to text, text to speech and end of turn reach the call
   through the module's own interfaces (`src/models.rs`), which the app implements (with sidevoice-engine, say). The
