@@ -138,7 +138,7 @@ and lets every other room message through.
 ## Status
 
 The state machine and its task, with the engine on both platforms: natively the engine crate, in the browser the
-page's `WebEngine`. The engine is pinned to sidevoice-engine#71 (the `vad` capability) until a release carries it.
+page's `WebEngine`. The engine is pinned to sidevoice-engine#71 (`vad`, at 30fb5b0) until a release carries it.
 The device's microphone and speaker natively, with AEC3 (macOS and Linux). Still to come: the browser's (`getUserMedia`
 and Web Audio), and the npm package.
 

@@ -2003,7 +2003,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 [[package]]
 name = "sidevoice-engine"
 version = "0.2.0"
-source = "git+https://github.com/sidevoice/sidevoice-engine?rev=cfd7b89d7b367f1efbfb6f420f8d6d78f102b8e7#cfd7b89d7b367f1efbfb6f420f8d6d78f102b8e7"
+source = "git+https://github.com/sidevoice/sidevoice-engine?rev=30fb5b0dfb13e6af9f58528c4593afe4bcbeb2e6#30fb5b0dfb13e6af9f58528c4593afe4bcbeb2e6"
 dependencies = [
  "async-lock",
  "async-trait",
