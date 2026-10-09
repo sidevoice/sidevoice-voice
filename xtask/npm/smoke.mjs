@@ -1,31 +1,24 @@
 // `cargo xtask npm-smoke` (xtask/src/npm.rs) runs this from a directory where @sidevoice/voice was installed from
 // its tarball, as a consumer installs it: the package as Node resolves it, its wasm (the file named by the first
-// argument, relative to the entry point) read from node_modules, and a call started on a plain-object engine and a
-// plain-object microphone and speaker, with the models named by the second argument (vad,stt,tts). It prints what it
-// saw; the checks are xtask's.
+// argument, relative to the entry point) read from node_modules, and a call started on plain-object models (the
+// interfaces of js/voice-models.d.ts) and a plain-object microphone and speaker. It prints what it saw; the checks
+// are xtask's.
 import { readFileSync } from "node:fs";
 import { createWebAudioIo, initSync, VoiceCall } from "@sidevoice/voice";
 
 const wasm = new URL(process.argv[2], import.meta.resolve("@sidevoice/voice"));
 initSync({ module: readFileSync(wasm) });
-const [vad, stt, tts] = process.argv[3].split(",");
 
-// Every model the fake engine loads has the three capabilities, shaped as the engine's WebEngine hands them out.
+// The page's models, as the call loads them: each load records the slots it filled.
 const loaded = [];
-const model = {
-  asVad: () => ({
-    stream: async () => ({ sampleRate: 16000, accept: async () => ({ frames: [] }), reset: async () => {} }),
-  }),
-  asStt: () => ({ transcribe: async () => "" }),
-  asTts: () => ({
-    voices: async () => [{ id: "smoke-voice" }],
-    speak: async () => ({ samples: new Float32Array(160), sampleRate: 16000 }),
-  }),
-};
-const engine = {
-  async load(id) {
-    loaded.push(id);
-    return model;
+const models = {
+  async load() {
+    loaded.push("vad", "transcriber", "speaker");
+    return {
+      vad: { accept: async () => [], reset: async () => {} },
+      transcriber: { transcribe: async () => "" },
+      speaker: { speak: async () => ({ samples: new Float32Array(160), sampleRate: 16000 }) },
+    };
   },
 };
 
@@ -40,8 +33,9 @@ const io = {
   stop() {},
 };
 
-const config = { vad: { model: vad }, stt: { model: stt }, tts: { model: tts } };
-const call = VoiceCall.create(engine, config, { io });
+// Models dropped as the call stops, so no timer of theirs keeps Node running after the last check.
+const config = { language: "en", idle_unload_minutes: 0 };
+const call = VoiceCall.create(models, config, { io });
 let state = null;
 const errors = [];
 call.onEvent((event) => {

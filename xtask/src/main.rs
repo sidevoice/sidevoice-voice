@@ -3,7 +3,7 @@
 //! --target wasm32-unknown-unknown --lib` (its runner is set in `.cargo/config.toml`).
 //!
 //! - `npm`: the npm package `@sidevoice/voice` packed into `target/npm/` (xtask/src/npm.rs).
-//! - `npm-smoke`: that tarball installed as a consumer installs it, and a call run in Node on a fake engine and a
+//! - `npm-smoke`: that tarball installed as a consumer installs it, and a call run in Node on fake models and a
 //!   fake microphone and speaker.
 //! - `manifest DIR [--tag vX.Y.Z]`: the npm tarball in DIR renamed as published (`sidevoice-voice-nightly.tgz` for
 //!   the nightly) and `SHA256SUMS` written over DIR (xtask/src/release.rs).

@@ -1,11 +1,9 @@
 name: ci
 
 # Every pull request: format and Clippy (native and wasm32, and the build tooling), the tests on macOS and Linux and
-# on wasm32 in Node, the whole call on recorded speech with real models on macOS and Linux, and the npm package
-# `@sidevoice/voice` built and installed as a consumer installs it (`cargo xtask npm`, `npm-smoke`), publishing
-# nothing: what passes here is what merging publishes (release.yml). A native build compiles the engine with it
-# (sidevoice-engine: sherpa-onnx linked statically, whisper.cpp compiled with CMake), so the native jobs are the slow
-# ones.
+# on wasm32 in Node (the call on recorded speech, with fake models; real models run in the apps' CI, which wire them
+# in), and the npm package `@sidevoice/voice` built and installed as a consumer installs it (`cargo xtask npm`,
+# `npm-smoke`), publishing nothing: what passes here is what merging publishes (release.yml).
 on:
   # Into any branch, so a pull request stacked on another is checked before its base merges.
   pull_request:
@@ -47,29 +45,6 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: ./.github/actions/setup
       - run: cargo test --locked
-
-  # The whole call through the public API on recorded speech, with real models: Silero, Whisper base and Kokoro, on
-  # the engine's sherpa-onnx backend (tests/recorded_call.rs). The test downloads them itself, checked by digest; the
-  # cache only spares the download, keyed by the test that names them and the engine it pins.
-  test-recorded:
-    name: Test recorded call (${{ matrix.target }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { target: macos-aarch64, runner: macos-14 }
-          - { target: linux-x86_64, runner: ubuntu-24.04 }
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: ./.github/actions/setup
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ runner.temp }}/test-models
-          key: test-models-${{ matrix.target }}-${{ hashFiles('tests/recorded_call.rs', 'Cargo.lock') }}
-      - run: cargo test --locked --test recorded_call -- --ignored --nocapture
-        env:
-          SIDEVOICE_TEST_MODELS: ${{ runner.temp }}/test-models
 
   test-wasm:
     name: Test wasm (Node, npm package)

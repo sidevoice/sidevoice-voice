@@ -8,8 +8,3 @@ xtask = "run --quiet --locked --manifest-path xtask/Cargo.toml --"
 [target.wasm32-unknown-unknown]
 runner = "wasm-bindgen-test-runner"
 
-# The engine links sherpa-onnx's static libraries, built for Linux x86_64 with libstdc++'s old string ABI, and
-# compiles whisper.cpp, which must use the same ABI there or ONNX Runtime aborts (`free(): invalid pointer`): the
-# line sidevoice-engine's README asks of every app that links both (its "Build and test").
-[env]
-CXXFLAGS_x86_64_unknown_linux_gnu = "-D_GLIBCXX_USE_CXX11_ABI=0"

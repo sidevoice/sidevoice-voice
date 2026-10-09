@@ -83,14 +83,14 @@ fn the_shipped_js_is_what_the_package_names() {
 #[test]
 fn a_smoke_report_must_show_a_running_call() {
     let ran = json!({
-        "loaded": SMOKE_MODELS,
+        "loaded": SMOKE_SLOTS,
         "ioStarted": true,
         "state": {"listening": "listening", "recognising": 0, "playback": "idle", "online": true},
         "webAudioIo": "function",
     });
     assert_eq!(check_smoke(&ran), Ok(()));
     for (key, value) in [
-        ("loaded", json!(["smoke-vad"])),
+        ("loaded", json!(["vad"])),
         ("ioStarted", json!(false)),
         ("state", json!(null)),
         ("webAudioIo", json!("undefined")),
