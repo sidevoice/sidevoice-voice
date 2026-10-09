@@ -27,14 +27,18 @@ fn a_staged_version_is_found_unless_rejected_or_approved() {
     assert_eq!(staged("not json", "0.1.0"), None);
 }
 
+/// What npm answered on 2026-10-09 when @sidevoice/voice@0.0.0 was published again while staged.
+const STAGED_CONFLICT: &str = "npm error code E409\nnpm error 409 Conflict - PUT https://registry.npmjs.org/@sidevoice%2fvoice - \
+                               Cannot publish over previously staged version \"0.0.0\".";
+
 #[test]
-fn a_conflict_means_the_version_is_staged_already() {
-    assert!(already_staged(
-        "npm error code E409\nnpm error 409 Conflict - PUT https://registry.npmjs.org/-/stage"
-    ));
-    assert!(already_staged("this version is already staged"));
+fn npm_s_staged_conflict_means_the_version_is_staged_already() {
+    assert!(already_staged(STAGED_CONFLICT));
     assert!(!already_staged(
-        "npm error code E403\nnpm error 403 Forbidden"
+        "npm error code E409\nnpm error 409 Conflict - PUT https://registry.npmjs.org/x - busy"
+    ));
+    assert!(!already_staged(
+        "npm error code E403\nnpm error 403 Forbidden - previously staged"
     ));
 }
 
