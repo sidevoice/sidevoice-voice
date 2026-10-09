@@ -207,7 +207,6 @@ js/             the npm package's JavaScript, shipped as it is (ES modules, no d
   index.js        the entry point: the wasm build, and VoiceCall.create(engine, config, options?) on the browser's IO
   web-audio-io.js the browser's microphone and speaker (createWebAudioIo); capture-worklet.js, its AudioWorklet
   voice-host.js   the voice seam (createVoiceHost, localStorageProviderKeys); voice-host.d.ts, VoiceHost itself
-  voice-host.js   the voice seam (createVoiceHost, localStorageProviderKeys); voice-host.d.ts, VoiceHost itself
   *.d.ts          their types
 npm/            the npm package's package.json (version stamped by xtask) and README
 xtask/          the build tooling, `cargo xtask`: the npm package, its smoke test, the release assets, publishing
