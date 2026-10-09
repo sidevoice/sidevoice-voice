@@ -17,7 +17,8 @@ The call reaches its consumers in two ways:
 |---|---|---|
 | Open / update a PR | anyone | `ci`: format and Clippy (native, wasm32 and xtask), the native tests on macOS and Linux, the whole call with real models, the wasm32 tests in Node, and the npm package built and installed as a consumer installs it (`cargo xtask npm`, `npm-smoke`), publishing nothing; the package is kept 7 days as the artifact `voice-npm-<head sha>` ([A pull request's package](#a-pull-requests-package)). **PR title is a conventional commit**. |
 | Squash-merge into `main` | reviewer | The PR title becomes the commit. `release` runs: the wasm32 tests, the npm package built and smoke-tested; then it attests the assets, attaches them to the **`nightly`** pre-release, reads them back, verifies them and publishes it. Never on npm. release-please opens or updates the **release PR** ("chore(main): release X.Y.Z"). |
-| Merge the release PR | a maintainer | **This is the release.** release-please tags `vX.Y.Z` and creates a draft GitHub Release whose notes are that version's changelog; `release` runs from the tag, attaches and verifies the assets, and publishes the Release; then it publishes `@sidevoice/voice@X.Y.Z` to npm. |
+| Merge the release PR | a maintainer | **This is the release.** release-please tags `vX.Y.Z` and creates a draft GitHub Release whose notes are that version's changelog; `release` runs from the tag, attaches and verifies the assets, and publishes the Release; then it **stages** `@sidevoice/voice@X.Y.Z` on npm. |
+| Approve the staged version on npmjs.com | the operator (2FA) | The version reaches npm: `@sidevoice/voice@X.Y.Z` installs (dist-tag `latest`, or `next` for a candidate). |
 
 Everything besides the GitHub steps is either plain `cargo` or code in `xtask/` (`cargo xtask npm | npm-smoke |
 manifest | publish | npm-publish`, each described at the top of `xtask/src/main.rs`: thin calls to `cargo`,
@@ -50,7 +51,7 @@ sidevoice-voice = { git = "https://github.com/sidevoice/sidevoice-voice", tag = 
 
 Every GitHub Release (and the nightly) carries:
 
-- `sidevoice-voice-X.Y.Z.tgz`: the npm package exactly as `npm publish` sends it (on the nightly,
+- `sidevoice-voice-X.Y.Z.tgz`: the npm package exactly as `npm stage publish` sends it (on the nightly,
   `sidevoice-voice-nightly.tgz`, a fixed name whose download URL never changes; the version inside is the crate's).
 - `SHA256SUMS`.
 - `attestation.sigstore.json`: one SLSA provenance attestation whose subject is the tarball.
@@ -71,42 +72,39 @@ Release itself.
 
 ## npm
 
-Every `vX.Y.Z` release (never the nightly) is published to npm as `@sidevoice/voice` at that version: dist-tag
-`latest`, or `next` for a version with a `-` suffix (a release candidate).
+Every `vX.Y.Z` release (never the nightly) goes to npm as `@sidevoice/voice` at that version: dist-tag `latest`, or
+`next` for a version with a `-` suffix (a release candidate). The organisation requires **staged publishing**: the
+release **stages** the version, and nothing reaches npm until the operator approves it.
 
-Only the release workflow publishes, by npm's **trusted publishing** (OIDC) with provenance: no npm token exists.
-The job `publish-npm` ("Publish to npm") in `release.yml` runs after the GitHub Release is published, for versioned
-releases only, as one step, `cargo xtask npm-publish vX.Y.Z`:
+Only the release workflow stages, by npm's **trusted publishing** (OIDC) with provenance: no npm token exists. The
+job `stage-npm` ("Stage on npm") in `release.yml` runs after the GitHub Release is published, for versioned releases
+only, as one step, `cargo xtask npm-publish vX.Y.Z`:
 
 1. It downloads the Release's assets and checks `sidevoice-voice-X.Y.Z.tgz` against `SHA256SUMS` and the
    attestation (`gh attestation verify`, signer `release.yml` on `main`, GitHub-hosted runner): npm gets the bytes
    GitHub Releases has, nothing rebuilt.
-2. It publishes that tarball with `npm publish --access public --provenance --tag latest|next` (npm 11.5.1 or later;
-   it fails clearly with an older one). A version already published with the same bytes (compared with what
-   `npm pack @sidevoice/voice@X.Y.Z` fetches from the registry) is skipped, so a re-run carries on; with other bytes
-   it fails: **npm versions are immutable** (a published version can never be replaced, only deprecated), so a bad
-   release is fixed by the next version.
+2. It runs the npm CLI it pins (`NPM_VERSION` in `xtask/src/npm.rs`, 11.21.0, installed under `target/npm-cli`:
+   `npm stage` and trusted publishing both need it).
+3. A version **already published** with the same bytes (what `npm pack @sidevoice/voice@X.Y.Z` fetches) is skipped;
+   with other bytes it fails: **npm versions are immutable**, so a bad release is fixed by the next version.
+4. A version **already staged** is skipped too: with the same bytes (its `shasum`, where `npm stage list` can be read)
+   or when npm refuses to stage it again (a conflict). With other bytes it fails and says to reject the staged one.
+5. Otherwise it stages the tarball with `npm stage publish --access public --provenance --tag latest|next` and ends
+   with the **stage id** and how to approve it.
 
-### Before the first versioned release (the operator, once)
+Success means **"staged, awaiting approval"**, not published. The operator then approves it, with 2FA, on npmjs.com
+(`@sidevoice/voice` → staged versions) or with `npm stage approve <stage id>`; `npm stage reject <stage id>` drops it
+instead. Until it is approved, `@sidevoice/voice@X.Y.Z` cannot be installed.
 
-This is the operator's job, done once on npmjs.com before the first release PR is merged; no workflow and no
-contributor can do it. Until it is done the `publish-npm` job fails and nothing reaches npm (the GitHub Release is
-published regardless):
+### On npmjs.com (the operator, once)
 
-1. **The scope and the name.** `@sidevoice/voice` lives in the `@sidevoice` organisation, which must allow its
-   members to create public packages. A trusted publisher is configured on the package's settings page, which only
-   exists once the package does: publish it once by hand, from an account in the org, as a public `0.0.0`
-   placeholder (`npm publish --access public`), so the name is ours.
-2. **The trusted publisher.** `@sidevoice/voice` → Settings → Trusted publisher → GitHub Actions: organisation
-   `sidevoice`, repository `sidevoice-voice`, no environment, and the workflow filename npm checks. **npm checks the
-   workflow that starts the run, not one it calls**: a version is released by `release-please.yml`, which calls
-   `release.yml` (`workflow_call`), so the filename to enter is **`release-please.yml`**. The job's error names the
-   filename it saw when it does not match.
-3. **No tokens.** In the package's access settings, require 2FA and disallow tokens: only trusted publishing
-   remains.
+Done: `@sidevoice/voice` exists (its placeholder `0.0.0` staged), and its trusted publisher names organisation
+`sidevoice`, repository `sidevoice-voice`, workflow **`release-please.yml`**. npm checks the workflow that starts the
+run, not one it calls: a version is released by `release-please.yml`, which calls `release.yml` (`workflow_call`).
+The job's error names the workflow it saw when it does not match. In the package's access settings, 2FA is required
+and tokens are disallowed: only trusted publishing remains.
 
-Every workflow on the way grants `id-token: write`, and the job sets up Node.js 24, which brings npm 11: trusted
-publishing needs 11.5.1 or later, and `cargo xtask npm-publish` checks it.
+Every workflow on the way grants `id-token: write`, and the job sets up Node.js 24 to run the pinned npm.
 
 ## Which version comes next
 
@@ -160,8 +158,8 @@ artifact is not there yet; when the job that builds it failed, it is never there
   then re-run the failed jobs of that `release-please` run. Nothing is published until every check passed.
 - A `nightly` run fails: the previous snapshot stays. The next green push replaces it.
 - The npm job fails: the GitHub Release is already published and stays. Fix the cause (usually the trusted
-  publisher settings: the error names them) and re-run that job; a version already published with the same bytes
-  is skipped.
+  publisher settings: the error names them) and re-run that job; a version already staged or published with the
+  same bytes is skipped. A version staged with other bytes is rejected on npmjs.com first.
 - A release run is never cancelled half-way; nightlies queue behind each other.
 
 ## What this needs from the repository settings
@@ -171,5 +169,5 @@ artifact is not there yet; when the job that builds it failed, it is never there
 - Squash merging, with the PR title as the commit message.
 - `ci` and **PR title is a conventional commit** run on every PR; release-please's own PR gets both through a
   dispatched run (its pushes start no workflow by themselves). Make both required in a ruleset to enforce them.
-- On npmjs.com, the scope and the trusted publisher of `@sidevoice/voice`, the operator's once ([Before the first
-  versioned release](#before-the-first-versioned-release-the-operator-once)).
+- On npmjs.com, the trusted publisher of `@sidevoice/voice` ([On npmjs.com](#on-npmjscom-the-operator-once)), and
+  the operator's approval of every staged version.

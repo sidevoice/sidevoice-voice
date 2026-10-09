@@ -16,8 +16,9 @@ mod tests;
 const PACKAGE: &str = "@sidevoice/voice";
 /// The library name, after which wasm-bindgen names its output.
 const STEM: &str = "sidevoice_voice";
-/// The oldest npm that publishes by trusted publishing.
-const MIN_NPM: [u64; 3] = [11, 5, 1];
+/// The npm CLI `npm-publish` runs: staged publishing needs `npm stage`, trusted publishing 11.5.1 or later. Bumped by
+/// hand, like any pin.
+const NPM_VERSION: &str = "11.21.0";
 const SMOKE_JS: &str = include_str!("../npm/smoke.mjs");
 /// The models the smoke test's configuration names, in the order a call loads its stages: vad, stt, tts.
 const SMOKE_MODELS: [&str; 3] = ["smoke-vad", "smoke-stt", "smoke-tts"];
@@ -152,25 +153,16 @@ fn dist_tag(version: &str) -> &'static str {
     }
 }
 
-/// Whether `npm --version` printed `MIN_NPM` or later.
-fn npm_can_publish(version: &str) -> bool {
-    let numbers = version.split('.').map(|part| part.parse().unwrap_or(0));
-    numbers.take(3).collect::<Vec<u64>>() >= MIN_NPM.to_vec()
-}
-
-/// `cargo xtask npm-publish TAG`: the Release's tarball, verified, published by trusted publishing with provenance.
+/// `cargo xtask npm-publish TAG`: the Release's tarball, verified, **staged** on npm by trusted publishing with
+/// provenance (`npm stage publish`): the organisation publishes nothing directly, and a maintainer approves each staged
+/// version on npmjs.com with 2FA. A version already published, or already staged, with these very bytes is left as it
+/// is, so a re-run carries on.
 pub(crate) fn publish(tag: &str) -> Result<()> {
     let version = tag.strip_prefix('v').unwrap_or_default();
     if !version.starts_with(char::is_numeric) {
         return Err(format!("{tag}: not a vX.Y.Z; the nightly is never on npm"));
     }
-    let npm = sh("npm --version")?;
-    let npm = npm.trim();
-    if !npm_can_publish(npm) {
-        return Err(format!(
-            "npm {npm}: trusted publishing needs 11.5.1 or later"
-        ));
-    }
+    let npm = npm_cli()?;
 
     // Exactly the bytes the GitHub Release holds, checked against its SHA256SUMS and attestation.
     let dir: PathBuf = env::temp_dir().join("sidevoice-voice-npm-publish");
@@ -179,29 +171,175 @@ pub(crate) fn publish(tag: &str) -> Result<()> {
     if !download_verified(tag, &dir)?.contains(&name) {
         return Err(format!("{name}: not in the Release's SHA256SUMS"));
     }
+    let tarball = read(&dir.join(&name))?;
+    let shasum = sha1_hex(&tarball);
 
-    // A re-run carries on: a version already published with these very bytes is left as it is.
     let spec = format!("{PACKAGE}@{version}");
     let registry = dir.join("registry");
     empty_dir(&registry)?;
-    match run_in(&registry, &format!("npm pack {spec}"), &[]) {
+    match npm.run(&registry, &["pack", &spec]) {
         Err(error) if error.contains("E404") || error.contains("ETARGET") => {}
         Err(error) => return Err(error),
-        Ok(_) if read(&registry.join(&name))? == read(&dir.join(&name))? => {
-            println!("{spec} is already published with these bytes");
+        Ok(_) if read(&registry.join(&name))? == tarball => {
+            println!("{spec} is already published with these bytes; nothing to approve");
             return Ok(());
         }
-        Ok(_) => return Err(format!("{spec} is on npm with other bytes: release anew")),
+        Ok(_) => {
+            return Err(format!(
+                "{spec} is on npm with other bytes: npm versions are immutable, release anew"
+            ))
+        }
+    }
+    // Staged already (by an earlier run of this release): the same bytes wait for approval; other bytes must be
+    // rejected first. Listing staged versions may need a login this job does not have: then staging says.
+    match npm.run(&dir, &["stage", "list", PACKAGE, "--json"]) {
+        Ok(list) => match staged(&list, version) {
+            Some(item) if item.shasum == shasum => {
+                println!("{spec} is already STAGED with these bytes. {}", approval(&spec, &item.id));
+                return Ok(());
+            }
+            Some(item) => {
+                return Err(format!(
+                    "{spec} is staged with other bytes (stage id {}, shasum {}; this build {shasum}): reject it on \
+                     npmjs.com or with `npm stage reject {}`, then re-run",
+                    item.id, item.shasum, item.id
+                ))
+            }
+            None => {}
+        },
+        Err(error) => println!("could not list staged versions, staging anyway: {error}"),
     }
     let dist_tag = dist_tag(version);
-    let publish = format!("npm publish {name} --access public --provenance --tag {dist_tag}");
-    run_in(&dir, &publish, &[]).map_err(|error| {
+    let args = [
+        "stage",
+        "publish",
+        &name,
+        "--access",
+        "public",
+        "--provenance",
+        "--tag",
+        dist_tag,
+        "--json",
+    ];
+    let report = match npm.run(&dir, &args) {
+        Err(error) if already_staged(&error) => {
+            println!(
+                "{spec} is already staged (npm refused to stage it again). {}",
+                approval(&spec, &format!("(see `npm stage list {PACKAGE}`)"))
+            );
+            return Ok(());
+        }
+        result => result,
+    };
+    let report = report.map_err(|error| {
         let workflow = env::var("GITHUB_WORKFLOW_REF").unwrap_or_default();
         format!(
             "{error}\nnpm takes trusted publishing only: on npmjs.com, {PACKAGE} → Settings → Trusted publisher \
-             must name this repository and the workflow that started this run: {workflow}"
+             must name this repository and the workflow that started this run ({workflow}). If {spec} is already \
+             staged, approve or reject it on npmjs.com."
         )
     })?;
-    println!("published {spec} (dist-tag {dist_tag})");
+    let id = stage_id(&report).unwrap_or_else(|| format!("(see `npm stage list {PACKAGE}`)"));
+    println!(
+        "{spec} is STAGED (dist-tag {dist_tag}). {}",
+        approval(&spec, &id)
+    );
     Ok(())
+}
+
+/// Whether npm refused to stage a version because that version is staged already: the registry answers a conflict.
+/// The job cannot list staged versions itself (trusted publishing authenticates the publish only), so this is how a
+/// re-run of a release finds the version it staged before.
+fn already_staged(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("e409") || error.contains("already staged") || error.contains("conflict")
+}
+
+/// What a maintainer does with a staged version.
+fn approval(spec: &str, id: &str) -> String {
+    format!(
+        "Stage id {id}, awaiting a maintainer's approval with 2FA: npmjs.com → {PACKAGE} → staged versions, or \
+         `npm stage approve {id}`. Until then {spec} is not installable; `npm stage reject {id}` drops it."
+    )
+}
+
+/// A staged version, as `npm stage list --json` lists it.
+#[derive(Debug, PartialEq)]
+struct Staged {
+    id: String,
+    shasum: String,
+}
+
+/// The staged, not rejected, `version` of the package in `npm stage list --json`'s report.
+fn staged(report: &str, version: &str) -> Option<Staged> {
+    let items: Value = serde_json::from_str(report).ok()?;
+    items.as_array()?.iter().find_map(|item| {
+        let ours = item["packageName"] == PACKAGE && item["version"] == version;
+        let live = !matches!(item["status"].as_str(), Some("rejected" | "approved"));
+        (ours && live).then(|| Staged {
+            id: item["id"].as_str().unwrap_or_default().to_owned(),
+            shasum: item["shasum"].as_str().unwrap_or_default().to_owned(),
+        })
+    })
+}
+
+/// The stage id in `npm stage publish --json`'s report.
+fn stage_id(report: &str) -> Option<String> {
+    fn find(value: &Value) -> Option<String> {
+        match value {
+            Value::Object(map) => map
+                .get("stageId")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or_else(|| map.values().find_map(find)),
+            Value::Array(items) => items.iter().find_map(find),
+            _ => None,
+        }
+    }
+    find(&serde_json::from_str(report).ok()?)
+}
+
+/// The SHA-1 of a tarball, as npm's `shasum` names it.
+fn sha1_hex(bytes: &[u8]) -> String {
+    use sha1::Digest;
+    sha1::Sha1::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// The npm CLI the publishing step runs: `NPM_VERSION`, installed under `target/npm-cli` (staged publishing needs
+/// `npm stage`, trusted publishing 11.5.1 or later), run by the Node.js on the `PATH`.
+struct NpmCli {
+    script: PathBuf,
+}
+
+impl NpmCli {
+    fn run(&self, dir: &Path, args: &[&str]) -> Result<String> {
+        let script = self.script.to_str().ok_or("npm-cli.js: not a UTF-8 path")?;
+        let mut all = vec![script];
+        all.extend_from_slice(args);
+        run_in(dir, "node", &all)
+    }
+}
+
+fn npm_cli() -> Result<NpmCli> {
+    let (_, target) = metadata()?;
+    let prefix = target.join("npm-cli");
+    let script = prefix.join("node_modules/npm/bin/npm-cli.js");
+    if !script.exists() {
+        fs::create_dir_all(&prefix).map_err(|error| format!("{}: {error}", prefix.display()))?;
+        let spec = format!("npm@{NPM_VERSION}");
+        run_in(
+            &prefix,
+            "npm install --no-audit --no-fund --prefix .",
+            &[&spec],
+        )?;
+    }
+    let cli = NpmCli { script };
+    let version = cli.run(&prefix, &["--version"])?;
+    if version.trim() != NPM_VERSION {
+        return Err(format!("npm {}: expected {NPM_VERSION}", version.trim()));
+    }
+    Ok(cli)
 }
