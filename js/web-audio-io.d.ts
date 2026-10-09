@@ -28,6 +28,11 @@ export interface WebAudioIoOptions {
    * choose; the default output otherwise. A non-default output may escape the browser's echo canceller.
    */
   outputDevice?: string;
+  /**
+   * Whether the browser cancels the echo of what the call plays out of the microphone (`getUserMedia`'s
+   * `echoCancellation`): on unless `false`. Off, the call hears its own replies; for trying what it does without.
+   */
+  echoCancellation?: boolean;
 }
 
 /**

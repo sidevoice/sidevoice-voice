@@ -27,9 +27,12 @@ const CAPTURE = {
  *
  * A non-default output may escape the browser's echo canceller, which takes its reference from what it plays out:
  * whether it does on each browser is an open point of sidevoice-core#89, to be checked before the web beta.
+ *
+ * `options.echoCancellation: false` turns the browser's echo canceller off (on by default), to hear what the call
+ * does without it; noise suppression and gain control stay as they are.
  */
 export function createWebAudioIo(options = {}) {
-  const { outputDevice } = options;
+  const { outputDevice, echoCancellation = true } = options;
   let sink = null;
   let context = null;
   let stream = null;
@@ -88,7 +91,8 @@ export function createWebAudioIo(options = {}) {
     }
     let media;
     try {
-      media = await navigator.mediaDevices.getUserMedia({ audio: CAPTURE });
+      const audio = { ...CAPTURE, echoCancellation: echoCancellation !== false };
+      media = await navigator.mediaDevices.getUserMedia({ audio });
     } catch (error) {
       const denied = error?.name === "NotAllowedError" || error?.name === "SecurityError";
       return current() && fail(denied ? "microphone-denied" : "microphone-unavailable");
