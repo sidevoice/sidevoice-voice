@@ -30,6 +30,8 @@ pub(crate) const AUDIO_IDLE_MS: u64 = 5_000;
 pub(crate) struct Segmentation {
     /// Silence after the detector's end of speech that ends a turn.
     pub(crate) end_of_turn_silence_ms: u32,
+    /// Silence after which the turn's audio is offered to an end-of-turn model, once per pause (`smart-turn`).
+    pub(crate) pause_ms: Option<u32>,
     /// The level speech needs while nothing plays.
     pub(crate) quiet_bar: f32,
     /// The level speech needs to open a turn while a reply plays.
@@ -43,6 +45,9 @@ pub(crate) enum Segment {
     Started,
     /// The open turn ended, with its audio.
     Ended(EndedTurn),
+    /// The open turn has paused for `pause_ms`: its audio so far, and the pause's number in the turn, to ask an
+    /// end-of-turn model whether it is over.
+    Paused { pcm: Vec<f32>, pause: u32 },
 }
 
 /// The audio of a turn that ended.
@@ -58,6 +63,10 @@ pub(crate) struct EndedTurn {
 #[derive(Debug)]
 struct Open {
     pcm: Vec<f32>,
+    /// Pauses so far, the one going on included.
+    pauses: u32,
+    /// Whether the pause going on was offered to an end-of-turn model.
+    offered: bool,
     /// Samples of silence since the last speech.
     silent: u64,
     /// The time of the last window, in the call's milliseconds.
@@ -119,6 +128,8 @@ impl Segmenter {
                     audio.extend_from_slice(pcm);
                     self.open = Some(Open {
                         pcm: audio,
+                        pauses: 0,
+                        offered: false,
                         silent: 0,
                         last_audio_ms: now,
                     });
@@ -135,12 +146,29 @@ impl Segmenter {
                 open.pcm.extend_from_slice(&pcm[..pcm.len().min(room)]);
                 if speech && level >= self.numbers.quiet_bar {
                     open.silent = 0;
+                    open.offered = false;
                     return None;
+                }
+                if open.silent == 0 {
+                    open.pauses += 1;
                 }
                 open.silent += pcm.len() as u64;
                 let silence_ms = open.silent / PER_MS;
-                (silence_ms >= u64::from(self.numbers.end_of_turn_silence_ms))
-                    .then(|| self.end(silence_ms))
+                if silence_ms >= u64::from(self.numbers.end_of_turn_silence_ms) {
+                    return Some(self.end(silence_ms));
+                }
+                let pause = self
+                    .numbers
+                    .pause_ms
+                    .is_some_and(|pause| silence_ms >= u64::from(pause));
+                if pause && !open.offered {
+                    open.offered = true;
+                    return Some(Segment::Paused {
+                        pcm: open.pcm.clone(),
+                        pause: open.pauses,
+                    });
+                }
+                None
             }
         }
     }
@@ -157,6 +185,14 @@ impl Segmenter {
         let open = self.open.as_ref()?;
         let idle = now.saturating_sub(open.last_audio_ms);
         (idle >= AUDIO_IDLE_MS).then(|| self.end(idle))
+    }
+
+    /// Ends the open turn if it is still in pause number `pause`: an end-of-turn model said it is over.
+    pub(crate) fn end_paused(&mut self, pause: u32) -> Option<Segment> {
+        let open = self.open.as_ref()?;
+        let still = open.pauses == pause && open.silent > 0;
+        let silence_ms = open.silent / PER_MS;
+        still.then(|| self.end(silence_ms))
     }
 
     /// Ends the open turn now, as if its speech had stopped `silence_ms` ago.

@@ -11,7 +11,7 @@ use futures_util::StreamExt;
 use super::{Events, VoiceCall};
 use crate::config::{Patience, VoiceConfig};
 use crate::io::{AudioIo, IoEvent, IoSink};
-use crate::models::{Detector, Loaded, Models, Speaker, Transcriber};
+use crate::models::{EndOfTurnModel, Models, Speaker, Transcriber, Vad, VadFrame, VoiceModels};
 use crate::room::{PlaybackStatus, Reply, RoomEvent, RoomMessage, TurnPhase};
 use crate::test_support::{clip, config, silence, EnergyVad, QUILTER, WINDOW};
 use crate::VoiceEvent;
@@ -19,21 +19,23 @@ use crate::VoiceEvent;
 #[derive(Default)]
 struct FakeModels {
     fail: Option<&'static str>,
+    /// The end-of-turn classifier it supplies, if any.
+    end_of_turn: Option<Arc<dyn EndOfTurnModel>>,
     /// How many times the models were loaded, and how many detectors are alive (one per load not dropped yet).
     loads: Arc<AtomicUsize>,
     alive: Arc<AtomicUsize>,
 }
 
 #[async_trait]
-impl Models for FakeModels {
-    async fn load(&self, _config: &VoiceConfig) -> Result<Loaded, String> {
+impl VoiceModels for FakeModels {
+    async fn load(&self) -> Result<Models, String> {
         if let Some(code) = self.fail {
             return Err(code.into());
         }
         self.loads.fetch_add(1, Ordering::SeqCst);
         self.alive.fetch_add(1, Ordering::SeqCst);
-        Ok(Loaded {
-            detector: Box::new(FakeDetector {
+        Ok(Models {
+            vad: Box::new(FakeDetector {
                 vad: EnergyVad::new(),
                 pending: Vec::new(),
                 end: 0,
@@ -41,6 +43,7 @@ impl Models for FakeModels {
             }),
             transcriber: Arc::new(FakeTranscriber),
             speaker: Arc::new(FakeSpeaker),
+            end_of_turn: self.end_of_turn.clone(),
         })
     }
 }
@@ -59,8 +62,8 @@ impl Drop for FakeDetector {
 }
 
 #[async_trait]
-impl Detector for FakeDetector {
-    async fn accept(&mut self, pcm: &[f32]) -> Result<Vec<(u64, bool)>, String> {
+impl Vad for FakeDetector {
+    async fn accept(&mut self, pcm: &[f32]) -> Result<Vec<VadFrame>, String> {
         self.pending.extend_from_slice(pcm);
         let whole = self.pending.len() / WINDOW * WINDOW;
         let windows: Vec<f32> = self.pending.drain(..whole).collect();
@@ -68,7 +71,11 @@ impl Detector for FakeDetector {
             .chunks(WINDOW)
             .map(|window| {
                 self.end += WINDOW as u64;
-                (self.end, self.vad.window(window))
+                VadFrame {
+                    end: self.end,
+                    speech: self.vad.window(window),
+                    probability: None,
+                }
             })
             .collect())
     }
@@ -84,8 +91,14 @@ struct FakeTranscriber;
 
 #[async_trait]
 impl Transcriber for FakeTranscriber {
-    async fn transcribe(&self, pcm: Vec<f32>, language: Option<String>) -> Result<String, String> {
+    async fn transcribe(
+        &self,
+        pcm: Vec<f32>,
+        sample_rate: u32,
+        language: Option<String>,
+    ) -> Result<String, String> {
         assert!(pcm.len() > 16_000);
+        assert_eq!(sample_rate, 16_000);
         assert_eq!(language.as_deref(), Some("en"));
         Ok("Mister Quilter is the apostle of the middle classes.".into())
     }
@@ -98,7 +111,9 @@ impl Speaker for FakeSpeaker {
     async fn speak(
         &self,
         text: String,
+        _voice: Option<String>,
         _language: Option<String>,
+        _speed: f32,
     ) -> Result<(Vec<f32>, u32), String> {
         Ok((vec![0.0; text.len() * 10], 24_000))
     }
@@ -168,7 +183,7 @@ fn with_config(
     config: VoiceConfig,
 ) -> (VoiceCall, Events, Arc<Mutex<Speakers>>) {
     let speakers = Arc::default();
-    let (call, events) = VoiceCall::with_models(
+    let (call, events) = VoiceCall::new(
         Arc::new(models),
         Box::new(FakeIo(Arc::clone(&speakers))),
         config,
@@ -274,7 +289,7 @@ fn a_model_that_cannot_load_is_an_error_and_the_call_stays_idle() {
 }
 
 #[test]
-fn smart_turn_is_refused_until_the_engine_has_it() {
+fn smart_turn_without_an_end_of_turn_model_is_refused() {
     runtime().block_on(async {
         let (call, mut events, _speakers) = call(FakeModels::default());
         call.set_config(VoiceConfig {
@@ -287,7 +302,7 @@ fn smart_turn_is_refused_until_the_engine_has_it() {
             _ => None,
         })
         .await;
-        assert_eq!(code, "end-of-turn-unavailable");
+        assert_eq!(code, "end-of-turn-missing");
     });
 }
 
@@ -358,5 +373,62 @@ fn models_stay_while_the_call_runs_and_within_the_idle_minutes() {
             (1, 1),
             "ten minutes by default"
         );
+    });
+}
+
+/// An end-of-turn classifier that says every pause ends the turn, and counts how often it is asked.
+struct Finished(Arc<AtomicUsize>);
+
+#[async_trait]
+impl EndOfTurnModel for Finished {
+    async fn end_of_turn(&self, pcm: Vec<f32>, sample_rate: u32) -> Result<f32, String> {
+        assert!(pcm.len() > 16_000 && sample_rate == 16_000);
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(0.9)
+    }
+}
+
+#[test]
+fn smart_turn_ends_a_turn_at_a_pause_its_model_says_is_the_end() {
+    runtime().block_on(async {
+        let asked = Arc::new(AtomicUsize::new(0));
+        let models = FakeModels {
+            end_of_turn: Some(Arc::new(Finished(Arc::clone(&asked)))),
+            ..FakeModels::default()
+        };
+        let (call, mut events, speakers) = with_config(
+            models,
+            VoiceConfig {
+                end_of_turn: crate::EndOfTurn::SmartTurn,
+                patience: Patience::Fast,
+                audio_grace_ms: 0,
+                ..config()
+            },
+        );
+        call.start();
+        next(&mut events, |event| match event {
+            VoiceEvent::State(state) if state.listening == crate::Listening::Listening => Some(()),
+            _ => None,
+        })
+        .await;
+        let sink = speakers.lock().unwrap().sink.clone().expect("started");
+        // A pause of 1.2 s: shorter than any silence that ends a turn, longer than fast patience's 0.6 s pause.
+        for frame in [silence(300), clip(QUILTER, 0.9), silence(1_200)]
+            .concat()
+            .chunks(160)
+        {
+            sink.send(IoEvent::Captured(frame.to_vec()));
+        }
+        let turn = next(&mut events, |event| match event {
+            VoiceEvent::RoomMessage(RoomMessage::UserTurn(turn))
+                if turn.phase == TurnPhase::Finished =>
+            {
+                Some(turn)
+            }
+            _ => None,
+        })
+        .await;
+        assert!(turn.text.is_some());
+        assert!(asked.load(Ordering::SeqCst) >= 1);
     });
 }

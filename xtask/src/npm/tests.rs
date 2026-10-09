@@ -83,20 +83,20 @@ fn the_shipped_js_is_what_the_package_names() {
 #[test]
 fn a_smoke_report_must_show_a_running_call() {
     let ran = json!({
-        "loaded": SMOKE_MODELS,
+        "loaded": SMOKE_SLOTS,
         "ioStarted": true,
         "state": {"listening": "listening", "recognising": 0, "playback": "idle", "online": true},
         "webAudioIo": "function",
         "host": {
-            "missing": "settings-missing", "unknown": "model-unknown", "wrongTask": "model-wrong-task",
-            "buildUnfit": "build-unfit", "smartTurn": "end-of-turn-unavailable", "reloaded": 3,
+            "missing": "settings-missing", "unknown": "model-unknown", "reloaded": 1,
+            "smartMissing": "end-of-turn-missing", "catalogue": 2,
             "started": "resolved", "again": "resolved", "states": ["idle", "listening", "idle"],
             "keys": [true, "sk-smoke", false], "seam": SEAM,
         },
     });
     assert_eq!(check_smoke(&ran), Ok(()));
     for (key, value) in [
-        ("loaded", json!(["smoke-vad"])),
+        ("loaded", json!(["vad"])),
         ("ioStarted", json!(false)),
         ("state", json!(null)),
         ("webAudioIo", json!("undefined")),

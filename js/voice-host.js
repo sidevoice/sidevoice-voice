@@ -1,10 +1,10 @@
-// The voice seam over this package's call (`createVoiceHost`): `VoiceHost` (voice-host.d.ts), on a `WebEngine` and
-// the browser's microphone and speaker. The Sidevoice desktop app implements the same seam natively.
+// The voice seam over this package's call (`createVoiceHost`): `VoiceHost` (voice-host.d.ts), on the page's models
+// and the browser's microphone and speaker. The page's `source` turns the person's settings into models (which model
+// fills each slot is the page's) and lists its catalogue; this file runs the call and its lifecycle. The Sidevoice
+// desktop app implements the same seam natively.
 import { VoiceCall as WasmVoiceCall } from "../dist/sidevoice_voice.js";
 import { createWebAudioIo } from "./web-audio-io.js";
 
-/** The voice activity detector every call runs. */
-const VAD_MODEL = "silero-vad";
 const KEY_PREFIX = "sidevoice.provider-key.";
 
 const fail = (code, message) => Object.assign(new Error(message || code), { code });
@@ -14,15 +14,24 @@ export function localStorageProviderKeys() {
   return {
     get: (provider) => globalThis.localStorage.getItem(KEY_PREFIX + provider),
     set: (provider, key) =>
-      key == null ? globalThis.localStorage.removeItem(KEY_PREFIX + provider) : globalThis.localStorage.setItem(KEY_PREFIX + provider, key),
+      key == null
+        ? globalThis.localStorage.removeItem(KEY_PREFIX + provider)
+        : globalThis.localStorage.setItem(KEY_PREFIX + provider, key),
   };
 }
 
-export function createVoiceHost(engine, options = {}) {
+/** What of the settings chooses models: a change to it gives the call other models. */
+function stages(settings) {
+  const { stt, tts } = settings;
+  return JSON.stringify([stt.model, stt.build ?? null, tts.model, tts.build ?? null, settings.end_of_turn ?? "silence"]);
+}
+
+export function createVoiceHost(source, options = {}) {
   const { io, keys = localStorageProviderKeys(), ...webAudio } = options;
   const listeners = { "user-turn": new Set(), playback: new Set(), state: new Set(), level: new Set(),
     karaoke: new Set(), error: new Set() };
   let call = null;
+  let chosen = null;
   let listening = false;
   let waiting = [];
 
@@ -56,45 +65,30 @@ export function createVoiceHost(engine, options = {}) {
     return () => listeners[kind].delete(listener);
   };
 
-  /** Refuses a stage the catalogue cannot run: a model it lacks, one that cannot do `task`, or a named build that is
-   *  not one of the model's available here. */
-  function check(catalogue, stage, task) {
-    const model = catalogue.find((candidate) => candidate.id === stage.model);
-    if (!model) throw fail("model-unknown", `${stage.model} is not in the engine's catalogue`);
-    if (!model.capabilities.includes(task)) throw fail("model-wrong-task", `${stage.model} cannot do ${task}`);
-    if (stage.build != null && !model.builds.some((build) => build.id === stage.build && build.available)) {
-      throw fail("build-unfit", `${stage.build} does not run here`);
-    }
-  }
-
   const withCall = (action) => {
     if (call) action(call);
   };
 
   return Object.freeze({
     async setSettings(settings) {
-      const catalogue = await engine.models();
-      check(catalogue, settings.stt, "stt");
-      check(catalogue, settings.tts, "tts");
-      const endOfTurn = settings.end_of_turn ?? "silence";
-      if (endOfTurn === "smart-turn" && !catalogue.some((model) => model.capabilities.includes("end-of-turn"))) {
-        throw fail("end-of-turn-unavailable", "no end-of-turn model in the engine's catalogue");
-      }
-      const { stt, tts } = settings;
+      const changed = chosen === null || stages(settings) !== chosen;
+      const models = changed ? await source.models(settings) : null;
       const config = {
-        vad: { model: VAD_MODEL },
-        stt: { model: stt.model, build: stt.build ?? null, language: stt.language ?? null },
-        tts: { model: tts.model, build: tts.build ?? null, voice: tts.voice ?? null, speed: tts.speed ?? 1 },
-        end_of_turn: endOfTurn,
-        ...(settings.idle_unload_minutes != null ? { idle_unload_minutes: settings.idle_unload_minutes } : {}),
+        language: settings.stt.language ?? null,
+        voice: settings.tts.voice ?? null,
+        speed: settings.tts.speed ?? 1,
+        end_of_turn: settings.end_of_turn ?? "silence",
         ...(settings.patience ? { patience: settings.patience } : {}),
+        ...(settings.idle_unload_minutes != null ? { idle_unload_minutes: settings.idle_unload_minutes } : {}),
       };
-      if (call) {
+      if (!call) {
+        call = WasmVoiceCall.create(models, io ?? createWebAudioIo(webAudio), config);
+        call.onEvent(receive);
+      } else {
         call.setConfig(config);
-        return;
+        if (models) call.setModels(models);
       }
-      call = WasmVoiceCall.create(engine, io ?? createWebAudioIo(webAudio), config);
-      call.onEvent(receive);
+      chosen = stages(settings);
     },
     start() {
       if (!call) return Promise.reject(fail("settings-missing", "set the voice settings first"));
@@ -117,7 +111,7 @@ export function createVoiceHost(engine, options = {}) {
     onLevel: on("level"),
     onKaraoke: on("karaoke"),
     onError: on("error"),
-    models: () => engine.models(),
+    models: () => source.catalogue(),
     async setProviderKey(provider, key) {
       keys.set(provider, key == null || String(key).trim() === "" ? null : String(key).trim());
     },
