@@ -35,8 +35,8 @@ remote alike, and holds no socket: the app carries its messages to the room and 
 | [sidevoice-web](https://github.com/sidevoice/sidevoice-web) | The call interface the app bundles; in a browser it runs this crate's WebAssembly build, `@sidevoice/voice`. |
 
 One Rust repository, one version, shaped like sidevoice-engine. Native consumers (the desktop app) depend on the
-crate at a release's git tag and compile it themselves; the web gets a WebAssembly build, published on npm as
-`@sidevoice/voice`. The design is [sidevoice-core#89](https://github.com/sidevoice/sidevoice-core/issues/89).
+crate at a release's git tag and compile it themselves; the web gets a WebAssembly build on npm as `@sidevoice/voice`,
+staged by each release and approved by the operator (RELEASING.md). The design is [sidevoice-core#89](https://github.com/sidevoice/sidevoice-core/issues/89).
 
 ## Using a call
 
