@@ -14,5 +14,38 @@ description = "Sidevoice voice: the call on the device, from the microphone to t
 # rlib.
 crate-type = ["rlib", "cdylib"]
 
+[dependencies]
+# The models' bridges are async traits (src/models.rs), Send natively and not in the wasm32 build, as the engine's.
+async-trait = "=0.1.92"
+# The call's task takes every message on one channel and waits for it or the state machine's next deadline
+# (src/voice_call.rs): runtime-free, so the same on Tokio and in the browser.
+futures-channel = "0.3.31"
+futures-util = { version = "0.3.31", default-features = false, features = ["std"] }
+# The room's messages and the configuration, read and written as JSON (src/room.rs, src/config.rs).
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+
+# Which platform code a build contains is decided by these tables and one `#![cfg]` per platform file, which must
+# agree.
+
+# The web build (the npm package): the browser's event loop, timers and clocks (src/runtime/web.rs).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3.106"
+wasm-bindgen = "0.2.129"
+wasm-bindgen-futures = "0.4.79"
+
+# Every native build: the engine crate itself (src/models/engine.rs), and the app's Tokio runtime, on which the call
+# runs its tasks and timers (src/runtime/native.rs). The engine is pinned to the head of sidevoice-engine#71, which
+# adds the `vad` capability, until a release carries it; then to that release's tag.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+sidevoice-engine = { git = "https://github.com/sidevoice/sidevoice-engine", rev = "cfd7b89d7b367f1efbfb6f420f8d6d78f102b8e7" }
+tokio = { version = "1.53.2", default-features = false, features = ["rt", "time"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tokio = { version = "1.53.2", default-features = false, features = ["rt-multi-thread", "time"] }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3.79"
+
 [build-dependencies]
 cfg_aliases = "0.2.2"

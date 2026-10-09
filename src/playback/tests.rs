@@ -1,0 +1,96 @@
+use super::{Action, Playback};
+use crate::event::PlaybackState;
+use crate::room::{PlaybackStatus, Reply};
+
+#[cfg(web)]
+use wasm_bindgen_test::wasm_bindgen_test as test;
+
+fn reply(id: &str, text: &str) -> Reply {
+    Reply {
+        utterance_id: id.into(),
+        revision: 1,
+        reply_revision: 2,
+        thread_id: "t".into(),
+        history_id: "h".into(),
+        text: text.into(),
+        language: None,
+        replay: false,
+    }
+}
+
+fn statuses(actions: &[Action]) -> Vec<(PlaybackStatus, usize)> {
+    actions
+        .iter()
+        .filter_map(|action| match action {
+            Action::Status {
+                status,
+                heard_chars,
+                ..
+            } => Some((*status, *heard_chars)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn chunks_are_synthesized_one_ahead_and_heard_at_their_ends() {
+    let mut playback = Playback::default();
+    let mut actions = Vec::new();
+    playback.push(
+        reply(
+            "u",
+            "The first sentence of it. And the second sentence of it.",
+        ),
+        &mut actions,
+    );
+    playback.start(&mut actions);
+    assert_eq!(playback.state(), PlaybackState::Synthesizing);
+    assert!(matches!(
+        &actions[..],
+        [Action::Synthesize { chunk: 0, .. }]
+    ));
+    actions.clear();
+    // A result for a chunk not asked for is ignored.
+    playback.synthesized("u", 1, Ok((vec![0.0], 16_000)), &mut actions);
+    assert!(actions.is_empty());
+    playback.synthesized("u", 0, Ok((vec![0.0], 16_000)), &mut actions);
+    assert!(matches!(
+        &actions[..],
+        [
+            Action::Play { chunk: 0, .. },
+            Action::Synthesize { chunk: 1, .. }
+        ]
+    ));
+    actions.clear();
+    playback.chunk_started("u", 0, &mut actions);
+    assert_eq!(playback.state(), PlaybackState::Playing);
+    assert_eq!(statuses(&actions), [(PlaybackStatus::Playing, 0)]);
+    playback.chunk_played("u", 0, &mut actions);
+    playback.synthesized("u", 1, Ok((vec![0.0], 16_000)), &mut actions);
+    playback.chunk_started("u", 1, &mut actions);
+    actions.clear();
+    playback.interrupt(&mut actions);
+    assert_eq!(statuses(&actions), [(PlaybackStatus::Interrupted, 25)]);
+    assert!(!playback.busy());
+}
+
+#[test]
+fn a_reply_with_nothing_to_say_is_heard_at_once() {
+    let mut playback = Playback::default();
+    let mut actions = Vec::new();
+    playback.push(reply("u", "  "), &mut actions);
+    assert_eq!(statuses(&actions), [(PlaybackStatus::Heard, 0)]);
+    assert!(!playback.waiting());
+}
+
+#[test]
+fn a_reply_not_yet_sounding_is_unplayed_when_interrupted() {
+    let mut playback = Playback::default();
+    let mut actions = Vec::new();
+    playback.push(reply("u", "Something."), &mut actions);
+    playback.start(&mut actions);
+    actions.clear();
+    playback.interrupt(&mut actions);
+    assert_eq!(statuses(&actions), [(PlaybackStatus::Unplayed, 0)]);
+    assert!(matches!(actions[0], Action::Stop));
+}

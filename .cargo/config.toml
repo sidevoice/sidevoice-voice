@@ -1,0 +1,11 @@
+# `cargo test --target wasm32-unknown-unknown --lib` runs the module's tests in Node through the wasm-bindgen CLI's
+# test runner, which must be on the PATH at the version of `wasm-bindgen` in Cargo.lock (.github/actions/setup
+# installs it in CI). Doctests are left out: rustdoc cannot run them on wasm32.
+[target.wasm32-unknown-unknown]
+runner = "wasm-bindgen-test-runner"
+
+# The engine links sherpa-onnx's static libraries, built for Linux x86_64 with libstdc++'s old string ABI, and
+# compiles whisper.cpp, which must use the same ABI there or ONNX Runtime aborts (`free(): invalid pointer`): the
+# line sidevoice-engine's README asks of every app that links both (its "Build and test").
+[env]
+CXXFLAGS_x86_64_unknown_linux_gnu = "-D_GLIBCXX_USE_CXX11_ABI=0"
