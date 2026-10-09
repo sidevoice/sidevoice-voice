@@ -1,4 +1,4 @@
-//! Tokio's: the engine's native futures expect a Tokio runtime, the app's own.
+//! Tokio's: the call's tasks run on the app's Tokio runtime.
 #![cfg(native)]
 
 use std::future::Future;
