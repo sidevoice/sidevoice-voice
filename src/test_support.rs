@@ -98,6 +98,7 @@ pub(crate) fn config() -> VoiceConfig {
         end_of_turn: Default::default(),
         patience: Default::default(),
         audio_grace_ms: 1_000,
+        idle_unload_minutes: 10,
         listening_bar: Default::default(),
     }
 }
