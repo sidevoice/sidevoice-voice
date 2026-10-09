@@ -1,5 +1,5 @@
-//! The speaker's side of the native microphone and speaker: what the output callback plays (`Output`), and which
-//! chunk is where in what it played (`Schedule`).
+//! The speaker's side of the native microphone and speaker: what the output callback plays (`Output`), what waits
+//! for room in the playback ring (`Queue`), and which chunk is where in what it played (`Schedule`).
 //!
 //! The playback ring holds mono samples at the output's rate, chunk after chunk. The callback takes them one by one;
 //! the samples it takes are also the echo canceller's reference, pushed to the reference ring as they are taken, and
@@ -16,8 +16,6 @@ use crate::io::IoEvent;
 /// The counters the callback and the rest share, in samples at the output's rate.
 #[derive(Debug, Default)]
 pub(crate) struct Counters {
-    /// Samples ever queued for playback.
-    pub(crate) produced: AtomicU64,
     /// Samples the callback has taken.
     pub(crate) consumed: AtomicU64,
     /// Every sample queued before this count is dropped (after the fade).
@@ -127,7 +125,8 @@ impl Schedule {
     pub(crate) fn due(&mut self, consumed: u64) -> Vec<IoEvent> {
         let mut events = Vec::new();
         while let Some(placed) = self.chunks.front_mut() {
-            if !placed.started && consumed > placed.start {
+            // An empty chunk starts as it ends.
+            if !placed.started && (consumed > placed.start || consumed >= placed.end) {
                 placed.started = true;
                 events.push(IoEvent::ChunkStarted {
                     utterance: placed.utterance.clone(),
@@ -144,5 +143,64 @@ impl Schedule {
             self.chunks.pop_front();
         }
         events
+    }
+}
+
+/// A chunk waiting to be wholly in the playback ring.
+#[derive(Debug)]
+struct Pending {
+    utterance: String,
+    chunk: usize,
+    samples: Vec<f32>,
+    /// How many of its samples are in the ring, and the count its first one was queued at.
+    pushed: usize,
+    start: Option<u64>,
+}
+
+/// What the audio thread queues for the speaker: chunks go into the playback ring as room frees up, never in part
+/// and never dropped, and each is placed in the schedule once its last sample is in, so a chunk is never reported
+/// played before all of it was taken.
+#[derive(Debug, Default)]
+pub(crate) struct Queue {
+    pending: VecDeque<Pending>,
+    /// Samples ever pushed into the ring.
+    produced: u64,
+    pub(crate) schedule: Schedule,
+}
+
+impl Queue {
+    /// Queues a chunk's samples, at the output's rate.
+    pub(crate) fn play(&mut self, utterance: String, chunk: usize, samples: Vec<f32>) {
+        self.pending.push_back(Pending {
+            utterance,
+            chunk,
+            samples,
+            pushed: 0,
+            start: None,
+        });
+    }
+
+    /// Stops: what waits is dropped, the schedule forgotten, and the callback drops what the ring holds.
+    pub(crate) fn stop(&mut self, counters: &Counters) {
+        self.pending.clear();
+        self.schedule.clear();
+        counters.flush_to.store(self.produced, Ordering::Release);
+    }
+
+    /// Moves what waits into `ring`, as much as it has room for, in order.
+    pub(crate) fn feed(&mut self, ring: &mut Producer<f32>) {
+        while let Some(pending) = self.pending.front_mut() {
+            let start = *pending.start.get_or_insert(self.produced);
+            while pending.pushed < pending.samples.len() {
+                if ring.push(pending.samples[pending.pushed]).is_err() {
+                    return;
+                }
+                pending.pushed += 1;
+                self.produced += 1;
+            }
+            self.schedule
+                .place(&pending.utterance, pending.chunk, start, self.produced);
+            self.pending.pop_front();
+        }
     }
 }
