@@ -21,6 +21,25 @@ const MIN_NPM: [u64; 3] = [11, 5, 1];
 const SMOKE_JS: &str = include_str!("../npm/smoke.mjs");
 /// The models the smoke test's configuration names, in the order a call loads its stages: vad, stt, tts.
 const SMOKE_MODELS: [&str; 3] = ["smoke-vad", "smoke-stt", "smoke-tts"];
+/// The calls of the voice seam, `VoiceHost` (js/voice-host.d.ts), sorted.
+const SEAM: [&str; 16] = [
+    "cancelInput",
+    "hasProviderKey",
+    "models",
+    "mute",
+    "onError",
+    "onKaraoke",
+    "onLevel",
+    "onPlayback",
+    "onState",
+    "onUserTurn",
+    "setOnline",
+    "setProviderKey",
+    "setSettings",
+    "speak",
+    "start",
+    "stop",
+];
 
 fn parse(bytes: &[u8], what: &str) -> Result<Value> {
     serde_json::from_slice(bytes).map_err(|error| format!("{what}: {error}"))
@@ -124,8 +143,8 @@ pub(crate) fn smoke() -> Result<()> {
 }
 
 /// Whether the smoke test's report shows a call that ran: it loaded every stage through the engine, in order, started
-/// the microphone and speaker, and told its state as listening; and the package offers the default web microphone and
-/// speaker.
+/// the microphone and speaker, and told its state as listening; the package offers the default web microphone and
+/// speaker; and its voice seam answers as `VoiceHost` says.
 fn check_smoke(report: &Value) -> Result<()> {
     let (loaded, want) = (&report["loaded"], json!(SMOKE_MODELS));
     if *loaded != want {
@@ -139,6 +158,26 @@ fn check_smoke(report: &Value) -> Result<()> {
     }
     if report["webAudioIo"] != "function" {
         return Err(format!("the package has no createWebAudioIo: {report}"));
+    }
+    let host = &report["host"];
+    let want = json!({
+        "missing": "settings-missing", "unknown": "model-unknown", "wrongTask": "model-wrong-task",
+        "started": "resolved", "again": "resolved", "states": host["states"], "keys": [true, "sk-smoke", false],
+        "seam": SEAM,
+    });
+    if *host != want {
+        return Err(format!("the voice seam answered {host}, not {want}"));
+    }
+    let states: Vec<&str> = host["states"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    if !states.contains(&"listening") || states.last() != Some(&"idle") {
+        return Err(format!(
+            "the voice seam's states were {states:?}: never listening, or not idle after stop"
+        ));
     }
     Ok(())
 }

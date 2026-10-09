@@ -22,3 +22,18 @@ export declare const VoiceCall: {
    */
   create(engine: unknown, config: object, options?: VoiceCallOptions): VoiceCall;
 };
+
+export { createVoiceHost, localStorageProviderKeys } from "./voice-host.js";
+export type {
+  ProviderKeys,
+  VoiceHost,
+  VoiceHostError,
+  VoiceHostOptions,
+  VoiceKaraoke,
+  VoiceModel,
+  VoicePlayback,
+  VoiceReply,
+  VoiceSettings,
+  VoiceState,
+  VoiceUserTurn,
+} from "./voice-host.js";

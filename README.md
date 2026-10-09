@@ -99,6 +99,41 @@ Their failures are errors with stable codes: `microphone-denied`, `microphone-un
   own playback already cancelled, and the speaker plays a reply's chunks in order and says when each starts and ends
   (that is the clock of the heard position).
 
+## The voice seam a page drives
+
+A page drives a call through one interface, `VoiceHost`, defined once in this package
+([`js/voice-host.d.ts`](js/voice-host.d.ts)) with the payload types it carries (`VoiceSettings`, `VoiceUserTurn`,
+`VoicePlayback`, `VoiceReply`, `VoiceState`, `VoiceKaraoke`, `VoiceHostError`). It has two implementations:
+
+- **`createVoiceHost(engine, options?)`** here (`js/voice-host.js`): the call in the page, on a `WebEngine` and the
+  browser's microphone and speaker (or `options.io`), with provider keys in `localStorage`
+  (`localStorageProviderKeys()`, or `options.keys`; the page's engine host reads the same store for its `credential`).
+- **The Sidevoice desktop app**, `window.__sidevoiceDesktop.host.voice` on macOS: the call run natively, with WebRTC
+  AEC3 (sidevoice-desktop's `docs/BRIDGE.md`, "The voice call").
+
+```js
+const voice = window.__sidevoiceDesktop?.host?.voice ?? createVoiceHost(await WebEngine.create(host));
+voice.onUserTurn((turn) => outbox.send({ type: "voice-user-turn", data: turn }));   // by turn.client_msg_id
+voice.onPlayback((report) => outbox.send({ type: "voice-playback", data: report }));
+await voice.setSettings({ stt: { model: "whisper-base", language: "es" }, tts: { model: "kokoro-82m-v1.0", voice: "ef_dora" } });
+await voice.start();                                    // resolves once listening; rejects {code}
+room.on("voice-reply", (data) => voice.speak(data));
+```
+
+What both promise, beyond the types:
+
+- **`start()`** resolves at the first state whose `listening` is not `idle`, at once if the call listens already, and a
+  second `start` while one is pending settles with it. It rejects with `{code}`, and with `{code: "stopped"}` when
+  `stop()` comes first. `stop()` is safe at any time; `setSettings` rejects `{code}` for a model the catalogue lacks
+  (`model-unknown`) or one that cannot do that stage (`model-wrong-task`).
+- **Events** reach the listeners subscribed when they are emitted, in the order the call emitted them; nothing is
+  buffered. For each `turn_id`, `started` comes before exactly one `finished` or `cancelled`. A turn merged into the
+  next is `cancelled` with `merged`, after that next turn's `started`. For each reply, `playing` (if it sounds) comes
+  before exactly one of `heard`, `interrupted`, `unplayed`, `failed`, and karaoke only follows replies given to
+  `speak`.
+- **Every room message carries its own `client_msg_id`**, and turns emitted while `setOnline(false)` say
+  `offline: true`.
+
 ## What the call does
 
 The call is a pure state machine (`src/call.rs`) with three regions in parallel, driven by events and a monotonic
@@ -171,6 +206,8 @@ build.rs        the two cfg aliases: web, native
 js/             the npm package's JavaScript, shipped as it is (ES modules, no dependencies)
   index.js        the entry point: the wasm build, and VoiceCall.create(engine, config, options?) on the browser's IO
   web-audio-io.js the browser's microphone and speaker (createWebAudioIo); capture-worklet.js, its AudioWorklet
+  voice-host.js   the voice seam (createVoiceHost, localStorageProviderKeys); voice-host.d.ts, VoiceHost itself
+  voice-host.js   the voice seam (createVoiceHost, localStorageProviderKeys); voice-host.d.ts, VoiceHost itself
   *.d.ts          their types
 npm/            the npm package's package.json (version stamped by xtask) and README
 xtask/          the build tooling, `cargo xtask`: the npm package, its smoke test, the release assets, publishing
