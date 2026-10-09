@@ -20,7 +20,8 @@ use crate::event::{CallState, Karaoke, Listening, VoiceError, VoiceEvent};
 use crate::playback::{Action, Playback};
 use crate::recognition::{accepted, Job, Outcome, Recognition};
 use crate::room::{
-    Playback as PlaybackReport, RoomEvent, RoomMessage, TurnPhase, TurnTimings, UserTurn,
+    Playback as PlaybackReport, PlaybackReason, Reply, RoomEvent, RoomMessage, TurnPhase,
+    TurnTimings, UserTurn,
 };
 use crate::turns::{duration_ms, Segment, Segmentation, Segmenter};
 
@@ -139,6 +140,8 @@ pub(crate) struct Call {
     online: bool,
     /// The latest revision seen on a reply.
     revision: u64,
+    /// Replies written at a revision below this one answer an older turn than the person's latest.
+    turn_boundary: u64,
     segmenter: Segmenter,
     /// The turn being spoken.
     open: Option<usize>,
@@ -163,6 +166,7 @@ impl Call {
             muted: false,
             online: true,
             revision: 0,
+            turn_boundary: 0,
             open: None,
             turns: HashMap::new(),
             next_turn: 0,
@@ -205,11 +209,9 @@ impl Call {
                 self.playback.chunk_played(&utterance, chunk, &mut actions);
                 self.act(now, actions, &mut out);
             }
-            Input::Room(RoomEvent::Reply(reply)) => {
-                self.revision = self.revision.max(reply.revision);
-                let mut actions = Vec::new();
-                self.playback.push(reply, &mut actions);
-                self.act(now, actions, &mut out);
+            Input::Room(RoomEvent::Reply(reply)) => self.reply(now, reply, &mut out),
+            Input::Room(RoomEvent::TurnStarted { revision }) => {
+                self.turn_boundary = self.turn_boundary.max(revision);
             }
             Input::Room(RoomEvent::Other) => {}
             Input::Online(online) => self.online = online,
@@ -243,8 +245,10 @@ impl Call {
     /// The earliest time [`Call::poll`] has something to do, if any.
     pub(crate) fn deadline(&self) -> Option<u64> {
         let speaking = self.segmenter.speaking();
-        let reply = (self.playback.waiting() && !self.playback.busy() && self.quiet_until > 0)
-            .then_some(self.quiet_until);
+        // The grace is a deadline only when its end is all that holds the next reply back.
+        let reply = (self.playback.waiting() && !self.playback.busy() && self.quiet(speaking))
+            .then_some(self.quiet_until)
+            .filter(|&until| until > 0);
         [
             self.segmenter.deadline(),
             self.recognition.deadline(speaking),
@@ -295,9 +299,11 @@ impl Call {
                     },
                 );
                 self.open = Some(number);
+                // What the room wrote up to now answers what came before this turn.
+                self.turn_boundary = self.turn_boundary.max(self.revision + 1);
                 self.report_turn(number, TurnPhase::Started, None, false, out);
                 let mut actions = Vec::new();
-                self.playback.interrupt(&mut actions);
+                self.playback.interrupt(false, &mut actions);
                 self.act(now, actions, out);
             }
             Segment::Paused { pcm, pause } => {
@@ -394,9 +400,36 @@ impl Call {
     fn stop(&mut self, now: u64, out: &mut Vec<Effect>) {
         self.cancel_input(now, out);
         let mut actions = Vec::new();
-        self.playback.interrupt(&mut actions);
+        self.playback.interrupt(true, &mut actions);
         self.act(now, actions, out);
         self.started = false;
+    }
+
+    /// A reply from the room: queued, or refused unplayed when the call is stopped (`call_ended`) or it was written
+    /// before the person's latest turn (`newer_turn`; a replay the person asked for is never stale).
+    fn reply(&mut self, now: u64, reply: Reply, out: &mut Vec<Effect>) {
+        self.revision = self.revision.max(reply.revision);
+        let mut actions = Vec::new();
+        if !self.started {
+            self.playback
+                .refuse(&reply, PlaybackReason::CallEnded, &mut actions);
+        } else if !reply.replay && reply.revision < self.turn_boundary {
+            self.playback
+                .refuse(&reply, PlaybackReason::NewerTurn, &mut actions);
+        } else {
+            self.playback.push(reply, &mut actions);
+        }
+        self.act(now, actions, out);
+    }
+
+    /// Whether nothing of the person's holds a reply back: the call listens and no turn is open, being transcribed
+    /// or held for the merge window.
+    fn quiet(&self, speaking: bool) -> bool {
+        self.started
+            && !speaking
+            && self.open.is_none()
+            && self.recognition.len() == 0
+            && !self.recognition.holding()
     }
 
     /// Reports what is due and starts what may start, then the state if it changed.
@@ -420,8 +453,7 @@ impl Call {
                 out,
             );
         }
-        let quiet = !speaking && self.recognition.len() == 0 && !self.recognition.holding();
-        if quiet && self.open.is_none() && now >= self.quiet_until && !self.playback.busy() {
+        if self.quiet(speaking) && now >= self.quiet_until && !self.playback.busy() {
             let mut actions = Vec::new();
             self.playback.start(&mut actions);
             self.act(now, actions, out);
@@ -531,15 +563,13 @@ impl Call {
                     sample_rate,
                 }),
                 Action::Stop => out.push(Effect::StopPlayback),
+                Action::Error(code) => self.error(&code, out),
                 Action::Status {
                     utterance,
                     status,
                     heard_chars,
                     reason,
                 } => {
-                    if let Some(reason) = &reason {
-                        self.error(reason, out);
-                    }
                     let report = PlaybackReport {
                         client_msg_id: self.message_id(),
                         utterance_id: utterance,

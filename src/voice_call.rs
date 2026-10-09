@@ -2,8 +2,10 @@
 //! models ([`VoiceModels`]) as the call starts and drops them once it has been stopped for its idle minutes, opens
 //! the microphone and the speaker, feeds the capture to the detector and its windows to the state machine, runs each
 //! transcription, synthesis and end-of-turn question as a task of its own (so a long one never holds the detector
-//! back), and does what the state machine answers. Everything reaches it as messages on one channel; the
-//! host hears it through [`Events`].
+//! back), and does what the state machine answers. The owner's calls reach it on a channel only [`VoiceCall`] holds,
+//! and what the microphone, the speaker and the model tasks report on one of its own; the host hears it through
+//! [`Events`]. When the owner's channel closes (the [`VoiceCall`] was dropped) the task stops the call, drops the
+//! models and the microphone and speaker, and ends: what its tasks report after that goes nowhere.
 
 #[cfg(all(test, native))]
 mod tests;
@@ -13,8 +15,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use futures_channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
-use futures_util::future::{select, Either};
-use futures_util::StreamExt;
+use futures_util::future::{ready, select, Either};
+use futures_util::{stream, StreamExt};
 
 use crate::call::{Call, Effect, Input, Transcript};
 use crate::config::{EndOfTurn, VoiceConfig};
@@ -38,7 +40,7 @@ pub(crate) enum Message {
     Online(bool),
     Mute(bool),
     CancelInput,
-    Models(Arc<dyn VoiceModels>),
+    Models(Arc<dyn VoiceModels>, Box<VoiceConfig>),
     Io(IoEvent),
     EndOfTurn {
         turn: usize,
@@ -73,6 +75,7 @@ impl VoiceCall {
         config: VoiceConfig,
     ) -> (Self, Events) {
         let (messages, inbox) = unbounded();
+        let (internal, reported) = unbounded();
         let (events, received) = unbounded();
         let driver = Driver {
             call: Call::new(
@@ -86,12 +89,13 @@ impl VoiceCall {
             io,
             loaded: None,
             running: false,
+            opening: false,
             captured: VecDeque::new(),
             taken: 0,
-            messages: messages.clone(),
+            messages: internal,
             events,
         };
-        spawn(driver.run(inbox));
+        spawn(driver.run(inbox, reported));
         (Self { messages }, received)
     }
 
@@ -111,10 +115,12 @@ impl VoiceCall {
         self.send(Message::Config(Box::new(config)));
     }
 
-    /// Other models: the ones loaded are dropped, and the new ones loaded at once if the call is started (it restarts:
-    /// the open turn is cancelled and the reply playing interrupted), else at the next start.
-    pub fn set_models(&self, models: Arc<dyn VoiceModels>) {
-        self.send(Message::Models(models));
+    /// Other models, with the configuration they go with, taken together: the models loaded are dropped, and the new
+    /// ones loaded at once if the call is started (it restarts once, on both: the open turn is cancelled and the reply
+    /// playing interrupted), else at the next start. A pair the call cannot run (`smart-turn` without an end-of-turn
+    /// model) stops it with `end-of-turn-missing`.
+    pub fn set_models(&self, models: Arc<dyn VoiceModels>, config: VoiceConfig) {
+        self.send(Message::Models(models, Box::new(config)));
     }
 
     /// A message the room sent.
@@ -152,16 +158,26 @@ struct Driver {
     /// When the loaded models leave memory, the call stopped.
     residency: Residency,
     running: bool,
+    /// Started, its microphone and speaker not yet ready.
+    opening: bool,
     /// Capture not yet in a whole detector window.
     captured: VecDeque<f32>,
     /// The detector's position: samples taken into windows since its last reset.
     taken: u64,
+    /// The task's own channel, for what the microphone, the speaker and the model tasks report.
     messages: UnboundedSender<Message>,
     events: UnboundedSender<VoiceEvent>,
 }
 
 impl Driver {
-    async fn run(mut self, mut inbox: UnboundedReceiver<Message>) {
+    async fn run(
+        mut self,
+        owner: UnboundedReceiver<Message>,
+        reported: UnboundedReceiver<Message>,
+    ) {
+        // `None` once the owner's channel closed; the task's own channel never does, since the task holds a sender.
+        let owner = owner.map(Some).chain(stream::once(ready(None)));
+        let mut inbox = stream::select(owner, reported.map(Some));
         loop {
             let deadline = [self.call.deadline(), self.residency.deadline()]
                 .into_iter()
@@ -186,9 +202,10 @@ impl Driver {
                     }
                 }
             };
-            let Some(message) = message else {
+            let Some(Some(message)) = message else {
                 // The VoiceCall was dropped.
                 self.halt().await;
+                self.loaded = None;
                 return;
             };
             self.receive(message).await;
@@ -202,20 +219,20 @@ impl Driver {
             Message::Start => self.start().await,
             Message::Stop => self.halt().await,
             Message::Config(config) => {
-                self.config = (*config).clone();
-                self.residency.set_minutes(config.idle_unload_minutes);
-                self.input(Input::Config(config));
+                self.configure(config);
                 if self.running && self.end_of_turn_missing() {
                     self.error("end-of-turn-missing".into());
                     self.halt().await;
                 }
             }
-            Message::Models(models) => {
+            Message::Models(models, config) => {
                 self.models = models;
                 self.loaded = None;
-                if self.running {
-                    self.halt().await;
-                    self.loaded = None;
+                let running = self.running;
+                self.halt().await;
+                self.loaded = None;
+                self.configure(config);
+                if running {
                     self.start().await;
                 }
             }
@@ -223,6 +240,12 @@ impl Driver {
             Message::Online(online) => self.input(Input::Online(online)),
             Message::Mute(muted) => self.input(Input::Mute(muted)),
             Message::CancelInput => self.input(Input::Cancel),
+            Message::Io(IoEvent::Ready) => {
+                if self.running && self.opening {
+                    self.opening = false;
+                    self.input(Input::Start);
+                }
+            }
             Message::Io(IoEvent::Captured(pcm)) => self.captured(&pcm).await,
             Message::Io(IoEvent::ChunkStarted { utterance, chunk }) => {
                 self.input(Input::ChunkStarted { utterance, chunk });
@@ -264,6 +287,12 @@ impl Driver {
         }
     }
 
+    fn configure(&mut self, config: Box<VoiceConfig>) {
+        self.config = (*config).clone();
+        self.residency.set_minutes(config.idle_unload_minutes);
+        self.input(Input::Config(config));
+    }
+
     /// Whether the configuration asks for `smart-turn` and the loaded models have no end-of-turn classifier.
     fn end_of_turn_missing(&self) -> bool {
         let smart = self.config.end_of_turn == EndOfTurn::SmartTurn;
@@ -296,8 +325,9 @@ impl Driver {
             self.error(code);
             return;
         }
+        // The call listens once the microphone and the speaker say they work (`IoEvent::Ready`).
         self.running = true;
-        self.input(Input::Start);
+        self.opening = true;
     }
 
     /// Stops the call, its microphone and its speaker, and starts the detector over.
@@ -306,8 +336,10 @@ impl Driver {
             return;
         }
         self.running = false;
-        self.input(Input::Stop);
+        self.opening = false;
+        // The microphone and the speaker close before the call says it is idle.
         self.io.stop();
+        self.input(Input::Stop);
         self.captured.clear();
         self.taken = 0;
         if let Some(loaded) = &mut self.loaded {
@@ -320,7 +352,7 @@ impl Driver {
         let Some(loaded) = &mut self.loaded else {
             return;
         };
-        if !self.running {
+        if !self.running || self.opening {
             return;
         }
         self.captured.extend(pcm);

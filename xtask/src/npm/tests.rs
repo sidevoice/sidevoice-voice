@@ -85,6 +85,7 @@ fn a_smoke_report_must_show_a_running_call() {
     let ran = json!({
         "loaded": SMOKE_SLOTS,
         "ioStarted": true,
+        "listenedEarly": false,
         "state": {"listening": "listening", "recognising": 0, "playback": "idle", "online": true},
         "webAudioIo": "function",
         "host": {
@@ -98,6 +99,7 @@ fn a_smoke_report_must_show_a_running_call() {
     for (key, value) in [
         ("loaded", json!(["vad"])),
         ("ioStarted", json!(false)),
+        ("listenedEarly", json!(true)),
         ("state", json!(null)),
         ("webAudioIo", json!("undefined")),
         ("host", json!(null)),
@@ -117,4 +119,26 @@ fn a_smoke_report_must_show_a_running_call() {
         report["host"][key] = value;
         assert!(check_smoke(&report).is_err(), "host {key}");
     }
+}
+
+#[test]
+fn a_staged_version_this_job_cannot_compare_is_a_failure_naming_the_shasum_to_check() {
+    // `publish` returns this as its error: an unverifiable conflict never passes for success.
+    let failed = staging_failed(STAGED_CONFLICT, "@sidevoice/voice@0.0.0", "abc123", "wf");
+    assert!(failed.contains("could not compare"), "{failed}");
+    assert!(
+        failed.contains("approve it only if its shasum is abc123"),
+        "{failed}"
+    );
+    let other = staging_failed(
+        "npm error code E403",
+        "@sidevoice/voice@0.0.0",
+        "abc123",
+        "wf",
+    );
+    assert!(
+        other.contains("trusted publishing") && other.contains("(wf)"),
+        "{other}"
+    );
+    assert!(!other.contains("abc123"));
 }

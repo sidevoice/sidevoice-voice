@@ -1,5 +1,7 @@
 /** Where a microphone and speaker report: an `IoSink` of the call. */
 export interface AudioIoSink {
+  /** The microphone and the speaker work: the call listens from now. */
+  ready(): void;
   /** Captured audio: 16 kHz mono samples, in order, after echo cancellation. */
   captured(samples: Float32Array): void;
   /** The first sample of a chunk reached the speaker. */
@@ -12,7 +14,10 @@ export interface AudioIoSink {
 
 /** A microphone and speaker for one call. */
 export interface AudioIo {
-  /** Starts capturing and opens the speaker; reports to `sink`. May throw an `Error` with a stable `code`. */
+  /**
+   * Starts opening the microphone and the speaker; reports to `sink`: `ready()` once both work (the call listens only
+   * from then), or `failed(code)`. May throw an `Error` with a stable `code` when it cannot even begin.
+   */
   start(sink: AudioIoSink): void;
   /** Queues a chunk of a reply: mono samples at `sampleRate`, played after whatever is queued. */
   play(utterance: string, chunk: number, samples: Float32Array, sampleRate: number): void;

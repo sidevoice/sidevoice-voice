@@ -23,10 +23,17 @@ const models = {
 };
 
 let ioStarted = false;
+// The microphone answers a little later, as a permission prompt does: the call must not listen before it is ready.
+let ready = false;
+let listenedEarly = false;
 const io = {
   start(sink) {
     ioStarted = true;
-    sink.captured(new Float32Array(160));
+    setTimeout(() => {
+      ready = true;
+      sink.ready();
+      sink.captured(new Float32Array(160));
+    }, 50);
   },
   play() {},
   stopPlayback() {},
@@ -39,7 +46,10 @@ const call = VoiceCall.create(models, config, { io });
 let state = null;
 const errors = [];
 call.onEvent((event) => {
-  if (event.type === "state") state = event.data;
+  if (event.type === "state") {
+    state = event.data;
+    if (state.listening !== "idle" && !ready) listenedEarly = true;
+  }
   if (event.type === "error") errors.push(event.data.code);
 });
 call.start();
@@ -94,7 +104,13 @@ host.seam = Object.keys(voice).sort();
 host.catalogue = (await voice.models()).length;
 console.log(
   JSON.stringify({
-    wasm: wasm.pathname, loaded: callLoaded, ioStarted, state: callState, errors, webAudioIo: typeof createWebAudioIo,
+    wasm: wasm.pathname,
+    loaded: callLoaded,
+    ioStarted,
+    listenedEarly,
+    state: callState,
+    errors,
+    webAudioIo: typeof createWebAudioIo,
     host,
   }),
 );
