@@ -162,6 +162,7 @@ fn check_smoke(report: &Value) -> Result<()> {
     let host = &report["host"];
     let want = json!({
         "missing": "settings-missing", "unknown": "model-unknown", "wrongTask": "model-wrong-task",
+        "buildUnfit": "build-unfit", "smartTurn": "end-of-turn-unavailable",
         "started": "resolved", "again": "resolved", "states": host["states"], "keys": [true, "sk-smoke", false],
         "seam": SEAM,
     });

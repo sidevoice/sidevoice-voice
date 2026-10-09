@@ -10,9 +10,23 @@ import type { AudioIo, WebAudioIoOptions } from "./web-audio-io.js";
 
 /** The person's choices. Each host fills the rest: the voice activity detector, the builds, grace, listening bar. */
 export interface VoiceSettings {
-  stt: { model: string; /** A BCP 47 tag; null or absent to detect it. */ language?: string | null };
-  tts: { model: string; /** One of the model's voices; null or absent for its first. */ voice?: string | null; speed?: number };
+  stt: {
+    model: string;
+    /** One of the model's builds that is `available` here; null or absent for the host's choice. */
+    build?: string | null;
+    /** A BCP 47 tag; null or absent to detect it. */
+    language?: string | null;
+  };
+  tts: {
+    model: string;
+    build?: string | null;
+    /** One of the model's voices; null or absent for its first (for ElevenLabs, the account's first). */
+    voice?: string | null;
+    speed?: number;
+  };
   patience?: "fast" | "normal" | "calm";
+  /** `silence` by default; `smart-turn` needs a model with the `end-of-turn` capability. */
+  end_of_turn?: "silence" | "smart-turn";
 }
 
 /** One phase of a turn of the person's speech: `voice-user-turn`'s `data`. */
@@ -85,20 +99,42 @@ export interface VoiceKaraoke {
 export interface VoiceHostError {
   /** `microphone-denied`, `microphone-unavailable`, `speaker-unavailable`, `audio-device-unavailable`, the engine's
    *  (`model-load-failed`, `credential-missing`, …), `settings-missing`, `stopped`, `model-unknown`,
-   *  `model-wrong-task`, `model-unfit`, … */
+   *  `model-wrong-task`, `model-unfit`, `build-unfit`, `end-of-turn-unavailable`, … */
   code: string;
   message?: string;
   key?: string;
 }
 
-/** A model of the engine's catalogue, as `WebEngine.models()` lists it. */
+/** A build of a catalogue model, as `WebEngine.models()` lists it. A remote one has `accelerator: "remote"`, and its
+ *  `backend` is its provider's id (`openai`, `elevenlabs`), the one `setProviderKey` takes. */
+export interface VoiceBuild {
+  id: string;
+  backend: string;
+  /** What it would run on here (`cpu`, `metal`, `webgpu`, `wasm`, `remote`…), when it runs here. */
+  accelerator?: string;
+  precision: string;
+  downloadBytes: number;
+  memoryMb: number;
+  /** Whether it runs here; when not, `reasons` say why. */
+  available: boolean;
+  reasons: { code: string; params: { needs?: number; has?: number } }[];
+  /** On disk; for a remote build, whether the host has its provider's key. */
+  installed: boolean;
+}
+
+/** A model of the engine's catalogue, as `WebEngine.models()` lists it, on both hosts. */
 export interface VoiceModel {
   id: string;
+  family: string;
+  /** `stt`, `tts`, `vad`, `end-of-turn`… */
   capabilities: string[];
+  parametersM: number;
   languages: string[];
+  license: string;
   voices: { id: string; languages: string[]; gender?: "female" | "male" }[];
   installed: boolean;
-  [field: string]: unknown;
+  builds: VoiceBuild[];
+  recommendedBuild?: string;
 }
 
 /** The voice seam. Every event of a call reaches the listeners subscribed when it is emitted, in the order the call

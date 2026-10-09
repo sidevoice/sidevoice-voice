@@ -133,6 +133,14 @@ What both promise, beyond the types:
   `speak`.
 - **Every room message carries its own `client_msg_id`**, and turns emitted while `setOnline(false)` say
   `offline: true`.
+- **Settings** name a model per stage and optionally its build (one of the model's `available` builds, else
+  `build-unfit`), the language, voice and speed, the patience and the end of turn (`smart-turn` only with a model of
+  the `end-of-turn` capability, else `end-of-turn-unavailable`). A rejected `setSettings` changes nothing. While the
+  call runs, a change to any stage restarts it (the open turn cancelled, the reply interrupted); patience and end of
+  turn apply live.
+- **`models()`** is `WebEngine.models()`'s list on both hosts. A remote build has `accelerator: "remote"`, and its
+  `backend` is the provider id that `setProviderKey` takes (`openai`, `elevenlabs`); its `installed` says whether the
+  host has that key. The engine asks the host for a key each time it needs one, so a key set takes effect at once.
 
 ## What the call does
 

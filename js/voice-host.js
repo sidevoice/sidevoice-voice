@@ -56,11 +56,15 @@ export function createVoiceHost(engine, options = {}) {
     return () => listeners[kind].delete(listener);
   };
 
-  /** The model `id`, if the engine's catalogue has it and it can do `task`. */
-  async function check(id, task) {
-    const model = (await engine.models()).find((candidate) => candidate.id === id);
-    if (!model) throw fail("model-unknown", `${id} is not in the engine's catalogue`);
-    if (!model.capabilities.includes(task)) throw fail("model-wrong-task", `${id} cannot do ${task}`);
+  /** Refuses a stage the catalogue cannot run: a model it lacks, one that cannot do `task`, or a named build that is
+   *  not one of the model's available here. */
+  function check(catalogue, stage, task) {
+    const model = catalogue.find((candidate) => candidate.id === stage.model);
+    if (!model) throw fail("model-unknown", `${stage.model} is not in the engine's catalogue`);
+    if (!model.capabilities.includes(task)) throw fail("model-wrong-task", `${stage.model} cannot do ${task}`);
+    if (stage.build != null && !model.builds.some((build) => build.id === stage.build && build.available)) {
+      throw fail("build-unfit", `${stage.build} does not run here`);
+    }
   }
 
   const withCall = (action) => {
@@ -69,12 +73,19 @@ export function createVoiceHost(engine, options = {}) {
 
   return Object.freeze({
     async setSettings(settings) {
-      await check(settings.stt.model, "stt");
-      await check(settings.tts.model, "tts");
+      const catalogue = await engine.models();
+      check(catalogue, settings.stt, "stt");
+      check(catalogue, settings.tts, "tts");
+      const endOfTurn = settings.end_of_turn ?? "silence";
+      if (endOfTurn === "smart-turn" && !catalogue.some((model) => model.capabilities.includes("end-of-turn"))) {
+        throw fail("end-of-turn-unavailable", "no end-of-turn model in the engine's catalogue");
+      }
+      const { stt, tts } = settings;
       const config = {
         vad: { model: VAD_MODEL },
-        stt: { model: settings.stt.model, language: settings.stt.language ?? null },
-        tts: { model: settings.tts.model, voice: settings.tts.voice ?? null, speed: settings.tts.speed ?? 1 },
+        stt: { model: stt.model, build: stt.build ?? null, language: stt.language ?? null },
+        tts: { model: tts.model, build: tts.build ?? null, voice: tts.voice ?? null, speed: tts.speed ?? 1 },
+        end_of_turn: endOfTurn,
         ...(settings.patience ? { patience: settings.patience } : {}),
       };
       if (call) {

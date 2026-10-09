@@ -30,6 +30,7 @@ export type {
   VoiceHostError,
   VoiceHostOptions,
   VoiceKaraoke,
+  VoiceBuild,
   VoiceModel,
   VoicePlayback,
   VoiceReply,

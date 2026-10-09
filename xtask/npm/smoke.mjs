@@ -29,9 +29,9 @@ const engine = {
   },
   async models() {
     return [
-      { id: "silero-vad", capabilities: ["vad"] },
-      { id: stt, capabilities: ["stt"] },
-      { id: tts, capabilities: ["tts"] },
+      { id: "silero-vad", capabilities: ["vad"], builds: [] },
+      { id: stt, capabilities: ["stt"], builds: [{ id: stt + "/smoke", available: true }] },
+      { id: tts, capabilities: ["tts"], builds: [] },
     ];
   },
 };
@@ -74,7 +74,9 @@ voice.onState((s) => states.push(s.listening));
 const host = { missing: await code(voice.start()) };
 host.unknown = await code(voice.setSettings({ stt: { model: "nope" }, tts: { model: tts } }));
 host.wrongTask = await code(voice.setSettings({ stt: { model: tts }, tts: { model: tts } }));
-await voice.setSettings({ stt: { model: stt, language: "es" }, tts: { model: tts }, patience: "fast" });
+host.buildUnfit = await code(voice.setSettings({ stt: { model: stt, build: "nope" }, tts: { model: tts } }));
+host.smartTurn = await code(voice.setSettings({ stt: { model: stt }, tts: { model: tts }, end_of_turn: "smart-turn" }));
+await voice.setSettings({ stt: { model: stt, build: stt + "/smoke", language: "es" }, tts: { model: tts }, patience: "fast" });
 host.started = await code(voice.start());
 host.again = await code(voice.start());
 await voice.stop();
