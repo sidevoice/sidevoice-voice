@@ -5,9 +5,10 @@
 //!   endOfTurn?}`, objects with the methods of [`Vad`](crate::Vad), [`Transcriber`](crate::Transcriber),
 //!   [`Speaker`](crate::Speaker) and [`EndOfTurnModel`](crate::EndOfTurnModel).
 //! - `io` is an object with `start(sink)`, `play(utterance, chunk, samples, sampleRate)`, `stopPlayback()` and
-//!   `stop()`; it reports through `sink` (an [`IoSink`](crate::IoSink): `captured(samples)`, with 16 kHz mono
-//!   samples, `chunkStarted(utterance, chunk)`, `chunkPlayed(utterance, chunk)`, `failed(code)`). `start` may throw an
-//!   error with a `code`.
+//!   `stop()`; it reports through `sink` (an [`IoSink`](crate::IoSink): `ready()` once the microphone and the
+//!   speaker work, which is when the call listens, `captured(samples)`, with 16 kHz mono samples,
+//!   `chunkStarted(utterance, chunk)`, `chunkPlayed(utterance, chunk)`, `failed(code)`). `start` may throw an error
+//!   with a `code`.
 //! - `config` is the configuration as JSON ([`VoiceConfig`]); a malformed one throws.
 //!
 //! Every event reaches the callbacks given to `onEvent`, as `{ type, data }`, the JSON of
@@ -83,11 +84,14 @@ impl WebVoiceCall {
         Ok(())
     }
 
-    /// Other models (`VoiceModels`): loaded at once if the call is started, else at the next start.
+    /// Other models (`VoiceModels`) with the configuration they go with, as JSON, taken together: loaded at once if the
+    /// call is started, else at the next start. A malformed configuration throws and changes nothing.
     #[wasm_bindgen(js_name = setModels)]
-    pub fn set_models(&self, models: JsValue) {
+    pub fn set_models(&self, models: JsValue, config: JsValue) -> Result<(), JsError> {
+        let config = read_config(&config)?;
         self.call
-            .set_models(Arc::new(models.unchecked_into::<JsVoiceModels>()));
+            .set_models(Arc::new(models.unchecked_into::<JsVoiceModels>()), config);
+        Ok(())
     }
 
     /// A message the room sent, as `{ type, data }`; messages the call does not use are let through.
@@ -121,6 +125,11 @@ impl WebVoiceCall {
 /// Where a JavaScript microphone and speaker report, for JavaScript.
 #[wasm_bindgen(js_class = IoSink)]
 impl IoSink {
+    /// The microphone and the speaker work: the call listens from now.
+    pub fn ready(&self) {
+        self.send(IoEvent::Ready);
+    }
+
     /// Captured audio: 16 kHz mono samples, in order, after echo cancellation.
     pub fn captured(&self, samples: Vec<f32>) {
         self.send(IoEvent::Captured(samples));

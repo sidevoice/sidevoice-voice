@@ -69,7 +69,8 @@ while let Some(event) = events.next().await {
     }
 }
 // What the room sends: call.room_event(RoomEvent::from_json(&message)?)
-// Other models (another transcriber, say): call.set_models(Arc::new(other)), which restarts a running call.
+// Other models (another transcriber, say), with the configuration they go with: call.set_models(Arc::new(other),
+// config), which restarts a running call once, on both.
 ```
 
 A page does the same with the WebAssembly build: `VoiceCall.create(models, io, config)`, where `models` is a
@@ -89,7 +90,8 @@ JavaScript object with `load()` answering `{vad, transcriber, speaker, endOfTurn
   person may be told of, is a `VoiceEvent::Error` with a stable code.
 - **`AudioIo`** is the microphone and the speaker: capture arrives as 16 kHz mono samples with the echo of the call's
   own playback already cancelled, and the speaker plays a reply's chunks in order and says when each starts and ends
-  (that is the clock of the heard position).
+  (that is the clock of the heard position). It says when both are ready (`IoEvent::Ready`), and only then does the
+  call listen.
 - **Which models, and their tuning, are the app's.** The detector's numbers core used and this module was written
   against: a probability of 0.6, speech confirmed after 400 ms, ended after 200 ms.
 
