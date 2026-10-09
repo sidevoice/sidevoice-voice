@@ -161,6 +161,8 @@ fn run(
         channels,
     } = devices;
     let _ = opened.send(Ok(output_rate));
+    // Both streams play: the call listens from now.
+    sink.send(IoEvent::Ready);
     let mut queue = Queue::default();
     let mut heard = Vec::new();
     let mut played = Vec::new();
