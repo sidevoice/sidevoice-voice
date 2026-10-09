@@ -403,6 +403,8 @@ impl Call {
         self.playback.interrupt(true, &mut actions);
         self.act(now, actions, out);
         self.started = false;
+        // A stop is always answered with the state, even an unchanged one: the host knows it took effect.
+        self.state = None;
     }
 
     /// A reply from the room: queued, or refused unplayed when the call is stopped (`call_ended`) or it was written

@@ -217,7 +217,14 @@ impl Driver {
     async fn receive(&mut self, message: Message) {
         match message {
             Message::Start => self.start().await,
-            Message::Stop => self.halt().await,
+            Message::Stop => {
+                if self.running {
+                    self.halt().await;
+                } else {
+                    // Nothing to close: the call still says it is idle, after all it said before.
+                    self.input(Input::Stop);
+                }
+            }
             Message::Config(config) => {
                 self.configure(config);
                 if self.running && self.end_of_turn_missing() {
