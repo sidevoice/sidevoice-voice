@@ -19,15 +19,16 @@ speaks its replies, and you answer by voice and can interrupt it — from the so
 **sidevoice-voice** is the call itself, on the device you call from. It listens to the microphone, tells when you
 start and stop speaking, has what you said transcribed, and reports your turn to the room as text. It takes the
 agent's replies as text, has them spoken, plays them, stops when you speak over them, and reports how much of each
-you heard. It runs every model through [sidevoice-engine](https://github.com/sidevoice/sidevoice-engine), local or
-remote alike, and holds no socket: the app carries its messages to the room and back.
+you heard. It runs models it does not know, through interfaces of its own the app fills (with
+[sidevoice-engine](https://github.com/sidevoice/sidevoice-engine)'s models, say), and holds no socket: the app carries
+its messages to the room and back.
 
 ## How it fits
 
 | Piece | Role |
 |---|---|
 | **sidevoice-voice** (this repository) | The call on the device: capture, echo cancellation, turns, transcription, speech, playback, barge-in, and what was heard. |
-| [sidevoice-engine](https://github.com/sidevoice/sidevoice-engine) | The models: the catalogue, which build fits here, and the backends that run them (voice activity, speech to text, text to speech). |
+| [sidevoice-engine](https://github.com/sidevoice/sidevoice-engine) | The models: the catalogue, which build fits here, and the backends that run them. The apps wire its models into this module's interfaces; this module does not depend on it. |
 | [sidevoice-core](https://github.com/sidevoice/sidevoice-core) | The room: the conversations, presence, routing to the agents, and the bookkeeping of what was heard. Text and events only, no audio. |
 | [sidevoice-connector](https://github.com/sidevoice/sidevoice-connector) | What you install on the machine where your agents run. It gives them their voice tools and runs the core. |
 | [sidevoice-desktop](https://github.com/sidevoice/sidevoice-desktop) | The app you call from: it compiles this crate in, with native capture and playback. |
@@ -39,17 +40,24 @@ crate at a release's git tag and compile it themselves; the web gets a WebAssemb
 
 ## Using a call
 
-A native app builds the engine (sidevoice-engine's README says how) and a configuration, and runs the call on its
-Tokio runtime with the device's own microphone and speaker (`NativeIo`, or any other `AudioIo`):
+The call runs models it does not know: the app supplies them through the module's own interfaces, and chooses which
+model fills each slot. Natively they are Rust traits (`src/models.rs`; implement them with the re-exported
+`#[async_trait]`):
+
+| Interface | What it does |
+|---|---|
+| `Vad` | A voice activity detector's stream over 16 kHz mono audio: `accept(pcm)` answers one `VadFrame {end, speech, probability?}` per window; speech starts and ends where `speech` changes. `reset()` starts over. |
+| `Transcriber` | `transcribe(pcm, sample_rate, language?)` → the text. |
+| `Speaker` | `speak(text, voice?, language?, speed)` → mono samples and their rate. |
+| `EndOfTurnModel` | Optional: `end_of_turn(pcm, sample_rate)` → the probability that the turn is over, for `smart-turn`. |
+| `VoiceModels` | `load()` → `Models {vad, transcriber, speaker, end_of_turn?}`: called as the call starts; what it returned is dropped once the call has been stopped for `idle_unload_minutes`. |
+
+A native app (the desktop app, wiring sidevoice-engine's models into these) creates a call with them, the device's
+own microphone and speaker (`NativeIo`, or any other `AudioIo`) and a configuration, and runs it on its Tokio runtime:
 
 ```rust
-let config: VoiceConfig = serde_json::from_value(json!({
-    "vad": {"model": "silero-vad"},
-    "stt": {"model": "whisper-base", "language": "es"},
-    "tts": {"model": "kokoro-82m-v1.0", "voice": "ef_dora"},
-    "patience": "normal",
-}))?;
-let (call, mut events) = VoiceCall::new(engine, Box::new(NativeIo::new()), config);
+let config: VoiceConfig = serde_json::from_value(json!({"language": "es", "voice": "ef_dora", "patience": "normal"}))?;
+let (call, mut events) = VoiceCall::new(Arc::new(my_models), Box::new(NativeIo::new()), config);
 call.start(); // loads the models, opens the microphone and the speaker, listens
 while let Some(event) = events.next().await {
     match event {
@@ -61,26 +69,29 @@ while let Some(event) = events.next().await {
     }
 }
 // What the room sends: call.room_event(RoomEvent::from_json(&message)?)
+// Other models (another transcriber, say): call.set_models(Arc::new(other)), which restarts a running call.
 ```
 
-A page does the same with the WebAssembly build: `VoiceCall.create(engine, io, config)`, where `engine` is a
-`WebEngine` of `@sidevoice/engine` and `io` a JavaScript microphone and speaker; `onEvent(listener)` hears the same
-events as `{type, data}`, and `roomEvent(message)`, `setConfig`, `setOnline`, `mute`, `cancelInput`, `start` and `stop`
-mirror the Rust methods (`src/web.rs`).
+A page does the same with the WebAssembly build: `VoiceCall.create(models, io, config)`, where `models` is a
+JavaScript object with `load()` answering `{vad, transcriber, speaker, endOfTurn?}`, objects with the same methods
+(called through wasm-bindgen's structural imports, `src/models/web.rs`), and `io` a JavaScript microphone and speaker.
+`onEvent(listener)` hears the same events as `{type, data}`, and `roomEvent(message)`, `setConfig`, `setModels`,
+`setOnline`, `mute`, `cancelInput`, `start` and `stop` mirror the Rust methods (`src/web.rs`).
 
-- **The configuration** (`VoiceConfig`, read strictly from JSON) names the engine model of each stage (`vad`, `stt`,
-  `tts`, with an optional `build`, and the language, voice and speed), what ends a turn (`end_of_turn`: `silence`, or
-  `smart-turn` once the engine has it, sidevoice-engine#69), the `patience` (`fast`, `normal`, `calm`), the grace before
-  a reply (`audio_grace_ms`, 1 s), the listening bar, and how long the models stay in memory with the call stopped
-  (`idle_unload_minutes`, 10; 0 unloads them as it stops). Local and remote models are configured alike: the engine
-  has one catalogue for both, and a remote provider's key goes from the app's key store to the engine, never here.
-- **`start` loads the models**, installing them if they are not; to show download progress, install them through
-  the engine first. They stay loaded across stops, and leave memory once the call has been stopped for
-  `idle_unload_minutes`; the next start loads them again, on the web as natively. A model that cannot load, and
-  every other failure a person may be told of, is a `VoiceEvent::Error` with a stable code.
+- **The configuration** (`VoiceConfig`, read strictly from JSON) names no model: the `language` the transcriber is
+  given, the speaker's `voice` and `speed`, what ends a turn (`end_of_turn`: `silence`, or `smart-turn`, which needs
+  an `EndOfTurnModel`), the `patience` (`fast`, `normal`, `calm`), the grace before a reply (`audio_grace_ms`, 1 s),
+  the listening bar, and how long the models stay loaded with the call stopped (`idle_unload_minutes`, 10; 0 drops
+  them as it stops). A new configuration is in effect at once.
+- **`start` loads the models** if they are not loaded. They stay across stops, and are dropped once the call has been
+  stopped for `idle_unload_minutes`; the next start loads them again, on the web as natively. `smart-turn` without an
+  end-of-turn model refuses to start with `end-of-turn-missing`. A model that cannot load, and every other failure a
+  person may be told of, is a `VoiceEvent::Error` with a stable code.
 - **`AudioIo`** is the microphone and the speaker: capture arrives as 16 kHz mono samples with the echo of the call's
   own playback already cancelled, and the speaker plays a reply's chunks in order and says when each starts and ends
   (that is the clock of the heard position).
+- **Which models, and their tuning, are the app's.** The detector's numbers core used and this module was written
+  against: a probability of 0.6, speech confirmed after 400 ms, ended after 200 ms.
 
 ## Echo cancellation
 
@@ -104,12 +115,12 @@ The call cancels the echo of its own playback, never relying on the operating sy
 The call is a pure state machine (`src/call.rs`) with three regions in parallel, driven by events and a monotonic
 time; a task around it (`src/voice_call.rs`) feeds it and does what it answers.
 
-- **Listening.** Each 32 ms window of the detector (the engine's `vad`, Silero: speech above a probability of 0.6,
-  confirmed after 400 ms, ended after 200 ms) opens a turn when it is speech and loud enough: the window's level (RMS
+- **Listening.** Each window of the app's detector opens a turn when it is speech and loud enough: the window's level (RMS
   in dBFS, from −60 to 0, smoothed) must clear the listening bar, 0.5, raised to 0.8 while a reply plays and no turn
   is open. A turn starts with the second of audio before it, ends after the patience's silence (2, 2.5 or 3.5 s on
   top of the detector's own end), when its audio stops arriving for 5 s, or when the microphone is muted, and keeps
-  at most a minute.
+  at most a minute. With `smart-turn`, a pause of 0.6, 0.9 or 1.3 s (by patience) is offered to the end-of-turn model
+  once; a probability of 0.5 or more ends the turn there, and a pause of 2.5, 3 or 4 s ends it anyway.
 - **Recognition.** Turns are transcribed in order, one at a time, at most eight waiting. A transcript is dropped
   when it is empty, written in no Latin letter for a language that is, or too unlikely; the turn is then
   `cancelled`. Otherwise it waits the merge window (none, 0.5 or 1.5 s by patience): a turn that follows within it
@@ -139,11 +150,9 @@ and lets every other room message through.
 
 ## Status
 
-The state machine and its task, with the engine on both platforms: natively the engine crate, in the browser the
-page's `WebEngine`. The engine is pinned to sidevoice-engine#72 (remote backends and the host's credentials, on
-#71 and its `vad` capability) until a release carries them.
-The device's microphone and speaker natively, with AEC3 (macOS and Linux). Still to come: the browser's (`getUserMedia`
-and Web Audio), and the npm package.
+The state machine and its task, on the app's models through the module's interfaces, natively and in the browser.
+The device's microphone and speaker natively, with AEC3 (macOS and Linux). Still to come: the browser's
+(`getUserMedia` and Web Audio), and the npm package.
 
 ## Layout
 
@@ -159,8 +168,9 @@ src/            the crate sidevoice-voice
   event.rs        what a call tells its host (VoiceEvent)
   config.rs       VoiceConfig
   voice_call.rs   VoiceCall, the task around the state machine
-  models.rs       the models as the task uses them; models/engine.rs (native: the engine crate),
-                  models/web.rs (wasm32: the page's WebEngine)
+  models.rs       the model interfaces the app implements (VoiceModels, Vad, Transcriber, Speaker, EndOfTurnModel);
+                  models/web.rs, the page's JavaScript models through structural imports (wasm32)
+  residency.rs    when idle models are dropped
   io.rs           AudioIo, the microphone and the speaker; io/native.rs, NativeIo (cpal), with io/native/output.rs
                   (what the output callback plays, and where each chunk is) and io/native/pipeline.rs (the capture
                   through the echo canceller)
@@ -169,29 +179,25 @@ src/            the crate sidevoice-voice
   runtime.rs      spawning, sleeping and clocks; runtime/native.rs (Tokio), runtime/web.rs (the browser)
   web.rs          the bridge to JavaScript, only in the wasm32 build
   maybe_send.rs   Send and Sync in native builds only
-tests/          recorded_call.rs, the whole call with real models; fixtures/, the recorded clips
+tests/          fixtures/, the recorded clips the unit tests hear
 build.rs        the two cfg aliases: web, native
 ```
 
 ## Build and test
 
-You need Rust 1.98.1 (the version `.github/actions/setup` installs). A native build compiles sidevoice-engine with
-it, and so needs what the engine's does (its README, "Build and test"): CMake, a C++ compiler and libclang for
-whisper.cpp, and the libstdc++ ABI line of `.cargo/config.toml` on Linux x86_64. WebRTC's audio processing needs meson,
-ninja and pkg-config, and cpal needs ALSA's development files on Linux (`libasound2-dev`). The wasm32 build links no
-engine and no canceller: it reaches the page's.
+You need Rust 1.98.1 (the version `.github/actions/setup` installs). The module links no model runtime. Natively,
+WebRTC's audio processing needs meson, ninja and pkg-config, and cpal needs ALSA's development files on Linux
+(`libasound2-dev`); the wasm32 build links no canceller.
 
 The tests drive the state machine with the recorded clips of `tests/fixtures` and a detector on energy, and the task
-with fake models and a fake microphone and speaker; nothing is downloaded. The echo canceller runs on the same clips:
-one plays as the reply and comes back through a room with reflections, the other speaks over it. The native
-microphone and speaker are tested without devices: what the output callback plays, how a stop fades and what it
-drops, when each chunk starts and ends, and the capture through the canceller at the devices' rates. The whole call with real models, on the
-same clips, is ignored unless asked for (about 300 MB of models the first time, kept in `$SIDEVOICE_TEST_MODELS`);
-CI runs it on macOS and Linux:
+with fake models (a fake end-of-turn classifier among them) and a fake microphone and speaker; nothing is downloaded.
+The echo canceller runs on the same clips: one plays as the reply and comes back through a room with reflections, the
+other speaks over it. The native microphone and speaker are tested without devices.
+The call with real models is the apps' to run: they wire the models in, and their CI fails when a model and this
+module do not fit.
 
 ```sh
 cargo test --locked
-cargo test --locked --test recorded_call -- --ignored --nocapture
 ```
 
 The wasm32 tests run in Node and need the wasm32 target, Node.js, and the wasm-bindgen CLI at the version of

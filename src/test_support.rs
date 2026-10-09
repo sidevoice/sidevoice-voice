@@ -2,7 +2,7 @@
 //! tests read them too), a voice activity detector on energy that answers as the engine's streams do, and a
 //! configuration.
 
-use crate::config::{Stage, SttStage, TtsStage, VoiceConfig};
+use crate::config::VoiceConfig;
 use crate::turns::instant;
 
 /// LibriSpeech dev-clean 1272-128104-0000, English, 16 kHz mono (tests/fixtures/README.md).
@@ -77,28 +77,10 @@ impl EnergyVad {
     }
 }
 
-/// A configuration with the default numbers.
+/// A configuration with the default numbers, for English.
 pub(crate) fn config() -> VoiceConfig {
     VoiceConfig {
-        vad: Stage {
-            model: "silero-vad".into(),
-            build: None,
-        },
-        stt: SttStage {
-            model: "whisper-base".into(),
-            build: None,
-            language: Some("en".into()),
-        },
-        tts: TtsStage {
-            model: "kokoro-82m-v1.0".into(),
-            build: None,
-            voice: None,
-            speed: 1.0,
-        },
-        end_of_turn: Default::default(),
-        patience: Default::default(),
-        audio_grace_ms: 1_000,
-        idle_unload_minutes: 10,
-        listening_bar: Default::default(),
+        language: Some("en".into()),
+        ..VoiceConfig::default()
     }
 }
