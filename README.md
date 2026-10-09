@@ -108,11 +108,15 @@ time; a task around it (`src/voice_call.rs`) feeds it and does what it answers.
   when it is empty, written in no Latin letter for a language that is, or too unlikely; the turn is then
   `cancelled`. Otherwise it waits the merge window (none, 0.5 or 1.5 s by patience): a turn that follows within it
   joins it, and the earlier one is reported `cancelled` with `merged`.
-- **Playback.** A reply is cut into sentence chunks, each synthesized while the one before plays. A reply waits
-  while the person's turn is open or on its way to the room, and for the grace after it. A turn that opens while a
-  reply is on its way is a barge-in: the speaker stops with a short fade, the reply is `interrupted` (or `unplayed`
-  if it had not sounded) and every queued reply is dropped as `unplayed`. A reply sent again under the same id is
-  ignored, unless it is a replay.
+- **Playback.** A reply is cut into sentence chunks, each synthesized while the one before plays and never further
+  ahead (two chunks at most at the speaker unplayed). A reply waits while the person's turn is open or on its way to
+  the room, and for the grace after it. A turn that opens while a reply is on its way is a barge-in: the speaker
+  stops with a short fade, the reply is `interrupted` (`user_interrupted`; or `unplayed`, `newer_turn`, if it had not
+  sounded) and every queued reply is dropped as `unplayed` (`newer_turn`). A reply written before the person's latest
+  turn (its `revision` below the turn's) is dropped as it arrives, `unplayed` (`newer_turn`), unless it is a replay
+  the person asked for; one that arrives while the call is stopped is `unplayed` (`call_ended`) and never plays. A
+  reply that cannot be spoken is `failed`, what of it was at the speaker is flushed, and its code is an error. A
+  reply sent again under the same id is ignored, unless it is a replay.
 - **The heard position** moves at chunk boundaries: a chunk counts once its last sample left the speaker, never in
   part. It is what `heard_chars` reports and what the karaoke shows.
 - **Offline** is a flag, not a state: everything goes on, and turns say `offline`; the host's outbox keeps the
@@ -123,13 +127,15 @@ time; a task around it (`src/voice_call.rs`) feeds it and does what it answers.
 The module holds no socket. It emits, each with a `client_msg_id` for the host's outbox and the room's `voice-ack`:
 
 - `voice-user-turn {turn_id, phase: started | cancelled | finished, revision, text?, language?, offline, started_at,
-  ended_at?, merged, timings?}`. `finished` is what becomes the conversation's row; `revision` is the latest room
+  ended_at?, merged, timings_ms?}`. `finished` is what becomes the conversation's row; `revision` is the latest room
   revision seen on a reply when the turn started.
 - `voice-playback {utterance_id, status: playing | heard | interrupted | unplayed | failed, heard_chars, reason?,
-  at}`, the input of the room's heard and unheard bookkeeping. `heard_chars` counts Unicode scalar values.
+  at}`, the input of the room's heard and unheard bookkeeping. `heard_chars` counts Unicode scalar values; `reason`
+  is the room's word (`user_interrupted`, `newer_turn`, `call_ended`), and a failure has none.
 
 It consumes `voice-reply {utterance_id, revision, reply_revision, thread_id, history_id, text, language, replay?}`
-and lets every other room message through.
+and the room's answer to a started turn, `voice-user-turn {phase: started, revision}` (a reply written below that
+revision is stale), and lets every other room message through.
 
 ## Status
 
