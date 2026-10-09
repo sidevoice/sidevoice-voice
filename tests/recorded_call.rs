@@ -154,6 +154,7 @@ fn a_call_on_recorded_speech_with_real_models() {
             end_of_turn: Default::default(),
             patience: Patience::Fast,
             audio_grace_ms: 0,
+            idle_unload_minutes: 10,
             listening_bar: Default::default(),
         };
         let speaker = Arc::new(Mutex::new(Speaker::default()));

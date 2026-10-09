@@ -1,6 +1,7 @@
 //! The call's task on fakes: models that detect on energy, transcribe to a fixed text and speak silence, and a
 //! microphone and speaker the test plays by hand, on a Tokio runtime as an app runs it.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -15,8 +16,12 @@ use crate::room::{PlaybackStatus, Reply, RoomEvent, RoomMessage, TurnPhase};
 use crate::test_support::{clip, config, silence, EnergyVad, QUILTER, WINDOW};
 use crate::VoiceEvent;
 
+#[derive(Default)]
 struct FakeModels {
     fail: Option<&'static str>,
+    /// How many times the models were loaded, and how many detectors are alive (one per load not dropped yet).
+    loads: Arc<AtomicUsize>,
+    alive: Arc<AtomicUsize>,
 }
 
 #[async_trait]
@@ -25,11 +30,14 @@ impl Models for FakeModels {
         if let Some(code) = self.fail {
             return Err(code.into());
         }
+        self.loads.fetch_add(1, Ordering::SeqCst);
+        self.alive.fetch_add(1, Ordering::SeqCst);
         Ok(Loaded {
             detector: Box::new(FakeDetector {
                 vad: EnergyVad::new(),
                 pending: Vec::new(),
                 end: 0,
+                alive: Arc::clone(&self.alive),
             }),
             transcriber: Arc::new(FakeTranscriber),
             speaker: Arc::new(FakeSpeaker),
@@ -41,6 +49,13 @@ struct FakeDetector {
     vad: EnergyVad,
     pending: Vec<f32>,
     end: u64,
+    alive: Arc<AtomicUsize>,
+}
+
+impl Drop for FakeDetector {
+    fn drop(&mut self) {
+        self.alive.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 #[async_trait]
@@ -138,12 +153,21 @@ fn runtime() -> tokio::runtime::Runtime {
 }
 
 fn call(models: FakeModels) -> (VoiceCall, Events, Arc<Mutex<Speakers>>) {
+    with_config(
+        models,
+        VoiceConfig {
+            patience: Patience::Fast,
+            audio_grace_ms: 0,
+            ..config()
+        },
+    )
+}
+
+fn with_config(
+    models: FakeModels,
+    config: VoiceConfig,
+) -> (VoiceCall, Events, Arc<Mutex<Speakers>>) {
     let speakers = Arc::default();
-    let config = VoiceConfig {
-        patience: Patience::Fast,
-        audio_grace_ms: 0,
-        ..config()
-    };
     let (call, events) = VoiceCall::with_models(
         Arc::new(models),
         Box::new(FakeIo(Arc::clone(&speakers))),
@@ -169,7 +193,7 @@ async fn next<T>(events: &mut Events, want: impl Fn(VoiceEvent) -> Option<T>) ->
 #[test]
 fn speech_becomes_a_turn_and_a_reply_is_played_and_heard() {
     runtime().block_on(async {
-        let (call, mut events, speakers) = call(FakeModels { fail: None });
+        let (call, mut events, speakers) = call(FakeModels::default());
         call.start();
         next(&mut events, |event| match event {
             VoiceEvent::State(state) if state.listening == crate::Listening::Listening => Some(()),
@@ -236,6 +260,7 @@ fn a_model_that_cannot_load_is_an_error_and_the_call_stays_idle() {
     runtime().block_on(async {
         let (call, mut events, speakers) = call(FakeModels {
             fail: Some("model-not-found"),
+            ..FakeModels::default()
         });
         call.start();
         let code = next(&mut events, |event| match event {
@@ -251,7 +276,7 @@ fn a_model_that_cannot_load_is_an_error_and_the_call_stays_idle() {
 #[test]
 fn smart_turn_is_refused_until_the_engine_has_it() {
     runtime().block_on(async {
-        let (call, mut events, _speakers) = call(FakeModels { fail: None });
+        let (call, mut events, _speakers) = call(FakeModels::default());
         call.set_config(VoiceConfig {
             end_of_turn: crate::EndOfTurn::SmartTurn,
             ..config()
@@ -263,5 +288,75 @@ fn smart_turn_is_refused_until_the_engine_has_it() {
         })
         .await;
         assert_eq!(code, "end-of-turn-unavailable");
+    });
+}
+
+/// Waits, a little at a time, until `done` holds, for at most five seconds.
+async fn until(done: impl Fn() -> bool) {
+    for _ in 0..500 {
+        if done() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("not in time");
+}
+
+#[test]
+fn idle_models_leave_memory_and_come_back_on_the_next_start() {
+    runtime().block_on(async {
+        let models = FakeModels::default();
+        let (loads, alive) = (Arc::clone(&models.loads), Arc::clone(&models.alive));
+        let listening = |event| match event {
+            VoiceEvent::State(state) if state.listening == crate::Listening::Listening => Some(()),
+            _ => None,
+        };
+        // Zero minutes: they leave as soon as the call stops.
+        let (call, mut events, _speakers) = with_config(
+            models,
+            VoiceConfig {
+                idle_unload_minutes: 0,
+                ..config()
+            },
+        );
+        call.start();
+        next(&mut events, listening).await;
+        assert_eq!(
+            (loads.load(Ordering::SeqCst), alive.load(Ordering::SeqCst)),
+            (1, 1)
+        );
+        call.stop();
+        until(|| alive.load(Ordering::SeqCst) == 0).await;
+        call.start();
+        next(&mut events, listening).await;
+        assert_eq!(
+            (loads.load(Ordering::SeqCst), alive.load(Ordering::SeqCst)),
+            (2, 1),
+            "loaded again"
+        );
+    });
+}
+
+#[test]
+fn models_stay_while_the_call_runs_and_within_the_idle_minutes() {
+    runtime().block_on(async {
+        let models = FakeModels::default();
+        let (loads, alive) = (Arc::clone(&models.loads), Arc::clone(&models.alive));
+        let (call, mut events, _speakers) = call(models);
+        call.start();
+        next(&mut events, |event| match event {
+            VoiceEvent::State(state) if state.listening == crate::Listening::Listening => Some(()),
+            _ => None,
+        })
+        .await;
+        call.stop();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        call.start();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            (loads.load(Ordering::SeqCst), alive.load(Ordering::SeqCst)),
+            (1, 1),
+            "ten minutes by default"
+        );
     });
 }

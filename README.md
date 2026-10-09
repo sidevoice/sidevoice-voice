@@ -71,10 +71,12 @@ mirror the Rust methods (`src/web.rs`).
 - **The configuration** (`VoiceConfig`, read strictly from JSON) names the engine model of each stage (`vad`, `stt`,
   `tts`, with an optional `build`, and the language, voice and speed), what ends a turn (`end_of_turn`: `silence`, or
   `smart-turn` once the engine has it, sidevoice-engine#69), the `patience` (`fast`, `normal`, `calm`), the grace before
-  a reply (`audio_grace_ms`, 1 s) and the listening bar. Local and remote models are configured alike: the engine
+  a reply (`audio_grace_ms`, 1 s), the listening bar, and how long the models stay in memory with the call stopped
+  (`idle_unload_minutes`, 10; 0 unloads them as it stops). Local and remote models are configured alike: the engine
   has one catalogue for both, and a remote provider's key goes from the app's key store to the engine, never here.
 - **`start` loads the models**, installing them if they are not; to show download progress, install them through
-  the engine first. A model that cannot load, and every other failure a person may be told of, is a
+  the engine first. They stay loaded across stops, and leave memory once the call has been stopped for
+  `idle_unload_minutes`; the next start loads them again, on the web as natively. A model that cannot load, and every other failure a person may be told of, is a
   `VoiceEvent::Error` with a stable code.
 - **`AudioIo`** is the microphone and the speaker: capture arrives as 16 kHz mono samples with the echo of the call's
   own playback already cancelled, and the speaker plays a reply's chunks in order and says when each starts and ends

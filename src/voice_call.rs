@@ -20,6 +20,7 @@ use crate::config::{EndOfTurn, VoiceConfig};
 use crate::event::{VoiceError, VoiceEvent};
 use crate::io::{AudioIo, IoEvent, IoSink};
 use crate::models::{Loaded, Models};
+use crate::residency::Residency;
 use crate::room::RoomEvent;
 use crate::runtime::{monotonic_ms, sleep, spawn, unix_ms};
 
@@ -80,6 +81,7 @@ impl VoiceCall {
                 call_id(),
                 unix_ms().saturating_sub(monotonic_ms()),
             ),
+            residency: Residency::new(config.idle_unload_minutes),
             config,
             models,
             io,
@@ -143,6 +145,8 @@ struct Driver {
     models: Arc<dyn Models>,
     io: Box<dyn AudioIo>,
     loaded: Option<Loaded>,
+    /// When the loaded models leave memory, the call stopped.
+    residency: Residency,
     running: bool,
     /// Capture not yet in a whole detector window.
     captured: VecDeque<f32>,
@@ -155,15 +159,24 @@ struct Driver {
 impl Driver {
     async fn run(mut self, mut inbox: UnboundedReceiver<Message>) {
         loop {
-            let message = match self.call.deadline() {
+            let deadline = [self.call.deadline(), self.residency.deadline()]
+                .into_iter()
+                .flatten()
+                .min();
+            let message = match deadline {
                 None => inbox.next().await,
                 Some(deadline) => {
                     let wait = deadline.saturating_sub(monotonic_ms());
                     match select(inbox.next(), Box::pin(sleep(wait))).await {
                         Either::Left((message, _)) => message,
                         Either::Right(((), _)) => {
-                            let effects = self.call.poll(monotonic_ms());
+                            let now = monotonic_ms();
+                            let effects = self.call.poll(now);
                             self.apply(effects);
+                            if self.residency.due(now) {
+                                // Dropping them is what unloads them; the next start loads them again.
+                                self.loaded = None;
+                            }
                             continue;
                         }
                     }
@@ -175,6 +188,8 @@ impl Driver {
                 return;
             };
             self.receive(message).await;
+            let idle = self.loaded.is_some() && !self.running;
+            self.residency.observe(monotonic_ms(), idle);
         }
     }
 
@@ -187,6 +202,7 @@ impl Driver {
                     || self.config.stt != config.stt
                     || self.config.tts != config.tts;
                 self.config = (*config).clone();
+                self.residency.set_minutes(config.idle_unload_minutes);
                 self.input(Input::Config(config));
                 if reload {
                     self.loaded = None;
