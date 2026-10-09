@@ -86,9 +86,10 @@ only, as one step, `cargo xtask npm-publish vX.Y.Z`:
    `npm stage` and trusted publishing both need it).
 3. A version **already published** with the same bytes (what `npm pack @sidevoice/voice@X.Y.Z` fetches) is skipped;
    with other bytes it fails: **npm versions are immutable**, so a bad release is fixed by the next version.
-4. A version **already staged** is skipped too: with the same bytes (its `shasum`, where `npm stage list` can be read)
-   or when npm refuses to stage it again (`E409`, "Cannot publish over previously staged version"). With other bytes
-   it fails and says to reject the staged one.
+4. A version **already staged** with the same bytes (its `shasum`, where `npm stage list` can be read) is skipped too.
+   With other bytes it fails and says to reject the staged one. When the job cannot list staged versions and npm
+   refuses to stage it again (`E409`, "Cannot publish over previously staged version"), it fails too: it cannot tell
+   whose bytes are staged, and prints this build's shasum for the operator to compare before approving.
 5. Otherwise it stages the tarball with `npm stage publish --access public --provenance --tag latest|next` and ends
    with the **stage id** and how to approve it.
 
@@ -158,8 +159,9 @@ artifact is not there yet; when the job that builds it failed, it is never there
   then re-run the failed jobs of that `release-please` run. Nothing is published until every check passed.
 - A `nightly` run fails: the previous snapshot stays. The next green push replaces it.
 - The npm job fails: the GitHub Release is already published and stays. Fix the cause (usually the trusted
-  publisher settings: the error names them) and re-run that job; a version already staged or published with the
-  same bytes is skipped. A version staged with other bytes is rejected on npmjs.com first.
+  publisher settings: the error names them) and re-run that job; a version already published, or staged with
+  the same bytes where the job can list it, is skipped. A version staged with other bytes is rejected on npmjs.com
+  first.
 - A release run is never cancelled half-way; nightlies queue behind each other.
 
 ## What this needs from the repository settings

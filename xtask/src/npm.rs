@@ -133,6 +133,11 @@ fn check_smoke(report: &Value) -> Result<()> {
     if report["ioStarted"] != true {
         return Err(format!("the call never started its io: {report}"));
     }
+    if report["listenedEarly"] != false {
+        return Err(format!(
+            "the call listened before its io was ready: {report}"
+        ));
+    }
     if report["state"]["listening"] != "listening" {
         return Err(format!("the call told no listening state: {report}"));
     }
@@ -154,7 +159,7 @@ fn dist_tag(version: &str) -> &'static str {
 /// `cargo xtask npm-publish TAG`: the Release's tarball, verified, **staged** on npm by trusted publishing with
 /// provenance (`npm stage publish`): the organisation publishes nothing directly, and a maintainer approves each staged
 /// version on npmjs.com with 2FA. A version already published, or already staged, with these very bytes is left as it
-/// is, so a re-run carries on.
+/// is, so a re-run carries on; one staged whose bytes this job cannot compare fails, naming the shasum to check.
 pub(crate) fn publish(tag: &str) -> Result<()> {
     let version = tag.strip_prefix('v').unwrap_or_default();
     if !version.starts_with(char::is_numeric) {
@@ -219,24 +224,10 @@ pub(crate) fn publish(tag: &str) -> Result<()> {
         dist_tag,
         "--json",
     ];
-    let report = match npm.run(&dir, &args) {
-        Err(error) if already_staged(&error) => {
-            println!(
-                "{spec} is already staged (npm refused to stage it again). {}",
-                approval(&spec, &format!("(see `npm stage list {PACKAGE}`)"))
-            );
-            return Ok(());
-        }
-        result => result,
-    };
-    let report = report.map_err(|error| {
-        let workflow = env::var("GITHUB_WORKFLOW_REF").unwrap_or_default();
-        format!(
-            "{error}\nnpm takes trusted publishing only: on npmjs.com, {PACKAGE} → Settings → Trusted publisher \
-             must name this repository and the workflow that started this run ({workflow}). If {spec} is already \
-             staged, approve or reject it on npmjs.com."
-        )
-    })?;
+    let workflow = env::var("GITHUB_WORKFLOW_REF").unwrap_or_default();
+    let report = npm
+        .run(&dir, &args)
+        .map_err(|error| staging_failed(&error, &spec, &shasum, &workflow))?;
     let id = stage_id(&report).unwrap_or_else(|| format!("(see `npm stage list {PACKAGE}`)"));
     println!(
         "{spec} is STAGED (dist-tag {dist_tag}). {}",
@@ -245,10 +236,26 @@ pub(crate) fn publish(tag: &str) -> Result<()> {
     Ok(())
 }
 
+/// Why staging failed, for the job's log. A version staged already (`already_staged`) is a failure too: this job could
+/// not list the staged versions to compare their bytes, so what is staged may not be this build, and nothing here
+/// says it may be approved. A maintainer compares the staged shasum with this build's before approving, or rejects it.
+fn staging_failed(error: &str, spec: &str, shasum: &str, workflow: &str) -> String {
+    if already_staged(error) {
+        format!(
+            "{error}\n{spec} is already staged, and this job could not compare its bytes with this build's (sha1 \
+             {shasum}). On npmjs.com → {PACKAGE} → staged versions (or `npm stage list {PACKAGE}`), approve it only \
+             if its shasum is {shasum}; otherwise reject it and run this release again."
+        )
+    } else {
+        format!(
+            "{error}\nnpm takes trusted publishing only: on npmjs.com, {PACKAGE} → Settings → Trusted publisher \
+             must name this repository and the workflow that started this run ({workflow})."
+        )
+    }
+}
+
 /// Whether npm refused to stage a version because that version is staged already: the registry answers `E409` with
-/// "Cannot publish over previously staged version" (`STAGED_CONFLICT` in the tests, as npm said it). The job cannot list
-/// staged versions itself (trusted publishing authenticates the publish only), so this is how a re-run of a release
-/// finds the version it staged before.
+/// "Cannot publish over previously staged version" (`STAGED_CONFLICT` in the tests, as npm said it).
 fn already_staged(error: &str) -> bool {
     error.contains("E409") && error.to_ascii_lowercase().contains("previously staged")
 }
