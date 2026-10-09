@@ -27,6 +27,9 @@ export interface VoiceSettings {
   patience?: "fast" | "normal" | "calm";
   /** `silence` by default; `smart-turn` needs a model with the `end-of-turn` capability. */
   end_of_turn?: "silence" | "smart-turn";
+  /** How long the models stay in memory with the call stopped, in minutes (10 by default; 0: they leave as it stops).
+   *  The next `start` loads them again. */
+  idle_unload_minutes?: number;
 }
 
 /** One phase of a turn of the person's speech: `voice-user-turn`'s `data`. */
