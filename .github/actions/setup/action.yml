@@ -23,8 +23,8 @@ runs:
         if [ "$WASM" = true ]; then rustup target add --toolchain "$RUST_VERSION" wasm32-unknown-unknown; fi
         echo "RUSTUP_TOOLCHAIN=$RUST_VERSION" >> "$GITHUB_ENV"
     # The native build's system tools: WebRTC's audio processing builds its C++ with meson and ninja (the
-    # `bundled` switch of webrtc-audio-processing), and cpal links ALSA on Linux. CMake, a C++ compiler and libclang
-    # (whisper.cpp, through the engine) are on the runners already.
+    # `bundled` switch of webrtc-audio-processing), and cpal links ALSA on Linux. A C++ compiler is on the runners
+    # already.
     - if: runner.os == 'Linux'
       shell: bash
       run: sudo apt-get update -qq && sudo apt-get install -y -qq meson ninja-build pkg-config libasound2-dev
