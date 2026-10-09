@@ -35,10 +35,10 @@ wasm-bindgen = "0.2.129"
 wasm-bindgen-futures = "0.4.79"
 
 # Every native build: the engine crate itself (src/models/engine.rs), and the app's Tokio runtime, on which the call
-# runs its tasks and timers (src/runtime/native.rs). The engine is pinned to the head of sidevoice-engine#71, which
-# adds the `vad` capability, until a release carries it; then to that release's tag.
+# runs its tasks and timers (src/runtime/native.rs). The engine is pinned to the head of sidevoice-engine#71
+# (`vad`, and loaded models whose futures are Send natively) until a release carries it; then to that release's tag.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-sidevoice-engine = { git = "https://github.com/sidevoice/sidevoice-engine", rev = "cfd7b89d7b367f1efbfb6f420f8d6d78f102b8e7" }
+sidevoice-engine = { git = "https://github.com/sidevoice/sidevoice-engine", rev = "30fb5b0dfb13e6af9f58528c4593afe4bcbeb2e6" }
 tokio = { version = "1.53.2", default-features = false, features = ["rt", "time"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]

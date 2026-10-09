@@ -23,7 +23,7 @@ pub(crate) struct EngineModels(pub(crate) Arc<Engine>);
 impl Models for EngineModels {
     async fn load(&self, config: &VoiceConfig) -> Result<Loaded, String> {
         let (engine, config) = (Arc::clone(&self.0), config.clone());
-        blocking(move || async move { load(&engine, &config).await }).await
+        blocking(async move { load(&engine, &config).await }).await
     }
 }
 
@@ -97,7 +97,7 @@ struct EngineTranscriber(LoadedModel);
 impl Transcriber for EngineTranscriber {
     async fn transcribe(&self, pcm: Vec<f32>, language: Option<String>) -> Result<String, String> {
         let model = self.0.clone();
-        blocking(move || async move {
+        blocking(async move {
             let stt = model.as_stt().ok_or("model-cannot-transcribe")?;
             stt.transcribe(&pcm, RATE, language.as_deref())
                 .await
@@ -121,7 +121,7 @@ impl Speaker for EngineSpeaker {
         language: Option<String>,
     ) -> Result<(Vec<f32>, u32), String> {
         let (model, voice, speed) = (self.model.clone(), self.voice.clone(), self.speed);
-        blocking(move || async move {
+        blocking(async move {
             let tts = model.as_tts().ok_or("model-cannot-speak")?;
             let audio = tts
                 .speak(&text, &voice, language.as_deref(), Some(speed))
@@ -133,17 +133,17 @@ impl Speaker for EngineSpeaker {
     }
 }
 
-/// Runs a model's work to its end on one of Tokio's blocking threads: loading, transcribing and speaking hold
-/// the CPU for seconds, and the engine's futures for them are not `Send` (they hold its model across an await), so
-/// they are made and run there.
-async fn blocking<T, F, Call>(work: F) -> Result<T, String>
+/// Runs a model's work to its end on one of Tokio's blocking threads: the engine's backends load, transcribe and
+/// speak synchronously inside their futures, holding the CPU for seconds, which would stall a runtime worker (and the
+/// call's own task with it).
+async fn blocking<T>(
+    work: impl Future<Output = Result<T, String>> + Send + 'static,
+) -> Result<T, String>
 where
     T: Send + 'static,
-    F: FnOnce() -> Call + Send + 'static,
-    Call: Future<Output = Result<T, String>>,
 {
     let handle = Handle::current();
-    tokio::task::spawn_blocking(move || handle.block_on(work()))
+    tokio::task::spawn_blocking(move || handle.block_on(work))
         .await
         .unwrap_or_else(|_| Err("model-call-failed".into()))
 }
