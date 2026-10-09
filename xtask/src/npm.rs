@@ -20,8 +20,8 @@ const STEM: &str = "sidevoice_voice";
 /// hand, like any pin.
 const NPM_VERSION: &str = "11.21.0";
 const SMOKE_JS: &str = include_str!("../npm/smoke.mjs");
-/// The models the smoke test's configuration names, in the order a call loads its stages: vad, stt, tts.
-const SMOKE_MODELS: [&str; 3] = ["smoke-vad", "smoke-stt", "smoke-tts"];
+/// The slots the smoke test's models fill, recorded each time the call loads them.
+const SMOKE_SLOTS: [&str; 3] = ["vad", "transcriber", "speaker"];
 /// The calls of the voice seam, `VoiceHost` (js/voice-host.d.ts), sorted.
 const SEAM: [&str; 16] = [
     "cancelInput",
@@ -121,7 +121,7 @@ fn copy_dir(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
-/// `cargo xtask npm-smoke`: install the tarball into a consumer's project and, in Node, run a call on a fake engine
+/// `cargo xtask npm-smoke`: install the tarball into a consumer's project and, in Node, run a call on fake models
 /// and a fake microphone and speaker.
 pub(crate) fn smoke() -> Result<()> {
     let (version, target) = metadata()?;
@@ -130,24 +130,22 @@ pub(crate) fn smoke() -> Result<()> {
     empty_dir(&dir)?;
     write(&dir.join("package.json"), br#"{"type": "module"}"#)?;
     let tarball = format!("../npm/{}", tarball_name(&version));
-    // The engine is a peer the consumer brings; the smoke test brings a fake one, so npm installs no peer.
-    let install = "npm install --no-audit --no-fund --legacy-peer-deps";
+    let install = "npm install --no-audit --no-fund";
     run_in(&dir, install, &[&tarball])?;
     write(&dir.join("smoke.mjs"), SMOKE_JS.as_bytes())?;
     let wasm = format!("../dist/{STEM}_bg.wasm");
-    let models = SMOKE_MODELS.join(",");
-    let report = run_in(&dir, "node smoke.mjs", &[&wasm, &models])?;
+    let report = run_in(&dir, "node smoke.mjs", &[&wasm])?;
     let report = parse(report.as_bytes(), "smoke.mjs")?;
     check_smoke(&report)?;
     println!("{PACKAGE}@{version} installs and runs: {report}");
     Ok(())
 }
 
-/// Whether the smoke test's report shows a call that ran: it loaded every stage through the engine, in order, started
-/// the microphone and speaker, and told its state as listening; the package offers the default web microphone and
-/// speaker; and its voice seam answers as `VoiceHost` says.
+/// Whether the smoke test's report shows a call that ran: it loaded the page's models once, started the microphone and
+/// speaker, and told its state as listening; the package offers the default web microphone and speaker; and its voice
+/// seam answers as `VoiceHost` says.
 fn check_smoke(report: &Value) -> Result<()> {
-    let (loaded, want) = (&report["loaded"], json!(SMOKE_MODELS));
+    let (loaded, want) = (&report["loaded"], json!(SMOKE_SLOTS));
     if *loaded != want {
         return Err(format!("the call loaded {loaded}, not {want}"));
     }
@@ -162,8 +160,8 @@ fn check_smoke(report: &Value) -> Result<()> {
     }
     let host = &report["host"];
     let want = json!({
-        "missing": "settings-missing", "unknown": "model-unknown", "wrongTask": "model-wrong-task",
-        "buildUnfit": "build-unfit", "smartTurn": "end-of-turn-unavailable", "reloaded": 3,
+        "missing": "settings-missing", "unknown": "model-unknown", "reloaded": 1,
+        "smartMissing": "end-of-turn-missing", "catalogue": 2,
         "started": "resolved", "again": "resolved", "states": host["states"], "keys": [true, "sk-smoke", false],
         "seam": SEAM,
     });

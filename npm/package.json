@@ -30,8 +30,5 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/sidevoice/sidevoice-voice.git"
-  },
-  "peerDependencies": {
-    "@sidevoice/engine": "*"
   }
 }

@@ -1,12 +1,16 @@
 // The voice seam a page drives a call through: `VoiceHost`. Implemented by `createVoiceHost` here (the call in the
-// page, over the WebAssembly build and a `WebEngine`) and by the Sidevoice desktop app (`window.__sidevoiceDesktop
-// .host.voice`, the call run natively). A page uses nothing else of either:
+// page, over the WebAssembly build and the page's models) and by the Sidevoice desktop app
+// (`window.__sidevoiceDesktop.host.voice`, the call run natively). A page uses nothing else of either:
 //
-//   const voice = window.__sidevoiceDesktop?.host?.voice ?? createVoiceHost(await WebEngine.create(host));
+//   const voice = window.__sidevoiceDesktop?.host?.voice ?? createVoiceHost(source);
+//
+// where `source` is the page's `VoiceModelSource`: its catalogue, and the models that fill the call's slots for the
+// person's settings (sidevoice-engine's, wired into `voice-models.d.ts`'s interfaces, say).
 //
 // The payloads are the room's messages as sidevoice-voice writes and reads them (its README, "The room's messages").
 
 import type { AudioIo, WebAudioIoOptions } from "./web-audio-io.js";
+import type { VoiceModels } from "./voice-models.js";
 
 /** The person's choices. Each host fills the rest: the voice activity detector, the builds, grace, listening bar. */
 export interface VoiceSettings {
@@ -100,9 +104,10 @@ export interface VoiceKaraoke {
 
 /** What a failed call rejects with, and what `onError` hears: rely on `code`. The desktop app adds its `key`. */
 export interface VoiceHostError {
-  /** `microphone-denied`, `microphone-unavailable`, `speaker-unavailable`, `audio-device-unavailable`, the engine's
-   *  (`model-load-failed`, `credential-missing`, …), `settings-missing`, `stopped`, `model-unknown`,
-   *  `model-wrong-task`, `model-unfit`, `build-unfit`, `end-of-turn-unavailable`, … */
+  /** `microphone-denied`, `microphone-unavailable`, `speaker-unavailable`, `audio-device-unavailable`, the models'
+   *  (`model-load-failed`, `credential-missing`, …), `settings-missing`, `stopped`, `end-of-turn-missing`, and the
+   *  model source's refusals of settings (`model-unknown`, `model-wrong-task`, `model-unfit`, `build-unfit`,
+   *  `end-of-turn-unavailable`, …). */
   code: string;
   message?: string;
   key?: string;
@@ -125,7 +130,7 @@ export interface VoiceBuild {
   installed: boolean;
 }
 
-/** A model of the engine's catalogue, as `WebEngine.models()` lists it, on both hosts. */
+/** A model of the catalogue the settings choose from, in the shape `WebEngine.models()` lists, on both hosts. */
 export interface VoiceModel {
   id: string;
   family: string;
@@ -145,7 +150,8 @@ export interface VoiceModel {
 export interface VoiceHost {
   /** Sets the person's choices; the first creates the call. Rejects `VoiceHostError`. */
   setSettings(settings: VoiceSettings): Promise<void>;
-  /** Loads the models (installing them if needed), opens the microphone and the speaker, listens. Resolves at the first
+  /** Loads the models, opens the microphone and the speaker, listens. `smart-turn` without an end-of-turn model
+   *  rejects `{code: "end-of-turn-missing"}`. Resolves at the first
    *  state whose `listening` is not `idle` (at once if the call listens already; a second `start` while one is pending
    *  settles with it). Rejects `VoiceHostError`; with `{code: "stopped"}` when `stop()` comes first. */
   start(): Promise<void>;
@@ -169,18 +175,29 @@ export interface VoiceHost {
   onLevel(listener: (level: number) => void): () => void;
   onKaraoke(listener: (karaoke: VoiceKaraoke) => void): () => void;
   onError(listener: (error: VoiceHostError) => void): () => void;
-  /** The engine's catalogue, for the settings' choices. */
+  /** The catalogue the settings choose from (the model source's). */
   models(): Promise<VoiceModel[]>;
-  /** Keeps `key` for a remote provider (`openai`, `elevenlabs`), or removes it with `null`. The engine asks the host for
+  /** Keeps `key` for a remote provider (`openai`, `elevenlabs`), or removes it with `null`. The models ask the host for
    *  it; the page never reads it back. */
   setProviderKey(provider: string, key: string | null): Promise<void>;
   hasProviderKey(provider: string): Promise<boolean>;
 }
 
-/** Where `createVoiceHost` keeps provider keys, and where the page's engine host reads them (`credential`). */
+/** Where `createVoiceHost` keeps provider keys, and where the page's models read them (an engine host's
+ *  `credential`, say). */
 export interface ProviderKeys {
   get(provider: string): string | null;
   set(provider: string, key: string | null): void;
+}
+
+/** The page's side of `createVoiceHost`: which models fill the call's slots, and what the settings choose from. */
+export interface VoiceModelSource {
+  /** The catalogue `models()` answers. */
+  catalogue(): Promise<VoiceModel[]>;
+  /** The models for `settings` (the voice activity detector, the transcriber, the speaker, and an end-of-turn
+   *  classifier for `smart-turn`), not loaded yet: the call loads them as it starts. Rejects `{code}` for settings it
+   *  cannot fill. Asked again only when the models the settings choose change (a stage or the end of turn). */
+  models(settings: VoiceSettings): VoiceModels | Promise<VoiceModels>;
 }
 
 export interface VoiceHostOptions extends WebAudioIoOptions {
@@ -190,8 +207,8 @@ export interface VoiceHostOptions extends WebAudioIoOptions {
   keys?: ProviderKeys;
 }
 
-/** The voice seam over this package's call, on `engine` (a `WebEngine` of `@sidevoice/engine`). */
-export declare function createVoiceHost(engine: unknown, options?: VoiceHostOptions): VoiceHost;
+/** The voice seam over this package's call, on the page's `source` of models. */
+export declare function createVoiceHost(source: VoiceModelSource, options?: VoiceHostOptions): VoiceHost;
 
 /** Provider keys in the page's `localStorage`, under `sidevoice.provider-key.<provider>`: the web's choice
  *  (sidevoice-core#89 §3), with the warning that any script of the page can read them. */

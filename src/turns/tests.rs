@@ -5,6 +5,7 @@ use wasm_bindgen_test::wasm_bindgen_test as test;
 
 const NUMBERS: Segmentation = Segmentation {
     end_of_turn_silence_ms: 2_500,
+    pause_ms: None,
     quiet_bar: 0.5,
     playing_bar: 0.8,
 };
@@ -73,4 +74,45 @@ fn a_turn_keeps_a_minute_and_ends_when_its_audio_stops() {
     };
     assert_eq!(ended.pcm.len(), MAX_TURN);
     assert_eq!(segmenter.deadline(), None);
+}
+
+#[test]
+fn with_smart_turn_each_pause_is_offered_once_and_ends_the_turn_if_it_is_still_on() {
+    let mut segmenter = Segmenter::new(Segmentation {
+        pause_ms: Some(900),
+        end_of_turn_silence_ms: 3_000,
+        ..NUMBERS
+    });
+    while segmenter.window(0, &window(true), true, false).is_none() {}
+    let mut offered = Vec::new();
+    for _ in 0..40 {
+        if let Some(Segment::Paused { pcm, pause }) =
+            segmenter.window(0, &window(false), false, false)
+        {
+            offered.push((pause, pcm.len()));
+        }
+    }
+    assert_eq!(offered.len(), 1, "once per pause");
+    assert_eq!(offered[0].0, 1);
+    // Speech again (loud long enough for the smoothed level): the first pause is over, so an answer about it ends
+    // nothing.
+    for _ in 0..10 {
+        segmenter.window(0, &window(true), true, false);
+    }
+    assert_eq!(segmenter.end_paused(1), None);
+    for _ in 0..30 {
+        if let Some(Segment::Paused { pause, .. }) =
+            segmenter.window(0, &window(false), false, false)
+        {
+            assert_eq!(pause, 2);
+        }
+    }
+    let Some(Segment::Ended(ended)) = segmenter.end_paused(2) else {
+        panic!("ended by the model")
+    };
+    assert!(
+        ended.silence_ms >= 900 && ended.silence_ms < 3_000,
+        "{}",
+        ended.silence_ms
+    );
 }

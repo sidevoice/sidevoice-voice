@@ -1,8 +1,9 @@
-//! The bridge to JavaScript, only in the wasm32 build (the npm package): `VoiceCall.create(engine, io, config)`, the
-//! same call as the Rust [`VoiceCall`](crate::VoiceCall), on the page's `WebEngine` and a JavaScript microphone and
-//! speaker.
+//! The bridge to JavaScript, only in the wasm32 build (the npm package): `VoiceCall.create(models, io, config)`, the
+//! same call as the Rust [`VoiceCall`](crate::VoiceCall), on the page's models and a JavaScript microphone and speaker.
 //!
-//! - `engine` is a `WebEngine` of `@sidevoice/engine`.
+//! - `models` is the page's `VoiceModels` (`js/voice-models.d.ts`): `load()` answers `{vad, transcriber, speaker,
+//!   endOfTurn?}`, objects with the methods of [`Vad`](crate::Vad), [`Transcriber`](crate::Transcriber),
+//!   [`Speaker`](crate::Speaker) and [`EndOfTurnModel`](crate::EndOfTurnModel).
 //! - `io` is an object with `start(sink)`, `play(utterance, chunk, samples, sampleRate)`, `stopPlayback()` and
 //!   `stop()`; it reports through `sink` (an [`IoSink`](crate::IoSink): `captured(samples)`, with 16 kHz mono
 //!   samples, `chunkStarted(utterance, chunk)`, `chunkPlayed(utterance, chunk)`, `failed(code)`). `start` may throw an
@@ -21,7 +22,7 @@ use js_sys::{Array, Float32Array, Function, Reflect, JSON};
 use wasm_bindgen::prelude::*;
 
 use crate::io::{AudioIo, IoEvent, IoSink};
-use crate::models::WebModels;
+use crate::models::JsVoiceModels;
 use crate::room::RoomEvent;
 use crate::runtime::spawn;
 use crate::voice_call::VoiceCall;
@@ -36,12 +37,15 @@ pub struct WebVoiceCall {
 
 #[wasm_bindgen(js_class = VoiceCall)]
 impl WebVoiceCall {
-    /// A call on `engine`'s models and `io`'s microphone and speaker, set up with `config`. It does nothing until
+    /// A call on the page's `models` and `io`'s microphone and speaker, set up with `config`. It does nothing until
     /// `start()`.
-    pub fn create(engine: JsValue, io: JsValue, config: JsValue) -> Result<WebVoiceCall, JsError> {
+    pub fn create(models: JsValue, io: JsValue, config: JsValue) -> Result<WebVoiceCall, JsError> {
         let config = read_config(&config)?;
-        let (call, mut events) =
-            VoiceCall::with_models(Arc::new(WebModels(engine)), Box::new(JsIo(io)), config);
+        let (call, mut events) = VoiceCall::new(
+            Arc::new(models.unchecked_into::<JsVoiceModels>()),
+            Box::new(JsIo(io)),
+            config,
+        );
         let listeners: Rc<RefCell<Vec<Function>>> = Rc::default();
         let heard = Rc::clone(&listeners);
         spawn(async move {
@@ -77,6 +81,13 @@ impl WebVoiceCall {
     pub fn set_config(&self, config: JsValue) -> Result<(), JsError> {
         self.call.set_config(read_config(&config)?);
         Ok(())
+    }
+
+    /// Other models (`VoiceModels`): loaded at once if the call is started, else at the next start.
+    #[wasm_bindgen(js_name = setModels)]
+    pub fn set_models(&self, models: JsValue) {
+        self.call
+            .set_models(Arc::new(models.unchecked_into::<JsVoiceModels>()));
     }
 
     /// A message the room sent, as `{ type, data }`; messages the call does not use are let through.

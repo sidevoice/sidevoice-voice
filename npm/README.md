@@ -11,21 +11,18 @@ The [Sidevoice](https://github.com/sidevoice) voice call for the web: it listens
 start and stop speaking, has what you said transcribed, and hands your turn to the page as a message for the room;
 it takes the room's replies, has them spoken, plays them, stops when you speak over them, and reports how much of
 each you heard. This package is its WebAssembly build (`wasm-bindgen --target web`) with the browser's microphone and
-speaker. Every model runs through [`@sidevoice/engine`](https://www.npmjs.com/package/@sidevoice/engine), which the
-page brings (a peer dependency), and the call holds no socket: the page carries its messages to the room and back.
+speaker. The models are the page's, supplied through the package's own interfaces (`VoiceModels`: a voice activity
+detector, a transcriber, a speaker and an optional end-of-turn classifier, typed in `js/voice-models.d.ts`), with
+[`@sidevoice/engine`](https://www.npmjs.com/package/@sidevoice/engine)'s models, say; and the call holds no socket:
+the page carries its messages to the room and back.
 
 ```js
-import initEngine, { WebEngine } from "@sidevoice/engine";
 import init, { VoiceCall } from "@sidevoice/voice";
 
-await Promise.all([initEngine(), init()]);
-const engine = await WebEngine.create(host); // @sidevoice/engine's README says how
-const call = VoiceCall.create(engine, {
-  vad: { model: "silero-vad" },
-  stt: { model: "whisper-base", language: "es" },
-  tts: { model: "kokoro-82m-v1.0", voice: "ef_dora" },
-  patience: "normal",
-});
+await init();
+// The page's models: `load()` answers objects with the methods js/voice-models.d.ts types.
+const models = { load: async () => ({ vad, transcriber, speaker }) };
+const call = VoiceCall.create(models, { language: "es", voice: "ef_dora", patience: "normal" });
 call.onEvent(({ type, data }) => {
   // "room-message" (to the room, kept until acknowledged), "state", "level", "karaoke", "error" ({ code })
 });
@@ -34,7 +31,7 @@ socket.onmessage = ({ data }) => call.roomEvent(JSON.parse(data));
 ```
 
 The microphone is `getUserMedia` with the browser's echo cancellation, noise suppression and gain control, turned
-into 16 kHz mono in an AudioWorklet; the speaker is Web Audio. `VoiceCall.create(engine, config, { outputDevice })`
+into 16 kHz mono in an AudioWorklet; the speaker is Web Audio. `VoiceCall.create(models, config, { outputDevice })`
 plays on another output where the browser allows it (a non-default output may escape the browser's echo canceller),
 and `{ io }` brings a microphone and speaker of the page's own (`createWebAudioIo` is the default one). Failures are
 `error` events with a stable `code` (`microphone-denied`, `microphone-unavailable`, ...), for the page to translate.

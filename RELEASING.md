@@ -8,8 +8,8 @@ The call reaches its consumers in two ways:
 - **Native consumers** (the desktop app) depend on the crate at a git tag and compile it themselves: source, no
   binaries.
 - **The web** gets `@sidevoice/voice` on npm: the wasm32 build of the crate as `wasm-bindgen --target web` emits it,
-  the browser's microphone and speaker and the entry point (`js/`), with its `package.json`. `@sidevoice/engine` is a
-  peer dependency: the page brings the engine. Published for `vX.Y.Z` releases only ([npm](#npm)).
+  the browser's microphone and speaker and the entry point (`js/`), with its `package.json`. It has no dependencies: the page
+  brings its own models (`js/voice-models.d.ts`). Published for `vX.Y.Z` releases only ([npm](#npm)).
 
 ## What each act means
 
@@ -31,10 +31,9 @@ manifest | publish | npm-publish`, each described at the top of `xtask/src/main.
   and the licence, and packs the package with `npm pack` into `target/npm/sidevoice-voice-X.Y.Z.tgz`. It fails if
   the tarball lacks wasm-bindgen's entry point, types or wasm, or any file of `js/`.
 - `cargo xtask npm-smoke` installs that tarball into a scratch project (`target/npm smoke/`) with `npm install`, as
-  a consumer does (without the peer: the test brings a fake engine), and in Node imports `@sidevoice/voice`, loads
-  its wasm from `node_modules` and runs `VoiceCall.create` on a plain-object engine and a plain-object microphone and
-  speaker: the call must load its three models through the engine, in order, start the microphone and speaker, and
-  say it listens.
+  a consumer does, and in Node imports `@sidevoice/voice`, loads its wasm from `node_modules` and runs
+  `VoiceCall.create` on plain-object models and a plain-object microphone and speaker: the call must load the models
+  once, start the microphone and speaker, and say it listens.
 
 The wasm32 tests and `cargo xtask npm` need the wasm-bindgen CLI (`wasm-bindgen`, `wasm-bindgen-test-runner`) on the
 `PATH`, at the version of the `wasm-bindgen` crate in `Cargo.lock`. In CI, `.github/actions/setup` installs it with
