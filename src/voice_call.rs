@@ -19,7 +19,7 @@ use futures_channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures_util::future::{abortable, ready, select, AbortHandle, Either};
 use futures_util::{stream, Stream, StreamExt};
 
-use crate::call::{Call, Effect, Input, Transcript};
+use crate::call::{Call, Effect, Input};
 use crate::config::{EndOfTurn, VoiceConfig};
 use crate::event::{VoiceError, VoiceEvent};
 use crate::io::{AudioIo, IoEvent, IoSink};
@@ -400,13 +400,9 @@ impl Driver {
                 self.error(code);
                 self.halt().await;
             }
-            Message::Transcribed { turn, result } => self.input(Input::Transcribed {
-                turn,
-                result: result.map(|text| Transcript {
-                    text,
-                    logprob: None,
-                }),
-            }),
+            Message::Transcribed { turn, result } => {
+                self.input(Input::Transcribed { turn, result })
+            }
             Message::Synthesized {
                 utterance,
                 chunk,

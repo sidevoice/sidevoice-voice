@@ -1,7 +1,7 @@
 //! The call on recorded speech: the clips go through a detector on energy, window by window, 32 ms apart, and the
 //! tests play the models and the speaker by hand.
 
-use super::{Call, Effect, Input, Transcript};
+use super::{Call, Effect, Input};
 use crate::config::{Patience, VoiceConfig};
 use crate::event::{Listening, TurnEvent, TurnTimings, VoiceEvent};
 use crate::say::{SayEvent, SayOutcome, StopReason};
@@ -244,10 +244,7 @@ impl Run {
     fn transcribed(&mut self, turn: usize, text: &str) {
         self.input(Input::Transcribed {
             turn,
-            result: Ok(Transcript {
-                text: text.into(),
-                logprob: None,
-            }),
+            result: Ok(text.into()),
         });
     }
 
@@ -561,12 +558,7 @@ fn transcripts_that_say_nothing_cancel_their_turn() {
         let (turn, _) = Run::transcribe(&run.take()).expect("transcribed");
         run.input(Input::Transcribed {
             turn,
-            result: result
-                .map(|()| Transcript {
-                    text: text.into(),
-                    logprob: None,
-                })
-                .map_err(str::to_owned),
+            result: result.map(|()| text.into()).map_err(str::to_owned),
         });
         let effects = run.take();
         let turns = Run::turns(&effects);

@@ -36,7 +36,7 @@ pub(crate) enum Input {
     /// A turn's transcript, or the stable code of why there is none.
     Transcribed {
         turn: usize,
-        result: Result<Transcript, String>,
+        result: Result<String, String>,
     },
     /// Say `text` under `id`, in `language` (the configuration's when absent).
     Say {
@@ -74,14 +74,6 @@ const CANCELS_KEPT: usize = 64;
 
 /// The end-of-turn probability from which a paused turn is over.
 const END_OF_TURN_LIKELY: f32 = 0.5;
-
-/// A transcript as the recogniser gave it.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct Transcript {
-    pub(crate) text: String,
-    /// The mean log-probability, where the recogniser reports one.
-    pub(crate) logprob: Option<f64>,
-}
 
 /// What the driver must do.
 #[derive(Debug, PartialEq)]
@@ -353,7 +345,7 @@ impl Call {
         &mut self,
         now: u64,
         turn: usize,
-        result: Result<Transcript, String>,
+        result: Result<String, String>,
         out: &mut Vec<Effect>,
     ) {
         if !self.recognition.is_active(turn) {
@@ -362,7 +354,7 @@ impl Call {
         let next = self.recognition.done();
         let language = self.config.language.clone();
         let text = match result {
-            Ok(transcript) => accepted(&transcript.text, language.as_deref(), transcript.logprob),
+            Ok(text) => accepted(&text, language.as_deref()),
             Err(code) => {
                 self.error(&code, out);
                 None

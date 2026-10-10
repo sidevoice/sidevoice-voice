@@ -40,39 +40,21 @@ fn a_held_transcript_is_due_only_when_nothing_can_join_it() {
 }
 
 #[test]
-fn the_filter_drops_empty_foreign_script_and_unlikely_transcripts() {
+fn the_filter_drops_empty_and_foreign_script_transcripts() {
+    assert_eq!(accepted("  hola  ", Some("es")).as_deref(), Some("hola"));
+    assert_eq!(accepted(" ", Some("es")), None);
+    assert_eq!(accepted("Привет", Some("es")), None);
+    assert_eq!(accepted("Привет", Some("ru")).as_deref(), Some("Привет"));
     assert_eq!(
-        accepted("  hola  ", Some("es"), None).as_deref(),
-        Some("hola")
-    );
-    assert_eq!(accepted(" ", Some("es"), None), None);
-    assert_eq!(accepted("Привет", Some("es"), None), None);
-    assert_eq!(
-        accepted("Привет", Some("ru"), None).as_deref(),
-        Some("Привет")
-    );
-    assert_eq!(
-        accepted("你好", None, None).as_deref(),
+        accepted("你好", None).as_deref(),
         Some("你好"),
         "a detected language is not checked"
     );
     assert_eq!(
-        accepted("Ñandú, ça va", Some("es-ES"), None).as_deref(),
+        accepted("Ñandú, ça va", Some("es-ES")).as_deref(),
         Some("Ñandú, ça va")
     );
-    assert_eq!(
-        accepted("1, 2, 3", Some("en"), None).as_deref(),
-        Some("1, 2, 3")
-    );
-    assert_eq!(
-        accepted("yes", Some("en"), Some(-2.5)).as_deref(),
-        Some("yes")
-    );
-    assert_eq!(accepted("yes", Some("en"), Some(-3.5)), None);
-    assert_eq!(
-        accepted("a longer sentence here", Some("en"), Some(-2.5)),
-        None
-    );
+    assert_eq!(accepted("1, 2, 3", Some("en")).as_deref(), Some("1, 2, 3"));
 }
 
 #[test]
@@ -82,7 +64,7 @@ fn the_script_a_language_is_written_in_comes_from_cldr() {
         "es", "en", "ca", "eu", "gl", "cy", "ga", "mt", "sq", "tr", "vi", "id", "ms", "sw", "uz",
         "az", "fil", "pt-BR", "es_MX",
     ] {
-        assert_eq!(accepted("Привет", Some(language), None), None, "{language}");
+        assert_eq!(accepted("Привет", Some(language)), None, "{language}");
     }
     // Written in another script: its own letters pass.
     for (language, text) in [
@@ -102,15 +84,15 @@ fn the_script_a_language_is_written_in_comes_from_cldr() {
         ("am", "ሰላም"),
     ] {
         assert_eq!(
-            accepted(text, Some(language), None).as_deref(),
+            accepted(text, Some(language)).as_deref(),
             Some(text),
             "{language}"
         );
     }
     // A tag that names its script wins over the likely one; one that does not parse checks nothing.
-    assert_eq!(accepted("Здраво", Some("sr-Latn"), None), None);
+    assert_eq!(accepted("Здраво", Some("sr-Latn")), None);
     assert_eq!(
-        accepted("Здраво", Some("not a tag"), None).as_deref(),
+        accepted("Здраво", Some("not a tag")).as_deref(),
         Some("Здраво")
     );
 }
