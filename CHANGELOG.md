@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.2.0](https://github.com/sidevoice/sidevoice-voice/compare/v0.1.0...v0.2.0) (2026-10-10)
+
+
+### ⚠ BREAKING CHANGES
+
+* **web:** the voice seam lists no models and keeps no keys; a slot's model choice is the page's ([#14](https://github.com/sidevoice/sidevoice-voice/issues/14))
+
+### Features
+
+* **web:** the voice seam lists no models and keeps no keys; a slot's model choice is the page's ([#14](https://github.com/sidevoice/sidevoice-voice/issues/14)) ([a6f2c0a](https://github.com/sidevoice/sidevoice-voice/commit/a6f2c0a22a878f5838c688e503c5b4db2318f685))
+
 ## 0.1.0 (2026-10-10)
 
 
