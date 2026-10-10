@@ -146,14 +146,8 @@ pub enum RoomEvent {
     /// A reply to speak.
     Reply(Reply),
     /// The room took a turn of the person's (`turn_id`, the module's own), at `revision`: the turn's boundary. A reply
-    /// written below it answers an older turn. `session_id` is the room session that `revision` counts in (opaque,
-    /// compared only for equality): the same after a resume, another for a session that replaced it, whose revisions
-    /// start again from 0.
-    TurnStarted {
-        session_id: String,
-        turn_id: String,
-        revision: u64,
-    },
+    /// written below it answers an older turn.
+    TurnStarted { turn_id: String, revision: u64 },
     /// The room refused a turn's `started` (message `client_msg_id`) because the call already has as many turns open as
     /// it keeps (`room.turns_full`): the turn is to be said again once one of them ends.
     TurnsFull { client_msg_id: String },
@@ -181,12 +175,10 @@ impl RoomEvent {
             "voice-user-turn" if envelope.data["phase"] == "started" => {
                 #[derive(Deserialize)]
                 struct Started {
-                    session_id: String,
                     turn_id: String,
                     revision: u64,
                 }
                 Started::deserialize(envelope.data).map(|started| Self::TurnStarted {
-                    session_id: started.session_id,
                     turn_id: started.turn_id,
                     revision: started.revision,
                 })
