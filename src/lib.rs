@@ -9,8 +9,11 @@
 //! window), `speech` (a text in sentence chunks), `playback` (the queue, barge-in and the heard position) and `call`
 //! (the state machine that runs the three regions).
 
+#[cfg(native)]
+mod audio;
 mod call;
 mod config;
+mod echo;
 mod event;
 mod io;
 mod maybe_send;
@@ -37,6 +40,8 @@ pub use config::{EndOfTurn, ListeningBar, Patience, VoiceConfig};
 pub use event::{
     CallState, Listening, PlaybackState, TurnEvent, TurnTimings, VoiceError, VoiceEvent,
 };
+#[cfg(native)]
+pub use io::NativeIo;
 pub use io::{AudioIo, IoEvent, IoSink};
 pub use maybe_send::{MaybeSend, MaybeSync};
 pub use models::{EndOfTurnModel, Models, Speaker, Transcriber, Vad, VadFrame, VoiceModels};
