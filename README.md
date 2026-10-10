@@ -212,7 +212,7 @@ time; a task around it (`src/voice_call.rs`) feeds it and does what it answers.
   at most a minute. With `smart-turn`, a pause of 0.6, 0.9 or 1.3 s (by patience) is offered to the end-of-turn model
   once; a probability of 0.5 or more ends the turn there, and a pause of 2.5, 3 or 4 s ends it anyway.
 - **Recognition.** Turns are transcribed in order, one at a time, at most eight waiting. A transcript is dropped
-  when it is empty, written in no Latin letter for a language that is, or too unlikely; the turn is then
+  when it is empty, or written in no Latin letter for a language that is; the turn is then
   `cancelled`. Otherwise it waits the merge window (none, 0.5 or 1.5 s by patience): a turn that follows within it
   joins it, and the earlier one is reported `cancelled` with `merged`.
 - **Playback.** What the app asks to say is cut into sentence chunks, each synthesized while the one before plays and

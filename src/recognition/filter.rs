@@ -1,36 +1,33 @@
-//! The acceptance filter: a transcript is dropped when it is empty, when it is written in no Latin letter while the
-//! language spoken is written in Latin script (a recogniser that heard noise answers in any script), or when the
-//! recogniser reports it too unlikely.
+//! The acceptance filter: a transcript is dropped when it is empty, or when it is written in no Latin letter while the
+//! language spoken is written in Latin script (a recogniser that heard noise answers in any script). It does not judge
+//! how likely the recogniser found the transcript.
 
-/// Languages written in another script than the Latin one, by their primary BCP 47 subtag: for these the script is
-/// not checked.
-const NON_LATIN: &[&str] = &[
-    "am", "ar", "be", "bg", "bn", "el", "fa", "gu", "he", "hi", "hy", "ja", "ka", "kk", "km", "kn",
-    "ko", "ky", "lo", "mk", "ml", "mn", "mr", "my", "ne", "or", "pa", "ps", "ru", "si", "sr", "ta",
-    "te", "th", "uk", "ur", "yi", "zh",
-];
+use icu_locale::subtags::script;
+use icu_locale::{LanguageIdentifier, LocaleExpander};
+
+/// Whether `language` (a BCP 47 tag) is written in Latin script: the script its tag names, or else the one CLDR says
+/// it is likely written in (CLDR's likely subtags, from ICU4X's compiled data for languages with Basic coverage or
+/// more; built on each call, it only points at that data). A tag that does not parse, or a language CLDR does not know,
+/// is not.
+fn written_in_latin(language: &str) -> bool {
+    // `es_MX`, as POSIX locales write it, is `es-MX`.
+    let Ok(mut id) = language.replace('_', "-").parse::<LanguageIdentifier>() else {
+        return false;
+    };
+    LocaleExpander::new_common().maximize(&mut id);
+    id.script == Some(script!("Latn"))
+}
 
 /// The transcript to report, or `None` to drop it. `language` is the one the stage was told (`None`: detected, and
-/// the script is not checked); `logprob`, the recogniser's mean log-probability where it reports one.
-pub(crate) fn accepted(text: &str, language: Option<&str>, logprob: Option<f64>) -> Option<String> {
+/// the script is not checked).
+pub(crate) fn accepted(text: &str, language: Option<&str>) -> Option<String> {
     let text = text.trim();
     if text.is_empty() {
         return None;
     }
-    let latin_language = language.is_some_and(|language| {
-        let primary = language.split(['-', '_']).next().unwrap_or_default();
-        !NON_LATIN.contains(&primary.to_ascii_lowercase().as_str())
-    });
+    let latin_language = language.is_some_and(written_in_latin);
     if latin_language && text.chars().any(char::is_alphabetic) && !text.chars().any(is_latin_letter)
     {
-        return None;
-    }
-    let floor = if text.split_whitespace().count() <= 2 {
-        -3.0
-    } else {
-        -2.0
-    };
-    if logprob.is_some_and(|value| value < floor) {
         return None;
     }
     Some(text.to_owned())
