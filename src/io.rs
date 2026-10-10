@@ -1,6 +1,6 @@
 //! The microphone and the speaker, as a call uses them ([`AudioIo`]): capture arrives as 16 kHz mono samples, with
-//! the echo of the call's own playback already cancelled, and the speaker plays a reply's chunks in order and says
-//! when each starts and ends. The platform's implementations are in `io/`; each file says where it runs.
+//! the echo of the call's own playback already cancelled, and the speaker plays the chunks of what is said in order
+//! and says when each starts and ends. The platform's implementations are in `io/`; each file says where it runs.
 
 use futures_channel::mpsc::UnboundedSender;
 
@@ -16,14 +16,14 @@ pub enum IoEvent {
     Captured(Vec<f32>),
     /// The first sample of a chunk reached the speaker.
     ChunkStarted {
-        /// The reply.
+        /// What is being said.
         utterance: String,
         /// The chunk's index in it.
         chunk: usize,
     },
     /// The last sample of a chunk reached the speaker.
     ChunkPlayed {
-        /// The reply.
+        /// What is being said.
         utterance: String,
         /// The chunk's index in it.
         chunk: usize,
@@ -54,7 +54,7 @@ pub trait AudioIo: MaybeSend {
     ///
     /// The code of why the microphone or the speaker could not be opened.
     fn start(&mut self, sink: IoSink) -> Result<(), String>;
-    /// Queues a chunk of a reply: mono samples at `sample_rate`, played after whatever is queued.
+    /// Queues a chunk of something said: mono samples at `sample_rate`, played after whatever is queued.
     fn play(&mut self, utterance: &str, chunk: usize, samples: Vec<f32>, sample_rate: u32);
     /// Stops the speaker at once, with a short fade, and drops every queued chunk.
     fn stop_playback(&mut self);

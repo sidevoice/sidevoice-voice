@@ -1,5 +1,5 @@
 //! What the driver needs from the platform it runs on: spawning a task, sleeping, and the two clocks (a monotonic
-//! one for the state machine, Unix time for the room's timestamps). Each platform's file says where it runs.
+//! one for the state machine, Unix time for the turns' timestamps). Each platform's file says where it runs.
 
 mod native;
 mod web;

@@ -1,27 +1,64 @@
-//! What a call tells its host ([`VoiceEvent`]): the room messages to carry, where the call is, how loud the
-//! microphone is, where the reader of a reply is, and what failed.
+//! What a call tells its host ([`VoiceEvent`]): the person's turns, where the call is, how loud the microphone is, and
+//! what failed. What becomes of something the call was asked to say comes through its own handle (`say`).
 
 use serde::Serialize;
 
-use crate::room::RoomMessage;
-
-/// Something the host must know or do.
+/// Something the host must know.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "kebab-case")]
 pub enum VoiceEvent {
-    /// A message to send to the room, through the host's outbox.
-    RoomMessage(RoomMessage),
+    /// A turn of the person's started, ended with its words, or came to nothing.
+    Turn(TurnEvent),
     /// Where the call is, when it changed.
     State(CallState),
     /// The microphone's smoothed level, from 0 to 1, once per detector window.
     Level(f32),
-    /// Where the reader of a reply is.
-    Karaoke(Karaoke),
     /// Something failed that a person may be told, as a stable code.
     Error(VoiceError),
 }
 
-/// Where the call is: its three regions, and whether the room is in reach.
+/// One step of a turn of the person's speech, under the call's own id for the turn.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "phase", rename_all = "lowercase")]
+pub enum TurnEvent {
+    /// The person started speaking.
+    Started {
+        turn_id: String,
+        /// When, in Unix milliseconds.
+        started_at: u64,
+    },
+    /// The turn's transcript is final: what the person said.
+    Finished {
+        turn_id: String,
+        text: String,
+        /// The language the transcript is in, when the transcriber was told one.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        language: Option<String>,
+        /// When the person started speaking (the first of the turns it joined) and when the turn ended, in Unix
+        /// milliseconds.
+        started_at: u64,
+        ended_at: u64,
+        /// Whether it joined earlier turns, which were cancelled with `merged`.
+        merged: bool,
+        timings: TurnTimings,
+    },
+    /// Nothing comes of the turn: no words in it, the person cancelled it, or it was joined into the next one
+    /// (`merged`).
+    Cancelled { turn_id: String, merged: bool },
+}
+
+/// How long a turn's parts took, in milliseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct TurnTimings {
+    /// The audio of the turn.
+    pub audio_ms: u64,
+    /// The silence that ended it.
+    pub endpoint_silence_ms: u64,
+    /// From the end of the turn to its transcript.
+    pub recognition_ms: u64,
+}
+
+/// Where the call is: its three regions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct CallState {
     /// The microphone.
@@ -30,8 +67,6 @@ pub struct CallState {
     pub recognising: usize,
     /// The speaker.
     pub playback: PlaybackState,
-    /// Whether the room is in reach; turns reported while it is not say `offline`.
-    pub online: bool,
 }
 
 /// Where the microphone is.
@@ -54,21 +89,10 @@ pub enum Listening {
 pub enum PlaybackState {
     /// Nothing to say.
     Idle,
-    /// A reply is being spoken and nothing sounds yet.
+    /// Something is being spoken and nothing sounds yet.
     Synthesizing,
-    /// A reply sounds.
+    /// Something sounds.
     Playing,
-}
-
-/// Where the reader of a reply is. Positions are in characters (Unicode scalar values) of the reply's text.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct Karaoke {
-    /// The reply.
-    pub utterance_id: String,
-    /// The chunk sounding now, from its first character to the one after its last; `None` between chunks.
-    pub sounding: Option<(usize, usize)>,
-    /// What was heard, from the start: the chunks played to their end.
-    pub heard_chars: usize,
 }
 
 /// A failure a person may be told of, as a stable code the app translates.

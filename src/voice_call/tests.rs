@@ -12,8 +12,9 @@ use super::{Events, VoiceCall};
 use crate::config::{Patience, VoiceConfig};
 use crate::io::{AudioIo, IoEvent, IoSink};
 use crate::models::{EndOfTurnModel, Models, Speaker, Transcriber, Vad, VadFrame, VoiceModels};
-use crate::room::{PlaybackStatus, Reply, RoomEvent, RoomMessage, TurnPhase};
+use crate::say::{SayEvent, SayOptions, SayOutcome};
 use crate::test_support::{clip, config, silence, EnergyVad, QUILTER, WINDOW};
+use crate::TurnEvent;
 use crate::VoiceEvent;
 
 #[derive(Default)]
@@ -235,40 +236,35 @@ fn speech_becomes_a_turn_and_a_reply_is_played_and_heard() {
         {
             sink.send(IoEvent::Captured(frame.to_vec()));
         }
-        let turn = next(&mut events, |event| match event {
-            VoiceEvent::RoomMessage(RoomMessage::UserTurn(turn))
-                if turn.phase == TurnPhase::Finished =>
-            {
-                Some(turn)
-            }
+        let said = next(&mut events, |event| match event {
+            VoiceEvent::Turn(TurnEvent::Finished { text, .. }) => Some(text),
             _ => None,
         })
         .await;
-        assert_eq!(
-            turn.text.as_deref(),
-            Some("Mister Quilter is the apostle of the middle classes.")
-        );
+        assert_eq!(said, "Mister Quilter is the apostle of the middle classes.");
 
-        call.room_event(RoomEvent::Reply(Reply {
-            utterance_id: "u1".into(),
-            revision: 1,
-            reply_revision: 2,
-            thread_id: "t".into(),
-            history_id: "h".into(),
-            text: "Noted. I will read the apostle's gospel tonight.".into(),
-            language: Some("en".into()),
-            replay: false,
+        let mut saying = call.say(
+            "Noted. I will read the apostle's gospel tonight.",
+            SayOptions::default(),
+        );
+        let mut steps = Vec::new();
+        while let Some(step) = tokio::time::timeout(Duration::from_secs(5), saying.next())
+            .await
+            .expect("in time")
+        {
+            steps.push(step);
+        }
+        assert_eq!(steps.first(), Some(&SayEvent::Playing));
+        assert_eq!(
+            steps.last(),
+            Some(&SayEvent::Done {
+                outcome: SayOutcome::Heard
+            })
+        );
+        assert!(steps.contains(&SayEvent::Progress {
+            sounding: None,
+            heard_chars: 48
         }));
-        let heard = next(&mut events, |event| match event {
-            VoiceEvent::RoomMessage(RoomMessage::Playback(report))
-                if report.status == PlaybackStatus::Heard =>
-            {
-                Some(report)
-            }
-            _ => None,
-        })
-        .await;
-        assert_eq!(heard.heard_chars, 48);
         let played = speakers.lock().unwrap().played.clone();
         assert_eq!(played.len(), 1);
         assert_eq!((played[0].1, played[0].3), (0, 24_000));
@@ -432,16 +428,12 @@ fn smart_turn_ends_a_turn_at_a_pause_its_model_says_is_the_end() {
         {
             sink.send(IoEvent::Captured(frame.to_vec()));
         }
-        let turn = next(&mut events, |event| match event {
-            VoiceEvent::RoomMessage(RoomMessage::UserTurn(turn))
-                if turn.phase == TurnPhase::Finished =>
-            {
-                Some(turn)
-            }
+        let said = next(&mut events, |event| match event {
+            VoiceEvent::Turn(TurnEvent::Finished { text, .. }) => Some(text),
             _ => None,
         })
         .await;
-        assert!(turn.text.is_some());
+        assert!(!said.is_empty());
         assert!(asked.load(Ordering::SeqCst) >= 1);
     });
 }
@@ -461,17 +453,8 @@ fn dropping_the_call_closes_the_microphone_drops_the_models_and_ends_the_events(
         })
         .await;
         let sink = speakers.lock().unwrap().sink.clone().expect("listening");
-        // A reply is being synthesized: a model task is under way when the owner goes.
-        call.room_event(RoomEvent::Reply(Reply {
-            utterance_id: "u1".into(),
-            revision: 1,
-            reply_revision: 2,
-            thread_id: "t".into(),
-            history_id: "h".into(),
-            text: "A reply the owner never hears.".into(),
-            language: Some("en".into()),
-            replay: false,
-        }));
+        // Something is being synthesized: a model task is under way when the owner goes.
+        let _saying = call.say("Something the owner never hears.", SayOptions::default());
         drop(call);
         tokio::time::timeout(Duration::from_secs(5), async {
             while events.next().await.is_some() {}
@@ -642,5 +625,47 @@ fn a_stop_ends_the_call_while_its_detector_never_answers_and_it_starts_again() {
         })
         .await;
         assert_eq!(loads.load(Ordering::SeqCst), 2);
+    });
+}
+
+#[test]
+fn a_handle_cancels_what_it_says_and_tells_how_it_ended() {
+    runtime().block_on(async {
+        let (call, mut events, _speakers) = call(FakeModels::default());
+        call.start();
+        next(&mut events, |event| match event {
+            VoiceEvent::State(state) if state.listening == crate::Listening::Listening => Some(()),
+            _ => None,
+        })
+        .await;
+        let mut saying = call.say("Cancelled at once.", SayOptions::default());
+        saying.cancel();
+        let mut last = None;
+        while let Some(step) = tokio::time::timeout(Duration::from_secs(5), saying.next())
+            .await
+            .expect("in time")
+        {
+            last = Some(step);
+        }
+        assert!(matches!(
+            last,
+            Some(SayEvent::Done {
+                outcome: SayOutcome::NotPlayed { .. } | SayOutcome::HeardUpTo { .. }
+            })
+        ));
+        // Said while stopped: not played.
+        call.stop();
+        let mut stopped = call.say("Said while stopped.", SayOptions::default());
+        let step = tokio::time::timeout(Duration::from_secs(5), stopped.next())
+            .await
+            .expect("in time");
+        assert_eq!(
+            step,
+            Some(SayEvent::Done {
+                outcome: SayOutcome::NotPlayed {
+                    reason: crate::StopReason::Stopped
+                }
+            })
+        );
     });
 }

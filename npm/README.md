@@ -8,13 +8,13 @@
 # @sidevoice/voice
 
 The [Sidevoice](https://github.com/sidevoice) voice call for the web: it listens to the microphone, tells when you
-start and stop speaking, has what you said transcribed, and hands your turn to the page as a message for the room;
-it takes the room's replies, has them spoken, plays them, stops when you speak over them, and reports how much of
-each you heard. This package is its WebAssembly build (`wasm-bindgen --target web`) with the browser's microphone and
-speaker. The models are the page's, supplied through the package's own interfaces (`VoiceModels`: a voice activity
-detector, a transcriber, a speaker and an optional end-of-turn classifier, typed in `js/voice-models.d.ts`), with
-[`@sidevoice/engine`](https://www.npmjs.com/package/@sidevoice/engine)'s models, say; and the call holds no socket:
-the page carries its messages to the room and back.
+start and stop speaking, has what you said transcribed, and tells the page your turns as words; it says what the
+page asks it to, plays it, stops when you speak over it, and tells the page how much of it you heard. This package
+is its WebAssembly build (`wasm-bindgen --target web`) with the browser's microphone and speaker. The models are the
+page's, supplied through the package's own interfaces (`VoiceModels`: a voice activity detector, a transcriber, a
+speaker and an optional end-of-turn classifier, typed in `js/voice-models.d.ts`), with
+[`@sidevoice/engine`](https://www.npmjs.com/package/@sidevoice/engine)'s models, say. The call knows nothing of
+the room: the page translates both ways.
 
 ```js
 import init, { VoiceCall } from "@sidevoice/voice";
@@ -24,10 +24,11 @@ await init();
 const models = { load: async () => ({ vad, transcriber, speaker }) };
 const call = VoiceCall.create(models, { language: "es", voice: "ef_dora", patience: "normal" });
 call.onEvent(({ type, data }) => {
-  // "room-message" (to the room, kept until acknowledged), "state", "level", "karaoke", "error" ({ code })
+  // "turn" (started, finished with the words, cancelled), "state", "level", "error" ({ code })
 });
 call.start(); // loads the models, asks for the microphone, listens
-socket.onmessage = ({ data }) => call.roomEvent(JSON.parse(data));
+const saying = call.say("Hecho.", { language: "es" }); // a handle: saying.cancel(), saying.onEvent(step)
+const outcome = await saying.outcome; // heard, heard up to N characters, or not played, and why
 ```
 
 The microphone is `getUserMedia` with the browser's echo cancellation, noise suppression and gain control, turned

@@ -1,12 +1,10 @@
 //! The call on recorded speech: the clips go through a detector on energy, window by window, 32 ms apart, and the
-//! tests play the models, the speaker and the room by hand.
+//! tests play the models and the speaker by hand.
 
 use super::{Call, Effect, Input, Transcript};
 use crate::config::{Patience, VoiceConfig};
-use crate::event::{Karaoke, Listening, VoiceEvent};
-use crate::room::{
-    PlaybackReason, PlaybackStatus, Reply, RoomEvent, RoomMessage, TurnPhase, UserTurn,
-};
+use crate::event::{Listening, TurnEvent, TurnTimings, VoiceEvent};
+use crate::say::{SayEvent, SayOutcome, StopReason};
 use crate::test_support::{clip, config, silence, EnergyVad, FLEURS_ES, QUILTER, WINDOW};
 
 #[cfg(web)]
@@ -16,6 +14,36 @@ use wasm_bindgen_test::wasm_bindgen_test as test;
 const WINDOW_MS: u64 = 32;
 /// The Unix time of the call's millisecond 0.
 const EPOCH: u64 = 1_800_000_000_000;
+
+/// A turn event, as the tests look at it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TurnPhase {
+    Started,
+    Finished,
+    Cancelled,
+}
+
+#[derive(Debug, Clone)]
+struct Seen {
+    turn_id: String,
+    phase: TurnPhase,
+    text: Option<String>,
+    language: Option<String>,
+    merged: bool,
+    started_at: u64,
+    ended_at: Option<u64>,
+    timings: Option<TurnTimings>,
+}
+
+/// What became of something said, as the tests look at it: playing, then heard, cut, not played or failed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PlaybackStatus {
+    Playing,
+    Heard,
+    Interrupted,
+    Unplayed,
+    Failed,
+}
 
 struct Run {
     call: Call,
@@ -86,42 +114,104 @@ impl Run {
         std::mem::take(&mut self.effects)
     }
 
-    /// The turn messages among `effects`.
-    fn turns(effects: &[Effect]) -> Vec<UserTurn> {
+    /// The turn events among `effects`.
+    fn turns(effects: &[Effect]) -> Vec<Seen> {
         effects
             .iter()
             .filter_map(|effect| match effect {
-                Effect::Event(VoiceEvent::RoomMessage(RoomMessage::UserTurn(turn))) => {
-                    Some(turn.clone())
-                }
+                Effect::Event(VoiceEvent::Turn(turn)) => Some(match turn.clone() {
+                    TurnEvent::Started {
+                        turn_id,
+                        started_at,
+                    } => Seen {
+                        turn_id,
+                        phase: TurnPhase::Started,
+                        text: None,
+                        language: None,
+                        merged: false,
+                        started_at,
+                        ended_at: None,
+                        timings: None,
+                    },
+                    TurnEvent::Finished {
+                        turn_id,
+                        text,
+                        language,
+                        started_at,
+                        ended_at,
+                        merged,
+                        timings,
+                    } => Seen {
+                        turn_id,
+                        phase: TurnPhase::Finished,
+                        text: Some(text),
+                        language,
+                        merged,
+                        started_at,
+                        ended_at: Some(ended_at),
+                        timings: Some(timings),
+                    },
+                    TurnEvent::Cancelled { turn_id, merged } => Seen {
+                        turn_id,
+                        phase: TurnPhase::Cancelled,
+                        text: None,
+                        language: None,
+                        merged,
+                        started_at: 0,
+                        ended_at: None,
+                        timings: None,
+                    },
+                }),
                 _ => None,
             })
             .collect()
     }
 
-    /// The playback reports among `effects`, as (utterance, status, heard characters).
+    /// What became of what was said among `effects`, as (what, how, heard characters).
     fn playbacks(effects: &[Effect]) -> Vec<(String, PlaybackStatus, usize)> {
+        let mut heard = std::collections::HashMap::new();
         effects
             .iter()
             .filter_map(|effect| match effect {
-                Effect::Event(VoiceEvent::RoomMessage(RoomMessage::Playback(report))) => Some((
-                    report.utterance_id.clone(),
-                    report.status,
-                    report.heard_chars,
-                )),
+                Effect::Say { id, event } => match event {
+                    SayEvent::Playing => Some((id.clone(), PlaybackStatus::Playing, 0)),
+                    SayEvent::Progress { heard_chars, .. } => {
+                        heard.insert(id.clone(), *heard_chars);
+                        None
+                    }
+                    SayEvent::Done { outcome } => Some(match outcome {
+                        SayOutcome::Heard => (
+                            id.clone(),
+                            PlaybackStatus::Heard,
+                            heard.get(id).copied().unwrap_or(0),
+                        ),
+                        SayOutcome::HeardUpTo {
+                            reason: StopReason::Failed { .. },
+                            heard_chars,
+                        } => (id.clone(), PlaybackStatus::Failed, *heard_chars),
+                        SayOutcome::HeardUpTo { heard_chars, .. } => {
+                            (id.clone(), PlaybackStatus::Interrupted, *heard_chars)
+                        }
+                        SayOutcome::NotPlayed {
+                            reason: StopReason::Failed { .. },
+                        } => (id.clone(), PlaybackStatus::Failed, 0),
+                        SayOutcome::NotPlayed { .. } => (id.clone(), PlaybackStatus::Unplayed, 0),
+                    }),
+                },
                 _ => None,
             })
             .collect()
     }
 
-    /// The playback reports among `effects`, as (status, reason).
-    fn reasons(effects: &[Effect]) -> Vec<(PlaybackStatus, Option<PlaybackReason>)> {
+    /// The outcomes among `effects`.
+    fn outcomes(effects: &[Effect]) -> Vec<(String, SayOutcome)> {
         effects
             .iter()
             .filter_map(|effect| match effect {
-                Effect::Event(VoiceEvent::RoomMessage(RoomMessage::Playback(report))) => {
-                    Some((report.status, report.reason))
-                }
+                Effect::Say {
+                    id,
+                    event: SayEvent::Done { outcome },
+                } => Some((id.clone(), outcome.clone())),
                 _ => None,
             })
             .collect()
@@ -162,7 +252,11 @@ impl Run {
     }
 
     fn reply(&mut self, id: &str, text: &str) {
-        self.input(Input::Room(RoomEvent::Reply(reply(id, text))));
+        self.input(Input::Say {
+            id: id.into(),
+            text: text.into(),
+            language: Some("en".into()),
+        });
     }
 
     /// Plays chunk `chunk` of `id`: synthesized, queued, started.
@@ -183,19 +277,6 @@ impl Run {
             utterance: id.into(),
             chunk,
         });
-    }
-}
-
-fn reply(id: &str, text: &str) -> Reply {
-    Reply {
-        utterance_id: id.into(),
-        revision: 7,
-        reply_revision: 8,
-        thread_id: "thread".into(),
-        history_id: "row".into(),
-        text: text.into(),
-        language: Some("en".into()),
-        replay: false,
     }
 }
 
@@ -245,11 +326,13 @@ fn a_spoken_sentence_is_one_turn_reported_after_the_merge_window() {
         Some("Mister Quilter is the apostle of the middle classes.")
     );
     assert_eq!(finished.language.as_deref(), Some("en"));
-    assert!(!finished.merged && !finished.offline);
+    assert!(!finished.merged);
+    assert!(finished
+        .ended_at
+        .is_some_and(|ended| ended > finished.started_at));
     let timings = finished.timings.expect("timings");
     assert!(timings.endpoint_silence_ms >= 2_500);
-    assert!(timings.recognition_ms.is_some_and(|ms| ms < 1_000));
-    assert_ne!(finished.client_msg_id, started[0].client_msg_id);
+    assert!(timings.recognition_ms < 1_000);
 }
 
 #[test]
@@ -340,12 +423,7 @@ fn speech_over_a_reply_interrupts_it_and_drops_the_queue() {
     assert!(effects.contains(&Effect::StopPlayback));
     let turns = Run::turns(&effects);
     assert_eq!(turns[0].phase, TurnPhase::Started);
-    assert_eq!(turns[0].turn_id, "c-turn-0", "the module names the turn");
-    let wire = RoomMessage::UserTurn(turns[0].clone()).to_json();
-    assert!(
-        wire["data"].get("revision").is_none(),
-        "no revision on a turn: {wire}"
-    );
+    assert_eq!(turns[0].turn_id, "c-turn-0", "the call names the turn");
     assert_eq!(
         Run::playbacks(&effects),
         [
@@ -418,13 +496,13 @@ fn a_reply_played_to_its_end_is_heard_and_moves_the_karaoke() {
         Run::playbacks(&effects),
         [("u1".into(), PlaybackStatus::Playing, 0)]
     );
-    assert!(
-        effects.contains(&Effect::Event(VoiceEvent::Karaoke(Karaoke {
-            utterance_id: "u1".into(),
+    assert!(effects.contains(&Effect::Say {
+        id: "u1".into(),
+        event: SayEvent::Progress {
             sounding: Some((0, 37)),
             heard_chars: 0,
-        })))
-    );
+        },
+    }));
     assert!(effects
         .iter()
         .any(|effect| matches!(effect, Effect::Synthesize { chunk: 1, .. })));
@@ -468,21 +546,6 @@ fn a_reply_that_cannot_be_spoken_fails_and_the_next_one_starts() {
         Run::synthesize(&effects),
         [("u2".into(), 0, "This one is spoken.".into())]
     );
-}
-
-#[test]
-fn a_reply_sent_again_is_ignored_unless_it_is_a_replay() {
-    let mut run = Run::new(config());
-    run.reply("u1", "Once.");
-    run.sound("u1", 0);
-    run.played("u1", 0);
-    run.take();
-    run.reply("u1", "Once.");
-    assert!(Run::synthesize(&run.take()).is_empty());
-    let mut again = reply("u1", "Once.");
-    again.replay = true;
-    run.input(Input::Room(RoomEvent::Reply(again)));
-    assert_eq!(Run::synthesize(&run.take()).len(), 1);
 }
 
 #[test]
@@ -583,35 +646,6 @@ fn muting_ends_the_turn_and_cancelling_drops_it() {
 }
 
 #[test]
-fn a_turn_spoken_offline_is_only_finished_and_says_so() {
-    let mut run = Run::new(config());
-    run.input(Input::Online(false));
-    run.hear(&speech());
-    assert!(
-        Run::turns(&run.take()).is_empty(),
-        "no started for a turn the room cannot hear of"
-    );
-    run.hear(&silence(3_000));
-    let (turn, _) = Run::transcribe(&run.take()).expect("transcribed");
-    // Back online before it is reported: it still started offline.
-    run.input(Input::Online(true));
-    run.transcribed(turn, "words said while away");
-    run.wait(2_000);
-    let turns = Run::turns(&run.take());
-    assert_eq!(turns.len(), 1);
-    assert_eq!(
-        (turns[0].phase, turns[0].offline),
-        (TurnPhase::Finished, true)
-    );
-
-    // One cancelled while offline says nothing at all.
-    run.input(Input::Online(false));
-    run.hear(&speech());
-    run.input(Input::Cancel);
-    assert!(Run::turns(&run.take()).is_empty());
-}
-
-#[test]
 fn stopping_cancels_the_turn_and_interrupts_the_reply() {
     let mut run = Run::new(config());
     run.reply("u1", "Something to say while the call stops.");
@@ -629,68 +663,26 @@ fn stopping_cancels_the_turn_and_interrupts_the_reply() {
 }
 
 #[test]
-fn a_reply_that_arrives_while_the_call_is_stopped_never_plays() {
+fn something_asked_while_the_call_is_stopped_is_not_played() {
     let mut run = Run::new(config());
     run.input(Input::Stop);
     run.take();
-    run.reply(
-        "late",
-        "A reply the room sent before it heard the call stop.",
-    );
+    run.reply("late", "Something asked while the call is stopped.");
     let effects = run.take();
     assert!(Run::synthesize(&effects).is_empty());
     assert_eq!(
-        Run::reasons(&effects),
-        [(PlaybackStatus::Unplayed, Some(PlaybackReason::CallEnded))]
+        Run::outcomes(&effects),
+        [(
+            "late".into(),
+            SayOutcome::NotPlayed {
+                reason: StopReason::Stopped
+            }
+        )]
     );
     // Starting again does not bring it back.
     run.input(Input::Start);
     run.wait(2_000);
     assert!(Run::synthesize(&run.take()).is_empty());
-}
-
-#[test]
-fn a_reply_written_before_the_persons_latest_turn_is_dropped_when_it_arrives() {
-    let mut run = Run::new(config());
-    run.reply("u1", "The first answer, seen at revision seven.");
-    run.take();
-    run.hear(&speech());
-    let turn_id = Run::turns(&run.take())[0].turn_id.clone();
-    // Written at revision 7, before the turn: it answers what came before.
-    run.reply("u2", "A reply still in transport when the person spoke.");
-    let effects = run.take();
-    assert_eq!(
-        Run::reasons(&effects),
-        [(PlaybackStatus::Unplayed, Some(PlaybackReason::NewerTurn))]
-    );
-    // An answer about a turn of another call moves nothing.
-    run.input(Input::Room(RoomEvent::TurnStarted {
-        session_id: "s1".into(),
-        turn_id: "elsewhere-turn-0".into(),
-        revision: 50,
-    }));
-    // The room gave this turn revision 12: a reply written at 10 is stale too, one at 12 is not.
-    run.input(Input::Room(RoomEvent::TurnStarted {
-        session_id: "s1".into(),
-        turn_id,
-        revision: 12,
-    }));
-    let mut stale = reply("u3", "Written at ten.");
-    stale.revision = 10;
-    run.input(Input::Room(RoomEvent::Reply(stale)));
-    let mut fresh = reply("u4", "Written for the turn.");
-    fresh.revision = 12;
-    run.input(Input::Room(RoomEvent::Reply(fresh)));
-    let effects = run.take();
-    assert_eq!(
-        Run::reasons(&effects),
-        [(PlaybackStatus::Unplayed, Some(PlaybackReason::NewerTurn))]
-    );
-    // A replay the person asked for is never stale.
-    let mut replay = reply("u1", "The first answer, again.");
-    replay.replay = true;
-    run.input(Input::Room(RoomEvent::Reply(replay)));
-    assert!(Run::reasons(&run.take()).is_empty());
 }
 
 #[test]
@@ -703,9 +695,7 @@ fn an_expired_grace_is_no_deadline_while_a_turn_holds_the_reply_back() {
     run.wait(500);
     // A second turn opens and a reply waits for it, well past the first turn's grace.
     run.hear(&speech());
-    let mut answer = reply("u1", "An answer written for the first turn.");
-    answer.revision = 20;
-    run.input(Input::Room(RoomEvent::Reply(answer)));
+    run.reply("u1", "An answer to the first turn.");
     run.take();
     assert!(run.now > 2_000);
     assert!(
@@ -717,174 +707,46 @@ fn an_expired_grace_is_no_deadline_while_a_turn_holds_the_reply_back() {
 }
 
 #[test]
-fn a_reply_taken_before_the_rooms_answer_is_retired_when_the_answer_says_it_is_older() {
+fn a_cancel_cuts_what_sounds_drops_what_waits_and_may_come_before_its_say() {
     let mut run = Run::new(config());
-    // The person speaks; a reply the room wrote at revision 5, before this turn, arrives before the room's answer and
-    // passes the call's own guess (it had seen no reply yet): it waits behind the turn.
-    run.hear(&speech());
-    let turn_id = Run::turns(&run.take())[0].turn_id.clone();
-    let mut early = reply("early", "Written before the person spoke.");
-    early.revision = 5;
-    run.input(Input::Room(RoomEvent::Reply(early)));
-    let mut replay = reply("again", "Asked for again.");
-    replay.revision = 5;
-    replay.replay = true;
-    run.input(Input::Room(RoomEvent::Reply(replay)));
-    assert!(Run::reasons(&run.take()).is_empty(), "both wait");
-    // The room's answer gives the turn revision 6: the reply written at 5 goes; the replay the person asked for stays.
-    run.input(Input::Room(RoomEvent::TurnStarted {
-        session_id: "s1".into(),
-        turn_id,
-        revision: 6,
-    }));
+    run.reply("u1", "The first thing to say, and it goes on.");
+    run.reply("u2", "The second thing to say, which waits.");
+    run.sound("u1", 0);
+    run.take();
+    run.input(Input::CancelSay("u2".into()));
+    run.input(Input::CancelSay("u1".into()));
+    let effects = run.take();
+    assert!(effects.contains(&Effect::StopPlayback));
     assert_eq!(
-        Run::reasons(&run.take()),
-        [(PlaybackStatus::Unplayed, Some(PlaybackReason::NewerTurn))]
-    );
-    run.hear(&silence(3_000));
-    let (turn, _) = Run::transcribe(&run.take()).expect("transcribed");
-    run.transcribed(turn, "a question");
-    run.wait(2_000);
-    let spoken: Vec<String> = Run::synthesize(&run.take())
-        .into_iter()
-        .map(|(id, _, _)| id)
-        .collect();
-    assert_eq!(spoken, ["again"], "only the replay is spoken");
-}
-
-#[test]
-fn a_turn_the_room_has_no_room_for_keeps_its_words_and_is_said_again_when_another_ends() {
-    let mut run = Run::new(VoiceConfig {
-        patience: Patience::Fast,
-        ..config()
-    });
-    let full = |run: &mut Run, id: &str| {
-        run.input(Input::Room(RoomEvent::TurnsFull {
-            client_msg_id: id.into(),
-        }))
-    };
-    // Turn B is spoken and waits for its transcript; turn A starts, and the room refuses its start.
-    run.hear(&speech());
-    run.hear(&silence(3_000));
-    let (b, _) = Run::transcribe(&run.take()).expect("B transcribed");
-    run.hear(&speech());
-    let a = Run::turns(&run.take()).pop().expect("A started");
-    assert_eq!(a.phase, TurnPhase::Started);
-    full(&mut run, &a.client_msg_id);
-    run.wait(1_000);
-    assert!(
-        Run::turns(&run.take()).is_empty(),
-        "nothing is said again until a turn ends: no spinning"
-    );
-
-    // B ends: A starts again, same turn, a new message.
-    run.transcribed(b, "the first question");
-    let turns = Run::turns(&run.take());
-    assert_eq!(
-        turns
-            .iter()
-            .map(|t| (t.turn_id.clone(), t.phase))
-            .collect::<Vec<_>>(),
+        Run::outcomes(&effects),
         [
-            (turns[0].turn_id.clone(), TurnPhase::Finished),
-            (a.turn_id.clone(), TurnPhase::Started)
+            (
+                "u2".into(),
+                SayOutcome::NotPlayed {
+                    reason: StopReason::Cancelled
+                }
+            ),
+            (
+                "u1".into(),
+                SayOutcome::HeardUpTo {
+                    heard_chars: 0,
+                    reason: StopReason::Cancelled
+                }
+            ),
         ]
     );
-    let again = turns[1].clone();
-    assert_ne!(again.client_msg_id, a.client_msg_id);
-
-    // Still full: A's words, when they come, are kept and not said.
-    full(&mut run, &again.client_msg_id);
-    run.hear(&silence(3_000));
-    let (a_turn, _) = Run::transcribe(&run.take()).expect("A transcribed");
-    run.transcribed(a_turn, "the second question");
-    run.wait(2_000);
-    assert!(Run::turns(&run.take()).is_empty(), "A's words wait");
-
-    // Turn C is spoken and ends: A is said again, its start and then its words.
-    run.hear(&speech());
-    run.hear(&silence(3_000));
-    let (c, _) = Run::transcribe(&run.take()).expect("C transcribed");
-    run.transcribed(c, "the third question");
-    let turns = Run::turns(&run.take());
-    let said: Vec<_> = turns
-        .iter()
-        .map(|t| (t.turn_id.clone(), t.phase, t.text.clone()))
-        .collect();
-    assert_eq!(said[1], (a.turn_id.clone(), TurnPhase::Started, None));
+    // A cancel that overtook its own say: the say never plays.
+    run.input(Input::CancelSay("u3".into()));
+    run.reply("u3", "Cancelled before it was asked.");
+    let effects = run.take();
+    assert!(Run::synthesize(&effects).is_empty());
     assert_eq!(
-        said[2],
-        (
-            a.turn_id.clone(),
-            TurnPhase::Finished,
-            Some("the second question".into())
-        )
+        Run::outcomes(&effects),
+        [(
+            "u3".into(),
+            SayOutcome::NotPlayed {
+                reason: StopReason::Cancelled
+            }
+        )]
     );
-
-    // A start refused after its words were already sent: the words are kept and said again with it.
-    let words = turns[2].clone();
-    let started = turns[1].clone();
-    full(&mut run, &started.client_msg_id);
-    run.hear(&speech());
-    run.hear(&silence(3_000));
-    let (d, _) = Run::transcribe(&run.take()).expect("D transcribed");
-    run.transcribed(d, "the fourth question");
-    let turns = Run::turns(&run.take());
-    let again: Vec<_> = turns.iter().filter(|t| t.turn_id == a.turn_id).collect();
-    assert_eq!(again.len(), 2);
-    assert_eq!(again[1].text, words.text, "never dropped");
-}
-
-#[test]
-fn a_room_session_that_replaced_the_old_one_starts_its_boundary_over_and_a_resume_keeps_it() {
-    let mut run = Run::new(VoiceConfig {
-        patience: Patience::Fast,
-        ..config()
-    });
-    let said = |run: &mut Run| {
-        run.hear(&speech());
-        let turn = Run::turns(&run.take())[0].turn_id.clone();
-        run.hear(&silence(3_000));
-        let (number, _) = Run::transcribe(&run.take()).expect("transcribed");
-        run.transcribed(number, "a question");
-        run.wait(2_000);
-        run.take();
-        turn
-    };
-    let answer = |run: &mut Run, session: &str, turn_id: String, revision: u64| {
-        run.input(Input::Room(RoomEvent::TurnStarted {
-            session_id: session.into(),
-            turn_id,
-            revision,
-        }));
-    };
-    let spoken = |run: &mut Run, id: &str, revision: u64| {
-        let mut sent = reply(id, "An answer to the latest turn.");
-        sent.revision = revision;
-        run.input(Input::Room(RoomEvent::Reply(sent)));
-        let effects = run.take();
-        (Run::synthesize(&effects).len(), Run::reasons(&effects))
-    };
-    // Session s1 gives a turn revision 20: a reply below it is stale.
-    let first = said(&mut run);
-    answer(&mut run, "s1", first, 20);
-    assert_eq!(
-        spoken(&mut run, "old", 5),
-        (
-            0,
-            vec![(PlaybackStatus::Unplayed, Some(PlaybackReason::NewerTurn))]
-        )
-    );
-    // A resume: the same session, revisions go on, and the boundary stays.
-    let second = said(&mut run);
-    answer(&mut run, "s1", second, 21);
-    assert_eq!(spoken(&mut run, "still-old", 20).0, 0);
-    // A replacement session, whose revisions start over: its revision-1 reply is spoken, the microphone open all along.
-    let third = said(&mut run);
-    answer(&mut run, "s2", third, 1);
-    assert_eq!(spoken(&mut run, "new", 1), (1, vec![]));
-    assert!(run
-        .take()
-        .iter()
-        .all(|effect| *effect != Effect::StopPlayback));
 }
