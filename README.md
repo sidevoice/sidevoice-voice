@@ -214,7 +214,9 @@ The module holds no socket. It emits, each with a `client_msg_id` for the host's
 
 It consumes `voice-reply {utterance_id, revision, reply_revision, thread_id, history_id, text, language, replay?}`
 and the room's answer to a started turn, `voice-user-turn {phase: started, turn_id, revision}`: the revision the room
-gave that turn of this call is its boundary, and a reply written below it is stale. It lets every other room message
+gave that turn of this call is its boundary, and a reply written below it is stale. A refusal of a turn's `started` for
+too many open turns (`error {key: room.turns_full, client_msg_id}`) keeps that turn, its words included, and says it
+again once another of its turns ends. It lets every other room message
 through.
 
 ## Status

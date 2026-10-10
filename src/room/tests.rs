@@ -118,3 +118,18 @@ fn the_rooms_answer_to_a_started_turn_names_it_and_gives_its_revision() {
         json!({"type": "voice-user-turn", "data": {"phase": "cancelled", "revision": 12}});
     assert_eq!(RoomEvent::from_json(&cancelled).unwrap(), RoomEvent::Other);
 }
+
+#[test]
+fn the_rooms_refusal_for_too_many_open_turns_names_the_start_it_refuses() {
+    let refused = json!({"type": "error", "data": {
+        "key": "room.turns_full", "message": "Too many turns", "client_msg_id": "c-7"}});
+    assert_eq!(
+        RoomEvent::from_json(&refused).unwrap(),
+        RoomEvent::TurnsFull {
+            client_msg_id: "c-7".into()
+        }
+    );
+    let other =
+        json!({"type": "error", "data": {"key": "room.input_ended", "client_msg_id": "c-8"}});
+    assert_eq!(RoomEvent::from_json(&other).unwrap(), RoomEvent::Other);
+}
