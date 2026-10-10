@@ -7,6 +7,11 @@ use futures_channel::mpsc::UnboundedSender;
 use crate::maybe_send::MaybeSend;
 use crate::voice_call::Message;
 
+mod native;
+
+#[cfg(native)]
+pub use native::NativeIo;
+
 /// What the microphone and the speaker tell the call.
 #[derive(Debug, Clone, PartialEq)]
 pub enum IoEvent {
