@@ -219,8 +219,12 @@ impl Call {
             Input::Room(RoomEvent::Reply(reply)) => self.reply(now, reply, &mut out),
             Input::Room(RoomEvent::TurnStarted { turn_id, revision }) => {
                 // Only an answer about a turn of this call moves its boundary.
-                if self.turn_ids.contains(&turn_id) {
-                    self.turn_boundary = self.turn_boundary.max(revision);
+                if self.turn_ids.contains(&turn_id) && revision > self.turn_boundary {
+                    self.turn_boundary = revision;
+                    // Replies already taken that were written before this turn are stale now too.
+                    let mut actions = Vec::new();
+                    self.playback.retire_before(revision, &mut actions);
+                    self.act(now, actions, &mut out);
                 }
             }
             Input::Room(RoomEvent::Other) => {}
