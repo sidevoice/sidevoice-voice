@@ -162,6 +162,8 @@ pub(crate) struct Call {
     finished_sent: VecDeque<UserTurn>,
     /// Turns the room could not take yet (`room.turns_full`), oldest first.
     parked: VecDeque<Parked>,
+    /// The room session the revisions seen count in, once an answer named it.
+    session: Option<String>,
     segmenter: Segmenter,
     /// The turn being spoken.
     open: Option<usize>,
@@ -191,6 +193,7 @@ impl Call {
             started_sent: VecDeque::new(),
             finished_sent: VecDeque::new(),
             parked: VecDeque::new(),
+            session: None,
             open: None,
             turns: HashMap::new(),
             next_turn: 0,
@@ -234,7 +237,12 @@ impl Call {
                 self.act(now, actions, &mut out);
             }
             Input::Room(RoomEvent::Reply(reply)) => self.reply(now, reply, &mut out),
-            Input::Room(RoomEvent::TurnStarted { turn_id, revision }) => {
+            Input::Room(RoomEvent::TurnStarted {
+                session_id,
+                turn_id,
+                revision,
+            }) => {
+                self.room_session(session_id);
                 // Only an answer about a turn of this call moves its boundary.
                 if self.turn_ids.contains(&turn_id) && revision > self.turn_boundary {
                     self.turn_boundary = revision;
@@ -622,6 +630,23 @@ impl Call {
         out.push(Effect::Event(VoiceEvent::RoomMessage(
             RoomMessage::UserTurn(message),
         )));
+    }
+
+    /// The room session the latest answer counts in. Another one than before replaced the old session, whose revisions
+    /// mean nothing in it: what counted in the old one starts over (the latest revision seen, the stale-reply boundary,
+    /// the messages sent there). The microphone, the speaker, the open turns and those waiting for room stay.
+    fn room_session(&mut self, session_id: String) {
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|session| *session != session_id)
+        {
+            self.revision = 0;
+            self.turn_boundary = 0;
+            self.started_sent.clear();
+            self.finished_sent.clear();
+        }
+        self.session = Some(session_id);
     }
 
     /// The room refused `started` message `client_msg_id` for too many open turns: that turn waits, with its end if
