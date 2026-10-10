@@ -105,6 +105,7 @@ fn the_rooms_answer_to_a_started_turn_names_it_and_gives_its_revision() {
     assert_eq!(
         RoomEvent::from_json(&started).unwrap(),
         RoomEvent::TurnStarted {
+            session_id: "s".into(),
             turn_id: "c-turn-0".into(),
             revision: 12
         }
