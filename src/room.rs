@@ -148,6 +148,9 @@ pub enum RoomEvent {
     /// The room took a turn of the person's (`turn_id`, the module's own), at `revision`: the turn's boundary. A reply
     /// written below it answers an older turn.
     TurnStarted { turn_id: String, revision: u64 },
+    /// The room refused a turn's `started` (message `client_msg_id`) because the call already has as many turns open as
+    /// it keeps (`room.turns_full`): the turn is to be said again once one of them ends.
+    TurnsFull { client_msg_id: String },
     /// Anything else the room sends, which the module does not use.
     Other,
 }
@@ -178,6 +181,15 @@ impl RoomEvent {
                 Started::deserialize(envelope.data).map(|started| Self::TurnStarted {
                     turn_id: started.turn_id,
                     revision: started.revision,
+                })
+            }
+            "error" if envelope.data["key"] == "room.turns_full" => {
+                #[derive(Deserialize)]
+                struct Refused {
+                    client_msg_id: String,
+                }
+                Refused::deserialize(envelope.data).map(|refused| Self::TurnsFull {
+                    client_msg_id: refused.client_msg_id,
                 })
             }
             _ => Ok(Self::Other),
