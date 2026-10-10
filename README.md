@@ -88,6 +88,9 @@ JavaScript object with `load()` answering `{vad, transcriber, speaker, endOfTurn
   stopped for `idle_unload_minutes`; the next start loads them again, on the web as natively. `smart-turn` without an
   end-of-turn model refuses to start with `end-of-turn-missing`. A model that cannot load, and every other failure a
   person may be told of, is a `VoiceEvent::Error` with a stable code.
+- **A stop, or dropping the call, never waits on a model that does not answer**: after half a second behind one, the
+  call closes the microphone and the speaker, drops the models and the tasks it started, and says it is idle; the next
+  start loads the models again.
 - **`AudioIo`** is the microphone and the speaker: capture arrives as 16 kHz mono samples with the echo of the call's
   own playback already cancelled, and the speaker plays a reply's chunks in order and says when each starts and ends
   (that is the clock of the heard position). It says when both are ready (`IoEvent::Ready`), and only then does the

@@ -713,3 +713,38 @@ fn an_expired_grace_is_no_deadline_while_a_turn_holds_the_reply_back() {
         "no expired deadline while the person speaks"
     );
 }
+
+#[test]
+fn a_reply_taken_before_the_rooms_answer_is_retired_when_the_answer_says_it_is_older() {
+    let mut run = Run::new(config());
+    // The person speaks; a reply the room wrote at revision 5, before this turn, arrives before the room's answer and
+    // passes the call's own guess (it had seen no reply yet): it waits behind the turn.
+    run.hear(&speech());
+    let turn_id = Run::turns(&run.take())[0].turn_id.clone();
+    let mut early = reply("early", "Written before the person spoke.");
+    early.revision = 5;
+    run.input(Input::Room(RoomEvent::Reply(early)));
+    let mut replay = reply("again", "Asked for again.");
+    replay.revision = 5;
+    replay.replay = true;
+    run.input(Input::Room(RoomEvent::Reply(replay)));
+    assert!(Run::reasons(&run.take()).is_empty(), "both wait");
+    // The room's answer gives the turn revision 6: the reply written at 5 goes; the replay the person asked for stays.
+    run.input(Input::Room(RoomEvent::TurnStarted {
+        turn_id,
+        revision: 6,
+    }));
+    assert_eq!(
+        Run::reasons(&run.take()),
+        [(PlaybackStatus::Unplayed, Some(PlaybackReason::NewerTurn))]
+    );
+    run.hear(&silence(3_000));
+    let (turn, _) = Run::transcribe(&run.take()).expect("transcribed");
+    run.transcribed(turn, "a question");
+    run.wait(2_000);
+    let spoken: Vec<String> = Run::synthesize(&run.take())
+        .into_iter()
+        .map(|(id, _, _)| id)
+        .collect();
+    assert_eq!(spoken, ["again"], "only the replay is spoken");
+}
