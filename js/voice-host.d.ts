@@ -74,6 +74,9 @@ export interface VoicePlayback {
 /** The room's answer to a turn's `started`: `voice-user-turn`'s `data` with `phase: "started"`, as the room sent it. */
 export interface VoiceTurnStarted {
   phase: "started";
+  /** The room session `revision` counts in (opaque): the same after a resume; another one replaced the old session,
+   *  and the call starts its stale-reply boundary over by itself. */
+  session_id: string;
   /** The call's `turn_id`, echoed. */
   turn_id: string;
   /** The revision the room gave the turn: a reply written below it answers an older turn. */
