@@ -81,6 +81,16 @@ export interface VoiceTurnStarted {
   thread_id?: string | null;
 }
 
+/** A refusal the room sent about one of the call's messages: the `error` frame's `data`, as the room sent it. */
+export interface VoiceRoomRefusal {
+  /** The refusal's stable key: `room.turns_full` (a turn's `started` while the call has as many turns open as the
+   *  room keeps) is the one the call acts on; others are ignored. */
+  key: string;
+  /** The message it refuses. */
+  client_msg_id?: string;
+  message?: string;
+}
+
 /** A reply the room wants spoken: `voice-reply`'s `data`, as the room sent it. */
 export interface VoiceReply {
   utterance_id: string;
@@ -171,6 +181,9 @@ export interface VoiceHost {
   speak(reply: VoiceReply): void;
   /** The room's answer to a turn's `started` (`VoiceTurnStarted`): the call drops replies written before that turn. */
   turnStarted(started: VoiceTurnStarted): void;
+  /** A refusal the room sent naming one of the call's messages (`VoiceRoomRefusal`): a turn refused for too many open
+   *  turns keeps its words and is said again when another ends. */
+  roomRefused(refusal: VoiceRoomRefusal): void;
   /** Whether the room is in reach: turns emitted while it is not carry `offline: true`. Kept from the first call, even
    *  before `setSettings`. */
   setOnline(online: boolean): void;

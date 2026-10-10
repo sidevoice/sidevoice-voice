@@ -141,6 +141,7 @@ await voice.setSettings({ stt: { model: "whisper-base", language: "es" }, tts: {
 await voice.start();                                    // resolves once listening; rejects {code}
 room.on("voice-reply", (data) => voice.speak(data));
 room.on("voice-user-turn", (data) => data.phase === "started" && voice.turnStarted(data)); // the room's answer
+room.on("error", (data) => data.client_msg_id && voice.roomRefused(data)); // a refusal naming one of its messages
 ```
 
 What both promise, beyond the types:
@@ -160,7 +161,9 @@ What both promise, beyond the types:
   `speak`.
 - **Every room message carries its own `client_msg_id`**, and a turn started while `setOnline(false)` says
   `offline: true`. The room's answer to a turn's `started` goes to `turnStarted`: it names the turn and the revision
-  that is its boundary for stale replies.
+  that is its boundary for stale replies. A refusal the room sends naming one of the call's messages goes to
+  `roomRefused`: a turn refused for too many open turns (`room.turns_full`) keeps its words and is said again once
+  another ends.
 - **Settings** name a model per stage and optionally its build, the language, voice and speed, the patience, the end
   of turn and `idle_unload_minutes` (how long the models stay loaded with the call stopped; 10 by default). A rejected
   `setSettings` changes nothing. A change to the models the settings choose (a stage, or the end of turn) gives the
