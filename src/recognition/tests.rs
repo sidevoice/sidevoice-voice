@@ -74,3 +74,43 @@ fn the_filter_drops_empty_foreign_script_and_unlikely_transcripts() {
         None
     );
 }
+
+#[test]
+fn the_script_a_language_is_written_in_comes_from_cldr() {
+    // Latin-written languages, by their tag or a regional one: a transcript in no Latin letter is dropped.
+    for language in [
+        "es", "en", "ca", "eu", "gl", "cy", "ga", "mt", "sq", "tr", "vi", "id", "ms", "sw", "uz",
+        "az", "fil", "pt-BR", "es_MX",
+    ] {
+        assert_eq!(accepted("Привет", Some(language), None), None, "{language}");
+    }
+    // Written in another script: its own letters pass.
+    for (language, text) in [
+        ("ru", "Привет"),
+        ("sr", "Здраво"),
+        ("ar", "مرحبا"),
+        ("fa", "سلام"),
+        ("hi", "नमस्ते"),
+        ("ja", "こんにちは"),
+        ("zh", "你好"),
+        ("ko", "안녕"),
+        ("el", "Γεια"),
+        ("he", "שלום"),
+        ("th", "สวัสดี"),
+        ("ka", "გამარჯობა"),
+        ("hy", "Բարեւ"),
+        ("am", "ሰላም"),
+    ] {
+        assert_eq!(
+            accepted(text, Some(language), None).as_deref(),
+            Some(text),
+            "{language}"
+        );
+    }
+    // A tag that names its script wins over the likely one; one that does not parse checks nothing.
+    assert_eq!(accepted("Здраво", Some("sr-Latn"), None), None);
+    assert_eq!(
+        accepted("Здраво", Some("not a tag"), None).as_deref(),
+        Some("Здраво")
+    );
+}

@@ -22,6 +22,9 @@ async-trait = "=0.1.92"
 # (src/voice_call.rs): runtime-free, so the same on Tokio and in the browser.
 futures-channel = "0.3.31"
 futures-util = { version = "0.3.31", default-features = false, features = ["std"] }
+# The script a language is likely written in, from CLDR's likely subtags in its compiled data
+# (src/recognition/filter.rs).
+icu_locale = "2.3.1"
 # The room's messages and the configuration, read and written as JSON (src/room.rs, src/config.rs).
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
