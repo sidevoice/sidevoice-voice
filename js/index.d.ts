@@ -47,6 +47,7 @@ export type {
   VoicePlayback,
   VoiceReply,
   VoiceTurnStarted,
+  VoiceRoomRefusal,
   VoiceSettings,
   VoiceState,
   VoiceUserTurn,
