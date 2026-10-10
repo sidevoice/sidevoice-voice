@@ -1,10 +1,13 @@
 name: ci
 
-# Every pull request: format and Clippy (native and wasm32), and the tests on macOS and Linux and on wasm32 in Node:
-# the call on recorded speech, with fake models. Real models run in the apps' CI, which wire them in.
+# Every pull request: format and Clippy (native and wasm32, and the build tooling), the tests on macOS and Linux and
+# on wasm32 in Node (the call on recorded speech, with fake models; real models run in the apps' CI, which wire them
+# in), and the npm package `@sidevoice/voice` built and installed as a consumer installs it (`cargo xtask npm`,
+# `npm-smoke`), publishing nothing: what passes here is what merging publishes (release.yml).
 on:
   # Into any branch, so a pull request stacked on another is checked before its base merges.
   pull_request:
+  # release-please.yml dispatches it on the release PR, whose pushes start no workflow.
   workflow_dispatch:
 
 permissions:
@@ -24,8 +27,10 @@ jobs:
         with:
           wasm: true
       - run: cargo fmt --check
+      - run: cargo fmt --manifest-path xtask/Cargo.toml --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo clippy --locked --all-targets --target wasm32-unknown-unknown -- -D warnings
+      - run: cargo clippy --locked --manifest-path xtask/Cargo.toml --all-targets -- -D warnings
 
   test-native:
     name: Test native (${{ matrix.target }})
@@ -42,13 +47,28 @@ jobs:
       - run: cargo test --locked
 
   test-wasm:
-    name: Test wasm (Node)
+    name: Test wasm (Node, npm package)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: ./.github/actions/setup
         with:
           wasm: true
-      # The module's tests compiled to wasm32 and run in Node by wasm-bindgen-test-runner (the runner in
-      # .cargo/config.toml; doctests cannot run on wasm32).
+      # The build tooling's own tests (xtask/), then the module's tests compiled to wasm32 and run in Node by
+      # wasm-bindgen-test-runner (the runner in .cargo/config.toml; doctests cannot run on wasm32).
+      - run: cargo test --locked --manifest-path xtask/Cargo.toml
       - run: cargo test --locked --target wasm32-unknown-unknown --lib
+      # The npm package, installed into a temporary directory as a consumer installs it: in Node a call must load its
+      # models through fakes, start a fake microphone and speaker, and say it listens (xtask/src/npm.rs).
+      - run: cargo xtask npm
+      - run: cargo xtask npm-smoke
+      # The package this pull request builds, to try the call before it merges: one artifact per head commit,
+      # `voice-npm-<head sha>`, kept 7 days. Built, as every job here, from GitHub's merge of that head into the base.
+      # RELEASING.md, "A pull request's package".
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: voice-npm-${{ github.event.pull_request.head.sha || github.sha }}
+          path: target/npm/*.tgz
+          retention-days: 7
+          if-no-files-found: error
+          overwrite: true

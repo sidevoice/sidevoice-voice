@@ -14,8 +14,9 @@ Rules for any coding agent (and person) working in this repository.
 
 ## Before changing things
 
-Read `README.md` (what the module is and where things are). The repository is Rust only: one crate (`src/`), and,
-as it grows, the build tooling `cargo xtask` (`xtask/`). The design is sidevoice-core#89.
+Read `README.md` (what the module is and where things are). The repository is one Rust crate (`src/`), the
+JavaScript the npm package ships beside its wasm build (`js/`: ES modules, no bundler, no dependencies), and the build
+tooling `cargo xtask` (`xtask/`). The design is sidevoice-core#89.
 
 - **The module knows nothing of the room.** Only the app talks to it: it tells the app the person's turns (under its
   own ids) and how what it was asked to say went (through each `say` handle), and the app translates both ways. No
