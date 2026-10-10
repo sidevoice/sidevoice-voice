@@ -1,29 +1,28 @@
 // The voice seam over this package's call (`createVoiceHost`): `VoiceHost` (voice-host.d.ts), on the page's models
-// and the browser's microphone and speaker. The page's `source` turns the person's settings into models (which model
-// fills each slot is the page's) and lists its catalogue; this file runs the call and its lifecycle. The Sidevoice
+// and the browser's microphone and speaker. The page's `source` turns the person's settings into models: which model
+// fills each slot, and how a setting names it, is the page's; this file runs the call and its lifecycle. The Sidevoice
 // desktop app implements the same seam natively.
 import { VoiceCall as WasmVoiceCall } from "../dist/sidevoice_voice.js";
 import { createWebAudioIo } from "./web-audio-io.js";
 
-const KEY_PREFIX = "sidevoice.provider-key.";
-
 const fail = (code, message) => Object.assign(new Error(message || code), { code });
 
-/** Provider keys in the page's `localStorage`. */
-export function localStorageProviderKeys() {
-  return {
-    get: (provider) => globalThis.localStorage.getItem(KEY_PREFIX + provider),
-    set: (provider, key) =>
-      key == null
-        ? globalThis.localStorage.removeItem(KEY_PREFIX + provider)
-        : globalThis.localStorage.setItem(KEY_PREFIX + provider, key),
-  };
+/** `value` as JSON with its objects' keys in order, so the same choice reads the same however it was written. */
+function canonical(value) {
+  if (Array.isArray(value)) return "[" + value.map(canonical).join(",") + "]";
+  if (value && typeof value === "object") {
+    return "{" + Object.keys(value).sort().filter((key) => value[key] !== undefined)
+      .map((key) => JSON.stringify(key) + ":" + canonical(value[key])).join(",") + "}";
+  }
+  return JSON.stringify(value ?? null);
 }
 
-/** What of the settings chooses models: a change to it gives the call other models. */
+/** What of the settings chooses models: each slot's choice as the page wrote it, without what the call itself reads
+ *  (the language, the voice and its speed), and the end of turn. A change to it gives the call other models. */
 function stages(settings) {
-  const { stt, tts } = settings;
-  return JSON.stringify([stt.model, stt.build ?? null, tts.model, tts.build ?? null, settings.end_of_turn ?? "silence"]);
+  const { language: _language, ...stt } = settings.stt;
+  const { voice: _voice, speed: _speed, ...tts } = settings.tts;
+  return canonical([stt, tts, settings.end_of_turn ?? "silence"]);
 }
 
 /** The handle of something said with no call yet: never played (`stopped`), its one step told to listeners as they
@@ -41,7 +40,7 @@ function notPlayed() {
 }
 
 export function createVoiceHost(source, options = {}) {
-  const { io, keys = localStorageProviderKeys(), ...webAudio } = options;
+  const { io, ...webAudio } = options;
   const listeners = { turn: new Set(), state: new Set(), level: new Set(), error: new Set() };
   let call = null;
   let chosen = null;
@@ -151,12 +150,5 @@ export function createVoiceHost(source, options = {}) {
     onState: on("state"),
     onLevel: on("level"),
     onError: on("error"),
-    models: () => source.catalogue(),
-    async setProviderKey(provider, key) {
-      keys.set(provider, key == null || String(key).trim() === "" ? null : String(key).trim());
-    },
-    async hasProviderKey(provider) {
-      return keys.get(provider) != null;
-    },
   });
 }

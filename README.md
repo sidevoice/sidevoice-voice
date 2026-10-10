@@ -138,17 +138,17 @@ A page drives a call through one interface, `VoiceHost`, defined once in this pa
 implementations:
 
 - **`createVoiceHost(source, options?)`** here (`js/voice-host.js`): the call in the page, on the page's models and the
-  browser's microphone and speaker (or `options.io`), with provider keys in `localStorage` (`localStorageProviderKeys()`,
-  or `options.keys`, which the page's models read too). `source` is the page's `VoiceModelSource`: `catalogue()`, what
-  `models()` answers, and `models(settings)`, the `VoiceModels` (`js/voice-models.d.ts`) that fill the call's slots for
-  the settings, or a refusal by `{code}`. Which model fills each slot is the page's; this package names none.
+  browser's microphone and speaker (or `options.io`). `source` is the page's `VoiceModelSource`: `models(settings)`,
+  the `VoiceModels` (`js/voice-models.d.ts`) that fill the call's slots for the settings, or a refusal by `{code}`.
+  Which models there are, which fills each slot, how a setting names it and the keys any of them needs are the page's;
+  this package lists none and names none.
 - **The Sidevoice desktop app**, `window.__sidevoiceDesktop.host.voice` on macOS: the call run natively, with WebRTC
   AEC3 (sidevoice-desktop's `docs/BRIDGE.md`, "The voice call").
 
 ```js
 const voice = window.__sidevoiceDesktop?.host?.voice ?? createVoiceHost(source); // source: the page's models
 voice.onTurn((turn) => turn.phase === "finished" && sendWords(turn.turn_id, turn.text)); // the page's to send
-await voice.setSettings({ stt: { model: "whisper-base", language: "es" }, tts: { model: "kokoro-82m-v1.0", voice: "ef_dora" } });
+await voice.setSettings({ stt: { ...sttChoice, language: "es" }, tts: { ...ttsChoice, voice: "ef_dora" } }); // choices: the page's
 await voice.start();                                    // resolves once listening; rejects {code}
 const saying = voice.say("Hecho, ya está en la rama.", { language: "es" });
 saying.onEvent((step) => step.type === "progress" && highlight(step.sounding, step.heard_chars));
@@ -164,7 +164,7 @@ What both promise, beyond the types:
   `end-of-turn-missing`. `stop()` is safe at any time, and a `start` right after it, awaited or not, starts the call
   again. `mute` holds from the first call, even before `setSettings`. Settings that change the models give the call
   the new models and configuration together (a live call restarts once); `setSettings` rejects with the model
-  source's `{code}` for settings it cannot fill (`model-unknown`, `build-unfit`, …).
+  source's `{code}` for settings it cannot fill.
 - **Turns** reach the listeners subscribed when they are emitted, in the order the call emitted them, with the state,
   level and errors; nothing is buffered. Each turn has the call's own `turn_id`: `started` comes before exactly one
   `finished` (the words) or `cancelled`. A turn merged into the next is `cancelled` with `merged`, after that next
@@ -173,15 +173,12 @@ What both promise, beyond the types:
   (`playing`, `progress` as each chunk starts and ends, then `done`), and `outcome`, a promise of how it ended: `heard`,
   `heard-up-to` with `heard_chars`, or `not-played`, the reason being `cancelled`, `barge-in`, `stopped` or `failed`
   with a code. What is said before `setSettings`, or with the call stopped, is `not-played` (`stopped`).
-- **Settings** name a model per stage and optionally its build, the language, voice and speed, the patience, the end
-  of turn and `idle_unload_minutes` (how long the models stay loaded with the call stopped; 10 by default). A rejected
-  `setSettings` changes nothing. A change to the models the settings choose (a stage, or the end of turn) gives the
-  call other models, which restarts it while it runs (the open turn cancelled, what is being said stopped); the
-  language, voice, speed, patience and idle minutes apply live.
-- **`models()`** is the catalogue in `WebEngine.models()`'s shape on both hosts. A remote build has
-  `accelerator: "remote"`, and its `backend` is the provider id that `setProviderKey` takes (`openai`, `elevenlabs`);
-  its `installed` says whether the host has that key. The models ask the host for a key each time they need one, so
-  a key set takes effect at once.
+- **Settings** are a choice per slot, `stt` and `tts`, with the patience, the end of turn and `idle_unload_minutes`
+  (how long the models stay loaded with the call stopped; 10 by default). Of a slot the call reads only the language
+  (`stt`) and the voice and speed (`tts`); everything else in it names the model as the page's source does, and goes to
+  the source as the page wrote it. A rejected `setSettings` changes nothing. A change to what chooses models (any other
+  field of a slot, or the end of turn) gives the call other models, which restarts it while it runs (the open turn
+  cancelled, what is being said stopped); the language, voice, speed, patience and idle minutes apply live.
 
 ## Echo cancellation
 
@@ -278,7 +275,7 @@ js/             the npm package's JavaScript, shipped as it is (ES modules, no d
   voice-models.d.ts the model interfaces the page implements (VoiceModels, VoiceVad, VoiceTranscriber, VoiceSpeaker,
                   VoiceEndOfTurn)
   web-audio-io.js the browser's microphone and speaker (createWebAudioIo); capture-worklet.js, its AudioWorklet
-  voice-host.js   the voice seam (createVoiceHost, localStorageProviderKeys); voice-host.d.ts, VoiceHost itself
+  voice-host.js   the voice seam (createVoiceHost); voice-host.d.ts, VoiceHost itself
   *.d.ts          their types
 npm/            the npm package's package.json (version stamped by xtask) and README
 xtask/          the build tooling, `cargo xtask`: the npm package, its smoke test, the release assets, publishing

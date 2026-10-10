@@ -4,8 +4,9 @@
 //
 //   const voice = window.__sidevoiceDesktop?.host?.voice ?? createVoiceHost(source);
 //
-// where `source` is the page's `VoiceModelSource`: its catalogue, and the models that fill the call's slots for the
-// person's settings (sidevoice-engine's, wired into `voice-models.d.ts`'s interfaces, say).
+// where `source` is the page's `VoiceModelSource`: the models that fill the call's slots for the person's settings
+// (the page's, wired into `voice-models.d.ts`'s interfaces). Which models there are, and how a setting names one,
+// are the page's: the call reads a slot's language, voice and speed, and hands the rest of it to `source` as it is.
 //
 // The call knows nothing of the room: it tells the page the person's turns under its own ids, and says what the page
 // asks it to through a handle that tells how it went (`voice-events.d.ts`). The page translates both ways.
@@ -19,24 +20,24 @@ import type {
   VoiceTurnEvent,
 } from "./voice-events.js";
 
-/** The person's choices. Each host fills the rest: the voice activity detector, the builds, grace, listening bar. */
+/** The person's choices. A slot's model is named as the page's `source` names it: the call hands everything in a slot
+ *  but the fields below to `source.models(settings)`, and reads nothing else of it. */
 export interface VoiceSettings {
   stt: {
-    model: string;
-    /** One of the model's builds that is `available` here; null or absent for the host's choice. */
-    build?: string | null;
     /** A BCP 47 tag; null or absent to detect it. */
     language?: string | null;
+    /** The model this slot takes, as the page's source names it. */
+    [choice: string]: unknown;
   };
   tts: {
-    model: string;
-    build?: string | null;
-    /** One of the model's voices; null or absent for its first (for ElevenLabs, the account's first). */
+    /** One of the model's voices; null or absent for the speaker's own choice. */
     voice?: string | null;
     speed?: number;
+    /** The model this slot takes, as the page's source names it. */
+    [choice: string]: unknown;
   };
   patience?: "fast" | "normal" | "calm";
-  /** `silence` by default; `smart-turn` needs a model with the `end-of-turn` capability. */
+  /** `silence` by default; `smart-turn` needs `source` to give an end-of-turn model. */
   end_of_turn?: "silence" | "smart-turn";
   /** How long the models stay in memory with the call stopped, in minutes (10 by default; 0: they leave as it stops).
    *  The next `start` loads them again. */
@@ -45,45 +46,12 @@ export interface VoiceSettings {
 
 /** What a failed call rejects with, and what `onError` hears: rely on `code`. The desktop app adds its `key`. */
 export interface VoiceHostError {
-  /** `microphone-denied`, `microphone-unavailable`, `speaker-unavailable`, `audio-device-unavailable`, the models'
-   *  (`model-load-failed`, `credential-missing`, …), `settings-missing`, `stopped`, `end-of-turn-missing`, and the
-   *  model source's refusals of settings (`model-unknown`, `model-wrong-task`, `model-unfit`, `build-unfit`,
-   *  `end-of-turn-unavailable`, …). */
+  /** `microphone-denied`, `microphone-unavailable`, `speaker-unavailable`, `audio-device-unavailable`,
+   *  `settings-missing`, `stopped`, `end-of-turn-missing`, and the codes of the page's models and of its source's
+   *  refusals of settings, as they give them. */
   code: string;
   message?: string;
   key?: string;
-}
-
-/** A build of a catalogue model, as `WebEngine.models()` lists it. A remote one has `accelerator: "remote"`, and its
- *  `backend` is its provider's id (`openai`, `elevenlabs`), the one `setProviderKey` takes. */
-export interface VoiceBuild {
-  id: string;
-  backend: string;
-  /** What it would run on here (`cpu`, `metal`, `webgpu`, `wasm`, `remote`…), when it runs here. */
-  accelerator?: string;
-  precision: string;
-  downloadBytes: number;
-  memoryMb: number;
-  /** Whether it runs here; when not, `reasons` say why. */
-  available: boolean;
-  reasons: { code: string; params: { needs?: number; has?: number } }[];
-  /** On disk; for a remote build, whether the host has its provider's key. */
-  installed: boolean;
-}
-
-/** A model of the catalogue the settings choose from, in the shape `WebEngine.models()` lists, on both hosts. */
-export interface VoiceModel {
-  id: string;
-  family: string;
-  /** `stt`, `tts`, `vad`, `end-of-turn`… */
-  capabilities: string[];
-  parametersM: number;
-  languages: string[];
-  license: string;
-  voices: { id: string; languages: string[]; gender?: "female" | "male" }[];
-  installed: boolean;
-  builds: VoiceBuild[];
-  recommendedBuild?: string;
 }
 
 /** The voice seam. Every event of a call reaches the listeners subscribed when it is emitted, in the order the call
@@ -116,41 +84,21 @@ export interface VoiceHost {
   /** The microphone's level, 0 to 1, once per detector window (about 30 a second). */
   onLevel(listener: (level: number) => void): () => void;
   onError(listener: (error: VoiceHostError) => void): () => void;
-  /** The catalogue the settings choose from (the model source's). */
-  models(): Promise<VoiceModel[]>;
-  /** Keeps `key` for a remote provider (`openai`, `elevenlabs`), or removes it with `null`. The models ask the host for
-   *  it; the page never reads it back. */
-  setProviderKey(provider: string, key: string | null): Promise<void>;
-  hasProviderKey(provider: string): Promise<boolean>;
 }
 
-/** Where `createVoiceHost` keeps provider keys, and where the page's models read them (an engine host's
- *  `credential`, say). */
-export interface ProviderKeys {
-  get(provider: string): string | null;
-  set(provider: string, key: string | null): void;
-}
-
-/** The page's side of `createVoiceHost`: which models fill the call's slots, and what the settings choose from. */
+/** The page's side of `createVoiceHost`: which models fill the call's slots. */
 export interface VoiceModelSource {
-  /** The catalogue `models()` answers. */
-  catalogue(): Promise<VoiceModel[]>;
   /** The models for `settings` (the voice activity detector, the transcriber, the speaker, and an end-of-turn
    *  classifier for `smart-turn`), not loaded yet: the call loads them as it starts. Rejects `{code}` for settings it
-   *  cannot fill. Asked again only when the models the settings choose change (a stage or the end of turn). */
+   *  cannot fill. Asked again only when what chooses models changes: a slot's fields other than its language, voice
+   *  and speed, or the end of turn. */
   models(settings: VoiceSettings): VoiceModels | Promise<VoiceModels>;
 }
 
 export interface VoiceHostOptions extends WebAudioIoOptions {
   /** The microphone and speaker instead of the browser's (`createWebAudioIo`). */
   io?: AudioIo;
-  /** Where provider keys are kept; `localStorageProviderKeys()` by default. */
-  keys?: ProviderKeys;
 }
 
 /** The voice seam over this package's call, on the page's `source` of models. */
 export declare function createVoiceHost(source: VoiceModelSource, options?: VoiceHostOptions): VoiceHost;
-
-/** Provider keys in the page's `localStorage`, under `sidevoice.provider-key.<provider>`: the web's choice
- *  (sidevoice-core#89 §3), with the warning that any script of the page can read them. */
-export declare function localStorageProviderKeys(): ProviderKeys;
