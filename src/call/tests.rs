@@ -665,11 +665,13 @@ fn a_reply_written_before_the_persons_latest_turn_is_dropped_when_it_arrives() {
     );
     // An answer about a turn of another call moves nothing.
     run.input(Input::Room(RoomEvent::TurnStarted {
+        session_id: "s1".into(),
         turn_id: "elsewhere-turn-0".into(),
         revision: 50,
     }));
     // The room gave this turn revision 12: a reply written at 10 is stale too, one at 12 is not.
     run.input(Input::Room(RoomEvent::TurnStarted {
+        session_id: "s1".into(),
         turn_id,
         revision: 12,
     }));
@@ -731,6 +733,7 @@ fn a_reply_taken_before_the_rooms_answer_is_retired_when_the_answer_says_it_is_o
     assert!(Run::reasons(&run.take()).is_empty(), "both wait");
     // The room's answer gives the turn revision 6: the reply written at 5 goes; the replay the person asked for stays.
     run.input(Input::Room(RoomEvent::TurnStarted {
+        session_id: "s1".into(),
         turn_id,
         revision: 6,
     }));
@@ -830,4 +833,58 @@ fn a_turn_the_room_has_no_room_for_keeps_its_words_and_is_said_again_when_anothe
     let again: Vec<_> = turns.iter().filter(|t| t.turn_id == a.turn_id).collect();
     assert_eq!(again.len(), 2);
     assert_eq!(again[1].text, words.text, "never dropped");
+}
+
+#[test]
+fn a_room_session_that_replaced_the_old_one_starts_its_boundary_over_and_a_resume_keeps_it() {
+    let mut run = Run::new(VoiceConfig {
+        patience: Patience::Fast,
+        ..config()
+    });
+    let said = |run: &mut Run| {
+        run.hear(&speech());
+        let turn = Run::turns(&run.take())[0].turn_id.clone();
+        run.hear(&silence(3_000));
+        let (number, _) = Run::transcribe(&run.take()).expect("transcribed");
+        run.transcribed(number, "a question");
+        run.wait(2_000);
+        run.take();
+        turn
+    };
+    let answer = |run: &mut Run, session: &str, turn_id: String, revision: u64| {
+        run.input(Input::Room(RoomEvent::TurnStarted {
+            session_id: session.into(),
+            turn_id,
+            revision,
+        }));
+    };
+    let spoken = |run: &mut Run, id: &str, revision: u64| {
+        let mut sent = reply(id, "An answer to the latest turn.");
+        sent.revision = revision;
+        run.input(Input::Room(RoomEvent::Reply(sent)));
+        let effects = run.take();
+        (Run::synthesize(&effects).len(), Run::reasons(&effects))
+    };
+    // Session s1 gives a turn revision 20: a reply below it is stale.
+    let first = said(&mut run);
+    answer(&mut run, "s1", first, 20);
+    assert_eq!(
+        spoken(&mut run, "old", 5),
+        (
+            0,
+            vec![(PlaybackStatus::Unplayed, Some(PlaybackReason::NewerTurn))]
+        )
+    );
+    // A resume: the same session, revisions go on, and the boundary stays.
+    let second = said(&mut run);
+    answer(&mut run, "s1", second, 21);
+    assert_eq!(spoken(&mut run, "still-old", 20).0, 0);
+    // A replacement session, whose revisions start over: its revision-1 reply is spoken, the microphone open all along.
+    let third = said(&mut run);
+    answer(&mut run, "s2", third, 1);
+    assert_eq!(spoken(&mut run, "new", 1), (1, vec![]));
+    assert!(run
+        .take()
+        .iter()
+        .all(|effect| *effect != Effect::StopPlayback));
 }
