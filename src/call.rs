@@ -70,6 +70,15 @@ pub(crate) enum Input {
 
 /// How many of the latest turns' ids are kept, to match the room's answers to their `started`.
 const TURN_IDS_KEPT: usize = 16;
+/// How many of the latest `started` and `finished` messages are kept, to match the room's refusals.
+const SENT_KEPT: usize = 32;
+
+/// A turn the room refused for too many open turns: its `started`, and its end once it has one, to send again.
+#[derive(Debug)]
+struct Parked {
+    started: UserTurn,
+    end: Option<UserTurn>,
+}
 
 /// The end-of-turn probability from which a paused turn is over.
 const END_OF_TURN_LIKELY: f32 = 0.5;
@@ -148,6 +157,11 @@ pub(crate) struct Call {
     turn_boundary: u64,
     /// The ids of the latest turns, whose `started` answers from the room count.
     turn_ids: VecDeque<String>,
+    /// The latest `started` and `finished` messages sent, for a refusal that names one.
+    started_sent: VecDeque<UserTurn>,
+    finished_sent: VecDeque<UserTurn>,
+    /// Turns the room could not take yet (`room.turns_full`), oldest first.
+    parked: VecDeque<Parked>,
     segmenter: Segmenter,
     /// The turn being spoken.
     open: Option<usize>,
@@ -174,6 +188,9 @@ impl Call {
             revision: 0,
             turn_boundary: 0,
             turn_ids: VecDeque::new(),
+            started_sent: VecDeque::new(),
+            finished_sent: VecDeque::new(),
+            parked: VecDeque::new(),
             open: None,
             turns: HashMap::new(),
             next_turn: 0,
@@ -227,6 +244,7 @@ impl Call {
                     self.act(now, actions, &mut out);
                 }
             }
+            Input::Room(RoomEvent::TurnsFull { client_msg_id }) => self.turns_full(&client_msg_id),
             Input::Room(RoomEvent::Other) => {}
             Input::Online(online) => self.online = online,
             Input::Mute(muted) => {
@@ -552,13 +570,88 @@ impl Call {
             merged,
             timings,
         };
+        self.send_turn(message, out);
+    }
+
+    /// Sends a turn's message, or keeps it while the room cannot take the turn (`room.turns_full`): a parked turn's
+    /// end waits with it (its cancel drops it: the room never took it). Each end the room is sent lets the oldest
+    /// parked turn try once more.
+    fn send_turn(&mut self, message: UserTurn, out: &mut Vec<Effect>) {
+        if message.phase != TurnPhase::Started {
+            let waiting = self.parked.iter().position(|parked| {
+                parked.started.turn_id == message.turn_id && parked.end.is_none()
+            });
+            if let Some(index) = waiting {
+                if message.phase == TurnPhase::Finished {
+                    self.parked[index].end = Some(message);
+                } else {
+                    self.parked.remove(index);
+                }
+                return;
+            }
+        }
+        let ended = message.phase != TurnPhase::Started && !message.offline;
+        self.emit_turn(message, out);
+        if ended {
+            if let Some(parked) = self.parked.pop_front() {
+                self.emit_turn(parked.started, out);
+                if let Some(end) = parked.end {
+                    self.emit_turn(end, out);
+                }
+            }
+        }
+    }
+
+    /// Emits a turn's message under a new id, and remembers it for a refusal that may name it.
+    fn emit_turn(&mut self, message: UserTurn, out: &mut Vec<Effect>) {
         let message = UserTurn {
             client_msg_id: self.message_id(),
             ..message
         };
+        let kept = match message.phase {
+            TurnPhase::Started => Some(&mut self.started_sent),
+            TurnPhase::Finished => Some(&mut self.finished_sent),
+            TurnPhase::Cancelled => None,
+        };
+        if let Some(kept) = kept {
+            kept.push_back(message.clone());
+            if kept.len() > SENT_KEPT {
+                kept.pop_front();
+            }
+        }
         out.push(Effect::Event(VoiceEvent::RoomMessage(
             RoomMessage::UserTurn(message),
         )));
+    }
+
+    /// The room refused `started` message `client_msg_id` for too many open turns: that turn waits, with its end if
+    /// it has one, for one of the others to end. A turn that ended with no words has nothing to keep.
+    fn turns_full(&mut self, client_msg_id: &str) {
+        let Some(started) = self
+            .started_sent
+            .iter()
+            .find(|sent| sent.client_msg_id == client_msg_id)
+            .cloned()
+        else {
+            return;
+        };
+        if self
+            .parked
+            .iter()
+            .any(|parked| parked.started.turn_id == started.turn_id)
+        {
+            return;
+        }
+        let open = self.turns.values().any(|turn| turn.id == started.turn_id);
+        let end = self
+            .finished_sent
+            .iter()
+            .rev()
+            .find(|sent| sent.turn_id == started.turn_id)
+            .cloned();
+        if open || end.is_some() {
+            self.parked.push_back(Parked { started, end });
+        }
     }
 
     /// Turns the playback's actions into effects and reports.
