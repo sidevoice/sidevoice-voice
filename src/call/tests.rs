@@ -748,3 +748,86 @@ fn a_reply_taken_before_the_rooms_answer_is_retired_when_the_answer_says_it_is_o
         .collect();
     assert_eq!(spoken, ["again"], "only the replay is spoken");
 }
+
+#[test]
+fn a_turn_the_room_has_no_room_for_keeps_its_words_and_is_said_again_when_another_ends() {
+    let mut run = Run::new(VoiceConfig {
+        patience: Patience::Fast,
+        ..config()
+    });
+    let full = |run: &mut Run, id: &str| {
+        run.input(Input::Room(RoomEvent::TurnsFull {
+            client_msg_id: id.into(),
+        }))
+    };
+    // Turn B is spoken and waits for its transcript; turn A starts, and the room refuses its start.
+    run.hear(&speech());
+    run.hear(&silence(3_000));
+    let (b, _) = Run::transcribe(&run.take()).expect("B transcribed");
+    run.hear(&speech());
+    let a = Run::turns(&run.take()).pop().expect("A started");
+    assert_eq!(a.phase, TurnPhase::Started);
+    full(&mut run, &a.client_msg_id);
+    run.wait(1_000);
+    assert!(
+        Run::turns(&run.take()).is_empty(),
+        "nothing is said again until a turn ends: no spinning"
+    );
+
+    // B ends: A starts again, same turn, a new message.
+    run.transcribed(b, "the first question");
+    let turns = Run::turns(&run.take());
+    assert_eq!(
+        turns
+            .iter()
+            .map(|t| (t.turn_id.clone(), t.phase))
+            .collect::<Vec<_>>(),
+        [
+            (turns[0].turn_id.clone(), TurnPhase::Finished),
+            (a.turn_id.clone(), TurnPhase::Started)
+        ]
+    );
+    let again = turns[1].clone();
+    assert_ne!(again.client_msg_id, a.client_msg_id);
+
+    // Still full: A's words, when they come, are kept and not said.
+    full(&mut run, &again.client_msg_id);
+    run.hear(&silence(3_000));
+    let (a_turn, _) = Run::transcribe(&run.take()).expect("A transcribed");
+    run.transcribed(a_turn, "the second question");
+    run.wait(2_000);
+    assert!(Run::turns(&run.take()).is_empty(), "A's words wait");
+
+    // Turn C is spoken and ends: A is said again, its start and then its words.
+    run.hear(&speech());
+    run.hear(&silence(3_000));
+    let (c, _) = Run::transcribe(&run.take()).expect("C transcribed");
+    run.transcribed(c, "the third question");
+    let turns = Run::turns(&run.take());
+    let said: Vec<_> = turns
+        .iter()
+        .map(|t| (t.turn_id.clone(), t.phase, t.text.clone()))
+        .collect();
+    assert_eq!(said[1], (a.turn_id.clone(), TurnPhase::Started, None));
+    assert_eq!(
+        said[2],
+        (
+            a.turn_id.clone(),
+            TurnPhase::Finished,
+            Some("the second question".into())
+        )
+    );
+
+    // A start refused after its words were already sent: the words are kept and said again with it.
+    let words = turns[2].clone();
+    let started = turns[1].clone();
+    full(&mut run, &started.client_msg_id);
+    run.hear(&speech());
+    run.hear(&silence(3_000));
+    let (d, _) = Run::transcribe(&run.take()).expect("D transcribed");
+    run.transcribed(d, "the fourth question");
+    let turns = Run::turns(&run.take());
+    let again: Vec<_> = turns.iter().filter(|t| t.turn_id == a.turn_id).collect();
+    assert_eq!(again.len(), 2);
+    assert_eq!(again[1].text, words.text, "never dropped");
+}
