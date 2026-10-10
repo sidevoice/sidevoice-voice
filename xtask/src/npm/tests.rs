@@ -95,7 +95,10 @@ fn a_smoke_report_must_show_a_running_call() {
         ("loaded", json!(["vad"])),
         ("ioStarted", json!(false)),
         ("listenedEarly", json!(true)),
-        ("said", json!({"id": "string", "steps": ["done"], "outcome": {"status": "not-played", "reason": "stopped"}})),
+        (
+            "said",
+            json!({"id": "string", "steps": ["done"], "outcome": {"status": "not-played", "reason": "stopped"}}),
+        ),
         ("state", json!(null)),
         ("webAudioIo", json!("undefined")),
     ] {
