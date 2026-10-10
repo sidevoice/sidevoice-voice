@@ -631,28 +631,40 @@ fn a_stop_ends_the_call_while_its_detector_never_answers_and_it_starts_again() {
 #[test]
 fn a_handle_cancels_what_it_says_and_tells_how_it_ended() {
     runtime().block_on(async {
-        let (call, mut events, _speakers) = call(FakeModels::default());
+        let (call, mut events, speakers) = call(FakeModels::default());
         call.start();
         next(&mut events, |event| match event {
             VoiceEvent::State(state) if state.listening == crate::Listening::Listening => Some(()),
             _ => None,
         })
         .await;
-        let mut saying = call.say("Cancelled at once.", SayOptions::default());
+        // The person speaks: what is said now waits for the turn, and the cancel reaches it while it waits.
+        let sink = speakers.lock().unwrap().sink.clone().unwrap();
+        for frame in [silence(300), clip(QUILTER, 0.9)].concat().chunks(160) {
+            sink.send(IoEvent::Captured(frame.to_vec()));
+        }
+        next(&mut events, |event| match event {
+            VoiceEvent::Turn(TurnEvent::Started { .. }) => Some(()),
+            _ => None,
+        })
+        .await;
+        let mut saying = call.say("Cancelled while it waits.", SayOptions::default());
         saying.cancel();
-        let mut last = None;
+        let mut steps = Vec::new();
         while let Some(step) = tokio::time::timeout(Duration::from_secs(5), saying.next())
             .await
             .expect("in time")
         {
-            last = Some(step);
+            steps.push(step);
         }
-        assert!(matches!(
-            last,
-            Some(SayEvent::Done {
-                outcome: SayOutcome::NotPlayed { .. } | SayOutcome::HeardUpTo { .. }
-            })
-        ));
+        assert_eq!(
+            steps,
+            [SayEvent::Done {
+                outcome: SayOutcome::NotPlayed {
+                    reason: crate::StopReason::Cancelled
+                }
+            }]
+        );
         // Said while stopped: not played.
         call.stop();
         let mut stopped = call.say("Said while stopped.", SayOptions::default());
