@@ -1,0 +1,13 @@
+[package]
+name = "xtask"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.98"
+publish = false
+description = "Build tooling for sidevoice-voice: the npm package, the release assets and publishing."
+
+[dependencies]
+serde_json = "1"
+sha2 = "0.10"
+# npm names a tarball by its SHA-1 (`shasum`), which `npm-publish` compares with a staged version's.
+sha1 = "0.10"
