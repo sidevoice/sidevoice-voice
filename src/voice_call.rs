@@ -11,22 +11,40 @@
 mod tests;
 
 use std::collections::VecDeque;
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use futures_channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
-use futures_util::future::{ready, select, Either};
-use futures_util::{stream, StreamExt};
+use futures_util::future::{abortable, ready, select, AbortHandle, Either};
+use futures_util::{stream, Stream, StreamExt};
 
 use crate::call::{Call, Effect, Input, Transcript};
 use crate::config::{EndOfTurn, VoiceConfig};
 use crate::event::{VoiceError, VoiceEvent};
 use crate::io::{AudioIo, IoEvent, IoSink};
+use crate::maybe_send::MaybeSend;
 use crate::models::{Models, VadFrame, VoiceModels};
 use crate::residency::Residency;
 use crate::room::RoomEvent;
 use crate::runtime::{monotonic_ms, sleep, spawn, unix_ms};
 use crate::turns::RATE;
+
+/// How long a stop, or the owner gone, waits behind a message the task is handling (a model that does not answer)
+/// before that message is abandoned.
+const ABANDON_AFTER_MS: u64 = 500;
+/// How many model tasks are kept to abort; older ones have ended.
+const TASKS_KEPT: usize = 64;
+
+/// How handling one message ended.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Settled {
+    Done,
+    /// A stop waited behind it too long.
+    Stopped,
+    /// The owner is gone.
+    Gone,
+}
 
 /// What a call tells its host, in order.
 pub type Events = UnboundedReceiver<VoiceEvent>;
@@ -90,6 +108,7 @@ impl VoiceCall {
             loaded: None,
             running: false,
             opening: false,
+            tasks: VecDeque::new(),
             captured: VecDeque::new(),
             taken: 0,
             messages: internal,
@@ -164,6 +183,8 @@ struct Driver {
     captured: VecDeque<f32>,
     /// The detector's position: samples taken into windows since its last reset.
     taken: u64,
+    /// The model tasks under way (the latest of them: older ones have ended).
+    tasks: VecDeque<AbortHandle>,
     /// The task's own channel, for what the microphone, the speaker and the model tasks report.
     messages: UnboundedSender<Message>,
     events: UnboundedSender<VoiceEvent>,
@@ -178,40 +199,115 @@ impl Driver {
         // `None` once the owner's channel closed; the task's own channel never does, since the task holds a sender.
         let owner = owner.map(Some).chain(stream::once(ready(None)));
         let mut inbox = stream::select(owner, reported.map(Some));
+        // What reached the task while it was busy with a message, in order.
+        let mut pending = VecDeque::new();
         loop {
-            let deadline = [self.call.deadline(), self.residency.deadline()]
-                .into_iter()
-                .flatten()
-                .min();
-            let message = match deadline {
-                None => inbox.next().await,
-                Some(deadline) => {
-                    let wait = deadline.saturating_sub(monotonic_ms());
-                    match select(inbox.next(), Box::pin(sleep(wait))).await {
-                        Either::Left((message, _)) => message,
-                        Either::Right(((), _)) => {
-                            let now = monotonic_ms();
-                            let effects = self.call.poll(now);
-                            self.apply(effects);
-                            if self.residency.due(now) {
-                                // Dropping them is what unloads them; the next start loads them again.
-                                self.loaded = None;
+            let message = match pending.pop_front() {
+                Some(message) => Some(Some(message)),
+                None => match self.next_deadline() {
+                    None => inbox.next().await,
+                    Some(deadline) => {
+                        let wait = deadline.saturating_sub(monotonic_ms());
+                        match select(inbox.next(), Box::pin(sleep(wait))).await {
+                            Either::Left((message, _)) => message,
+                            Either::Right(((), _)) => {
+                                let now = monotonic_ms();
+                                let effects = self.call.poll(now);
+                                self.apply(effects);
+                                if self.residency.due(now) {
+                                    // Dropping them is what unloads them; the next start loads them again.
+                                    self.loaded = None;
+                                }
+                                continue;
                             }
-                            continue;
                         }
                     }
-                }
+                },
             };
             let Some(Some(message)) = message else {
                 // The VoiceCall was dropped.
-                self.halt().await;
-                self.loaded = None;
+                self.abandon();
                 return;
             };
-            self.receive(message).await;
+            match self.settle(message, &mut inbox, &mut pending).await {
+                Settled::Done => {}
+                // The stop waits in `pending`, and is answered next.
+                Settled::Stopped => self.abandon(),
+                Settled::Gone => {
+                    self.abandon();
+                    return;
+                }
+            }
             let idle = self.loaded.is_some() && !self.running;
             self.residency.observe(monotonic_ms(), idle);
         }
+    }
+
+    fn next_deadline(&self) -> Option<u64> {
+        [self.call.deadline(), self.residency.deadline()]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+
+    /// Handles `message` while still hearing the owner: what arrives meanwhile waits in `pending`, but a stop, or the
+    /// owner gone, still waiting after [`ABANDON_AFTER_MS`] (a model that does not answer) abandons the message.
+    async fn settle(
+        &mut self,
+        message: Message,
+        inbox: &mut (impl Stream<Item = Option<Message>> + Unpin),
+        pending: &mut VecDeque<Message>,
+    ) -> Settled {
+        let mut work = Box::pin(self.receive(message));
+        let mut abandon: Option<(u64, Settled)> = None;
+        loop {
+            let timer = async move {
+                match abandon {
+                    Some((at, _)) => sleep(at.saturating_sub(monotonic_ms())).await,
+                    None => std::future::pending().await,
+                }
+            };
+            match select(work.as_mut(), select(inbox.next(), Box::pin(timer))).await {
+                Either::Left(((), _)) => {
+                    return match abandon {
+                        Some((_, Settled::Gone)) => Settled::Gone,
+                        _ => Settled::Done,
+                    }
+                }
+                Either::Right((Either::Left((next, _)), _)) => {
+                    let at = monotonic_ms() + ABANDON_AFTER_MS;
+                    match next {
+                        Some(Some(Message::Stop)) => {
+                            pending.push_back(Message::Stop);
+                            abandon.get_or_insert((at, Settled::Stopped));
+                        }
+                        Some(Some(message)) => pending.push_back(message),
+                        Some(None) | None => {
+                            let at = abandon.map_or(at, |(earlier, _)| earlier.min(at));
+                            abandon = Some((at, Settled::Gone));
+                        }
+                    }
+                }
+                Either::Right((Either::Right(((), _)), _)) => {
+                    return abandon.map_or(Settled::Done, |(_, settled)| settled);
+                }
+            }
+        }
+    }
+
+    /// Stops at once, without waiting on any model: the microphone and the speaker close, the models and every task
+    /// the call started are dropped (the next start loads them again), and the call says it is idle.
+    fn abandon(&mut self) {
+        self.running = false;
+        self.opening = false;
+        self.io.stop();
+        for task in self.tasks.drain(..) {
+            task.abort();
+        }
+        self.loaded = None;
+        self.captured.clear();
+        self.taken = 0;
+        self.input(Input::Stop);
     }
 
     async fn receive(&mut self, message: Message) {
@@ -344,8 +440,11 @@ impl Driver {
         }
         self.running = false;
         self.opening = false;
-        // The microphone and the speaker close before the call says it is idle.
+        // The microphone and the speaker close before the call says it is idle; what its tasks would answer is moot.
         self.io.stop();
+        for task in self.tasks.drain(..) {
+            task.abort();
+        }
         self.input(Input::Stop);
         self.captured.clear();
         self.taken = 0;
@@ -403,7 +502,7 @@ impl Driver {
                     let Some(loaded) = &self.loaded else { continue };
                     let transcriber = Arc::clone(&loaded.transcriber);
                     let messages = self.messages.clone();
-                    spawn(async move {
+                    self.track(async move {
                         let result = transcriber.transcribe(pcm, RATE, language).await;
                         let _ = messages.unbounded_send(Message::Transcribed { turn, result });
                     });
@@ -419,7 +518,7 @@ impl Driver {
                     let messages = self.messages.clone();
                     let (voice, speed) = (self.config.voice.clone(), self.config.speed);
                     let language = language.or_else(|| self.config.language.clone());
-                    spawn(async move {
+                    self.track(async move {
                         let result = speaker.speak(text, voice, language, speed).await;
                         let _ = messages.unbounded_send(Message::Synthesized {
                             utterance,
@@ -442,7 +541,7 @@ impl Driver {
                         .and_then(|loaded| loaded.end_of_turn.clone());
                     let Some(model) = model else { continue };
                     let messages = self.messages.clone();
-                    spawn(async move {
+                    self.track(async move {
                         let result = model.end_of_turn(pcm, RATE).await;
                         let _ = messages.unbounded_send(Message::EndOfTurn {
                             turn,
@@ -453,6 +552,19 @@ impl Driver {
                 }
             }
         }
+    }
+
+    /// Runs `task` on its own, abortable: `halt` and `abandon` drop what is still running, and the models it holds.
+    fn track(&mut self, task: impl Future<Output = ()> + MaybeSend + 'static) {
+        let (task, handle) = abortable(task);
+        self.tasks.retain(|task| !task.is_aborted());
+        if self.tasks.len() >= TASKS_KEPT {
+            self.tasks.pop_front();
+        }
+        self.tasks.push_back(handle);
+        spawn(async move {
+            let _ = task.await;
+        });
     }
 
     fn error(&self, code: String) {
