@@ -89,6 +89,15 @@ fn a_smoke_report_must_show_a_running_call() {
         "said": {"id": "string", "steps": ["playing", "progress", "progress", "done"], "outcome": {"status": "heard"}},
         "state": {"listening": "listening", "recognising": 0, "playback": "idle", "online": true},
         "webAudioIo": "function",
+        "host": {
+            "missing": "settings-missing", "unknown": "model-unknown", "reloaded": 1,
+            "smartMissing": "end-of-turn-missing", "catalogue": 2, "flags": ["muted"],
+            "early": "not-played", "said": ["function", "heard"],
+            "started": "resolved", "again": "resolved", "restarted": "resolved", "afterRestart": "listening",
+            "smartLive": ["listening", []],
+            "states": ["idle", "listening", "idle"],
+            "keys": [true, "sk-smoke", false], "seam": SEAM,
+        },
     });
     assert_eq!(check_smoke(&ran), Ok(()));
     for (key, value) in [
@@ -101,10 +110,26 @@ fn a_smoke_report_must_show_a_running_call() {
         ),
         ("state", json!(null)),
         ("webAudioIo", json!("undefined")),
+        ("host", json!(null)),
     ] {
         let mut report = ran.clone();
         report[key] = value;
         assert!(check_smoke(&report).is_err(), "{key}");
+    }
+    for (key, value) in [
+        ("started", json!("stopped")),
+        ("states", json!(["idle", "listening"])),
+        ("keys", json!([false, null, false])),
+        ("seam", json!(["start"])),
+        ("reloaded", json!(0)),
+        ("flags", json!(["listening"])),
+        ("said", json!(["function", "not-played"])),
+        ("afterRestart", json!("idle")),
+        ("smartLive", json!(["idle", ["end-of-turn-missing"]])),
+    ] {
+        let mut report = ran.clone();
+        report["host"][key] = value;
+        assert!(check_smoke(&report).is_err(), "host {key}");
     }
 }
 

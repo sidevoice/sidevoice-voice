@@ -129,6 +129,60 @@ Their failures are errors with stable codes: `microphone-denied`, `microphone-un
 - **Which models, and their tuning, are the app's.** The detector's numbers core used and this module was written
   against: a probability of 0.6, speech confirmed after 400 ms, ended after 200 ms.
 
+## The voice seam a page drives
+
+A page drives a call through one interface, `VoiceHost`, defined once in this package
+([`js/voice-host.d.ts`](js/voice-host.d.ts)) with the types it carries (`VoiceSettings`, `VoiceHostError`, and from
+[`js/voice-events.d.ts`](js/voice-events.d.ts) `VoiceTurnEvent`, `VoiceCallState`, `VoiceSaying`, `VoiceSayEvent`,
+`VoiceSayOutcome`). The call behind it knows nothing of the room: the page translates both ways. It has two
+implementations:
+
+- **`createVoiceHost(source, options?)`** here (`js/voice-host.js`): the call in the page, on the page's models and the
+  browser's microphone and speaker (or `options.io`), with provider keys in `localStorage` (`localStorageProviderKeys()`,
+  or `options.keys`, which the page's models read too). `source` is the page's `VoiceModelSource`: `catalogue()`, what
+  `models()` answers, and `models(settings)`, the `VoiceModels` (`js/voice-models.d.ts`) that fill the call's slots for
+  the settings, or a refusal by `{code}`. Which model fills each slot is the page's; this package names none.
+- **The Sidevoice desktop app**, `window.__sidevoiceDesktop.host.voice` on macOS: the call run natively, with WebRTC
+  AEC3 (sidevoice-desktop's `docs/BRIDGE.md`, "The voice call").
+
+```js
+const voice = window.__sidevoiceDesktop?.host?.voice ?? createVoiceHost(source); // source: the page's models
+voice.onTurn((turn) => turn.phase === "finished" && sendWords(turn.turn_id, turn.text)); // the page's to send
+await voice.setSettings({ stt: { model: "whisper-base", language: "es" }, tts: { model: "kokoro-82m-v1.0", voice: "ef_dora" } });
+await voice.start();                                    // resolves once listening; rejects {code}
+const saying = voice.say("Hecho, ya está en la rama.", { language: "es" });
+saying.onEvent((step) => step.type === "progress" && highlight(step.sounding, step.heard_chars));
+const outcome = await saying.outcome; // heard, heard up to N characters, or not played; the page reports it
+// saying.cancel() stops it, when the page learns it is no longer to be said.
+```
+
+What both promise, beyond the types:
+
+- **`start()`** resolves once the microphone and the speaker work: at the first state whose `listening` is not `idle`,
+  at once if the call listens already, and a second `start` while one is pending settles with it. It rejects with
+  `{code}`, and with `{code: "stopped"}` when `stop()` comes first; `smart-turn` without an end-of-turn model rejects
+  `end-of-turn-missing`. `stop()` is safe at any time, and a `start` right after it, awaited or not, starts the call
+  again. `mute` holds from the first call, even before `setSettings`. Settings that change the models give the call
+  the new models and configuration together (a live call restarts once); `setSettings` rejects with the model
+  source's `{code}` for settings it cannot fill (`model-unknown`, `build-unfit`, …).
+- **Turns** reach the listeners subscribed when they are emitted, in the order the call emitted them, with the state,
+  level and errors; nothing is buffered. Each turn has the call's own `turn_id`: `started` comes before exactly one
+  `finished` (the words) or `cancelled`. A turn merged into the next is `cancelled` with `merged`, after that next
+  turn's `started`.
+- **`say(text, options?)`** answers a handle at once: its `id`, `cancel()`, `onEvent(listener)` for its steps in order
+  (`playing`, `progress` as each chunk starts and ends, then `done`), and `outcome`, a promise of how it ended: `heard`,
+  `heard-up-to` with `heard_chars`, or `not-played`, the reason being `cancelled`, `barge-in`, `stopped` or `failed`
+  with a code. What is said before `setSettings`, or with the call stopped, is `not-played` (`stopped`).
+- **Settings** name a model per stage and optionally its build, the language, voice and speed, the patience, the end
+  of turn and `idle_unload_minutes` (how long the models stay loaded with the call stopped; 10 by default). A rejected
+  `setSettings` changes nothing. A change to the models the settings choose (a stage, or the end of turn) gives the
+  call other models, which restarts it while it runs (the open turn cancelled, what is being said stopped); the
+  language, voice, speed, patience and idle minutes apply live.
+- **`models()`** is the catalogue in `WebEngine.models()`'s shape on both hosts. A remote build has
+  `accelerator: "remote"`, and its `backend` is the provider id that `setProviderKey` takes (`openai`, `elevenlabs`);
+  its `installed` says whether the host has that key. The models ask the host for a key each time they need one, so
+  a key set takes effect at once.
+
 ## Echo cancellation
 
 The call cancels the echo of its own playback, never relying on the operating system's (sidevoice-core#89).
@@ -224,6 +278,7 @@ js/             the npm package's JavaScript, shipped as it is (ES modules, no d
   voice-models.d.ts the model interfaces the page implements (VoiceModels, VoiceVad, VoiceTranscriber, VoiceSpeaker,
                   VoiceEndOfTurn)
   web-audio-io.js the browser's microphone and speaker (createWebAudioIo); capture-worklet.js, its AudioWorklet
+  voice-host.js   the voice seam (createVoiceHost, localStorageProviderKeys); voice-host.d.ts, VoiceHost itself
   *.d.ts          their types
 npm/            the npm package's package.json (version stamped by xtask) and README
 xtask/          the build tooling, `cargo xtask`: the npm package, its smoke test, the release assets, publishing

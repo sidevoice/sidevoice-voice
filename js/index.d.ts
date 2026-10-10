@@ -61,3 +61,15 @@ export declare const VoiceCall: {
    */
   create(models: VoiceModels, config: object, options?: VoiceCallOptions): VoiceCall;
 };
+
+export { createVoiceHost, localStorageProviderKeys } from "./voice-host.js";
+export type {
+  ProviderKeys,
+  VoiceBuild,
+  VoiceHost,
+  VoiceHostError,
+  VoiceHostOptions,
+  VoiceModel,
+  VoiceModelSource,
+  VoiceSettings,
+} from "./voice-host.js";
