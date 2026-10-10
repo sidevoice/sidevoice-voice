@@ -26,16 +26,22 @@ let ioStarted = false;
 // The microphone answers a little later, as a permission prompt does: the call must not listen before it is ready.
 let ready = false;
 let listenedEarly = false;
+let speaker = null;
 const io = {
   start(sink) {
     ioStarted = true;
+    speaker = sink;
     setTimeout(() => {
       ready = true;
       sink.ready();
       sink.captured(new Float32Array(160));
     }, 50);
   },
-  play() {},
+  // Plays at once: each chunk starts and ends as it is queued.
+  play(utterance, chunk) {
+    speaker.chunkStarted(utterance, chunk);
+    speaker.chunkPlayed(utterance, chunk);
+  },
   stopPlayback() {},
   stop() {},
 };
@@ -56,6 +62,12 @@ call.start();
 for (let waited = 0; state?.listening !== "listening" && errors.length === 0 && waited < 5000; waited += 10) {
   await new Promise((resolve) => setTimeout(resolve, 10));
 }
+// Something said: its handle tells the steps and how it ended.
+const saying = call.say("The smoke test speaks this sentence.", { language: "en" });
+const steps = [];
+saying.onEvent((step) => steps.push(step.type));
+const outcome = await Promise.race([saying.outcome, new Promise((resolve) => setTimeout(() => resolve(null), 5000))]);
+const said = { id: typeof saying.id, steps, outcome };
 call.stop();
 console.log(
   JSON.stringify({
@@ -63,6 +75,7 @@ console.log(
     loaded,
     ioStarted,
     listenedEarly,
+    said,
     state,
     errors,
     webAudioIo: typeof createWebAudioIo,

@@ -86,6 +86,7 @@ fn a_smoke_report_must_show_a_running_call() {
         "loaded": SMOKE_SLOTS,
         "ioStarted": true,
         "listenedEarly": false,
+        "said": {"id": "string", "steps": ["playing", "progress", "progress", "done"], "outcome": {"status": "heard"}},
         "state": {"listening": "listening", "recognising": 0, "playback": "idle", "online": true},
         "webAudioIo": "function",
     });
@@ -94,6 +95,7 @@ fn a_smoke_report_must_show_a_running_call() {
         ("loaded", json!(["vad"])),
         ("ioStarted", json!(false)),
         ("listenedEarly", json!(true)),
+        ("said", json!({"id": "string", "steps": ["done"], "outcome": {"status": "not-played", "reason": "stopped"}})),
         ("state", json!(null)),
         ("webAudioIo", json!("undefined")),
     ] {

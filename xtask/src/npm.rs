@@ -138,6 +138,10 @@ fn check_smoke(report: &Value) -> Result<()> {
             "the call listened before its io was ready: {report}"
         ));
     }
+    let said = json!({"id": "string", "steps": ["playing", "progress", "progress", "done"], "outcome": {"status": "heard"}});
+    if report["said"] != said {
+        return Err(format!("what the call said went otherwise: {report}"));
+    }
     if report["state"]["listening"] != "listening" {
         return Err(format!("the call told no listening state: {report}"));
     }

@@ -10,7 +10,7 @@
 #[cfg(all(test, native))]
 mod tests;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -26,8 +26,8 @@ use crate::io::{AudioIo, IoEvent, IoSink};
 use crate::maybe_send::MaybeSend;
 use crate::models::{Models, VadFrame, VoiceModels};
 use crate::residency::Residency;
-use crate::room::RoomEvent;
 use crate::runtime::{monotonic_ms, sleep, spawn, unix_ms};
+use crate::say::{SayEvent, SayOptions, Saying};
 use crate::turns::RATE;
 
 /// How long a stop, or the owner gone, waits behind a message the task is handling (a model that does not answer)
@@ -54,8 +54,15 @@ pub(crate) enum Message {
     Start,
     Stop,
     Config(Box<VoiceConfig>),
-    Room(RoomEvent),
-    Online(bool),
+    /// Say `text`, telling `events` what becomes of it.
+    Say {
+        id: String,
+        text: String,
+        options: SayOptions,
+        events: UnboundedSender<SayEvent>,
+    },
+    /// Cancel what is said under this id.
+    CancelSay(String),
     Mute(bool),
     CancelInput,
     Models(Arc<dyn VoiceModels>, Box<VoiceConfig>),
@@ -77,10 +84,15 @@ pub(crate) enum Message {
 }
 
 /// One voice call. Its methods only send a message to the call's task and return; what comes of them arrives
-/// through the [`Events`] it was created with. Dropping it ends the call.
+/// through the [`Events`] it was created with, and what it says through its handle. Dropping it ends the call.
 #[derive(Debug)]
 pub struct VoiceCall {
     messages: UnboundedSender<Message>,
+    /// The task's own channel, which the handles of what it says cancel through: it outlives the owner's.
+    internal: UnboundedSender<Message>,
+    /// The prefix of the ids the call makes, and how many things it was asked to say.
+    call_id: String,
+    said: AtomicU64,
 }
 
 impl VoiceCall {
@@ -95,10 +107,11 @@ impl VoiceCall {
         let (messages, inbox) = unbounded();
         let (internal, reported) = unbounded();
         let (events, received) = unbounded();
+        let call_id = call_id();
         let driver = Driver {
             call: Call::new(
                 config.clone(),
-                call_id(),
+                call_id.clone(),
                 unix_ms().saturating_sub(monotonic_ms()),
             ),
             residency: Residency::new(config.idle_unload_minutes),
@@ -111,11 +124,18 @@ impl VoiceCall {
             tasks: VecDeque::new(),
             captured: VecDeque::new(),
             taken: 0,
-            messages: internal,
+            messages: internal.clone(),
             events,
+            sayers: HashMap::new(),
         };
         spawn(driver.run(inbox, reported));
-        (Self { messages }, received)
+        let call = Self {
+            messages,
+            internal,
+            call_id,
+            said: AtomicU64::new(0),
+        };
+        (call, received)
     }
 
     /// Loads the models if they are not, opens the microphone and the speaker, and starts listening.
@@ -123,8 +143,8 @@ impl VoiceCall {
         self.send(Message::Start);
     }
 
-    /// Stops listening and speaking: the person's turn not yet reported is cancelled, the reply playing is
-    /// interrupted and the queued ones are dropped. The models stay loaded for the next start.
+    /// Stops listening and speaking: the person's turn not yet reported is cancelled, and what is being said or
+    /// waits to be is not (`stopped`). The models stay loaded for the next start.
     pub fn stop(&self) {
         self.send(Message::Stop);
     }
@@ -135,21 +155,27 @@ impl VoiceCall {
     }
 
     /// Other models, with the configuration they go with, taken together: the models loaded are dropped, and the new
-    /// ones loaded at once if the call is started (it restarts once, on both: the open turn is cancelled and the reply
-    /// playing interrupted), else at the next start. A pair the call cannot run (`smart-turn` without an end-of-turn
+    /// ones loaded at once if the call is started (it restarts once, on both: the open turn is cancelled and what is being
+    /// said stops), else at the next start. A pair the call cannot run (`smart-turn` without an end-of-turn
     /// model) stops it with `end-of-turn-missing`.
     pub fn set_models(&self, models: Arc<dyn VoiceModels>, config: VoiceConfig) {
         self.send(Message::Models(models, Box::new(config)));
     }
 
-    /// A message the room sent.
-    pub fn room_event(&self, event: RoomEvent) {
-        self.send(Message::Room(event));
-    }
-
-    /// Whether the room is in reach: turns reported while it is not say `offline`.
-    pub fn set_online(&self, online: bool) {
-        self.send(Message::Online(online));
+    /// Says `text` after whatever is being said, once nothing of the person's holds it back (an open turn, one being
+    /// transcribed, the grace after one). The handle tells, in order, when it sounds, where the reader is and how it
+    /// ended, and cancels it. Said while the call is stopped, it is not played (`stopped`).
+    pub fn say(&self, text: impl Into<String>, options: SayOptions) -> Saying {
+        let number = self.said.fetch_add(1, Ordering::Relaxed);
+        let id = format!("{}-say-{number}", self.call_id);
+        let (events, received) = unbounded();
+        self.send(Message::Say {
+            id: id.clone(),
+            text: text.into(),
+            options,
+            events,
+        });
+        Saying::new(id, self.internal.clone(), received)
     }
 
     /// Mutes or unmutes the microphone; muting ends the open turn with what was said.
@@ -188,6 +214,8 @@ struct Driver {
     /// The task's own channel, for what the microphone, the speaker and the model tasks report.
     messages: UnboundedSender<Message>,
     events: UnboundedSender<VoiceEvent>,
+    /// The handles of what is being said or waits to be, by id, until each is done.
+    sayers: HashMap<String, UnboundedSender<SayEvent>>,
 }
 
 impl Driver {
@@ -339,8 +367,20 @@ impl Driver {
                     self.start().await;
                 }
             }
-            Message::Room(event) => self.input(Input::Room(event)),
-            Message::Online(online) => self.input(Input::Online(online)),
+            Message::Say {
+                id,
+                text,
+                options,
+                events,
+            } => {
+                self.sayers.insert(id.clone(), events);
+                self.input(Input::Say {
+                    id,
+                    text,
+                    language: options.language,
+                });
+            }
+            Message::CancelSay(id) => self.input(Input::CancelSay(id)),
             Message::Mute(muted) => self.input(Input::Mute(muted)),
             Message::CancelInput => self.input(Input::Cancel),
             Message::Io(IoEvent::Ready) => {
@@ -493,6 +533,15 @@ impl Driver {
             match effect {
                 Effect::Event(event) => {
                     let _ = self.events.unbounded_send(event);
+                }
+                Effect::Say { id, event } => {
+                    let done = matches!(event, SayEvent::Done { .. });
+                    if let Some(sayer) = self.sayers.get(&id) {
+                        let _ = sayer.unbounded_send(event);
+                    }
+                    if done {
+                        self.sayers.remove(&id);
+                    }
                 }
                 Effect::Transcribe {
                     turn,
