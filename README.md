@@ -17,11 +17,11 @@ already have with your agent into a voice call. The agent keeps its context and 
 speaks its replies, and you answer by voice and can interrupt it — from the sofa or on a walk, not only at your desk.
 
 **sidevoice-voice** is the call itself, on the device you call from. It listens to the microphone, tells when you
-start and stop speaking, has what you said transcribed, and reports your turn to the room as text. It takes the
-agent's replies as text, has them spoken, plays them, stops when you speak over them, and reports how much of each
-you heard. It runs models it does not know, through interfaces of its own the app fills (with
-[sidevoice-engine](https://github.com/sidevoice/sidevoice-engine)'s models, say), and holds no socket: the app carries
-its messages to the room and back.
+start and stop speaking, has what you said transcribed, and tells the app your turns as words. It says what the app
+asks it to, plays it, stops when you speak over it, and tells the app how much of it you heard. It runs models it does
+not know, through interfaces of its own the app fills (with
+[sidevoice-engine](https://github.com/sidevoice/sidevoice-engine)'s models, say), and knows nothing of the room:
+only the app talks to it, and the app carries what it hears to the room and what the room sends to it.
 
 ## How it fits
 
@@ -61,14 +61,22 @@ let (call, mut events) = VoiceCall::new(Arc::new(my_models), Box::new(NativeIo::
 call.start(); // loads the models, opens the microphone and the speaker, listens
 while let Some(event) = events.next().await {
     match event {
-        VoiceEvent::RoomMessage(message) => outbox.send(message.to_json()), // to the room, kept until acknowledged
-        VoiceEvent::State(state) => show(state),   // listening, recognising, playback, online
+        VoiceEvent::Turn(TurnEvent::Finished { turn_id, text, .. }) => send_words(turn_id, text),
+        VoiceEvent::Turn(turn) => show_turn(turn),  // started, cancelled
+        VoiceEvent::State(state) => show(state),   // listening, recognising, playback
         VoiceEvent::Level(level) => meter(level),  // the microphone, from 0 to 1
-        VoiceEvent::Karaoke(karaoke) => highlight(karaoke),
         VoiceEvent::Error(error) => tell(error.code),
     }
 }
-// What the room sends: call.room_event(RoomEvent::from_json(&message)?)
+// Something to say: a handle, which tells how it goes and can be cancelled.
+let mut saying = call.say("Hecho, ya está en la rama.", SayOptions::default());
+while let Some(step) = saying.next().await {
+    match step {
+        SayEvent::Playing => {}
+        SayEvent::Progress { sounding, heard_chars } => highlight(sounding, heard_chars),
+        SayEvent::Done { outcome } => report(outcome), // heard, heard up to N, or not played, and why
+    }
+}
 // Other models (another transcriber, say), with the configuration they go with: call.set_models(Arc::new(other),
 // config), which restarts a running call once, on both.
 ```
@@ -76,14 +84,15 @@ while let Some(event) = events.next().await {
 A page does the same with the WebAssembly build: `VoiceCall.create(models, io, config)`, where `models` is a
 JavaScript object with `load()` answering `{vad, transcriber, speaker, endOfTurn?}`, objects with the same methods
 (called through wasm-bindgen's structural imports, `src/models/web.rs`), and `io` a JavaScript microphone and speaker.
-`onEvent(listener)` hears the same events as `{type, data}`, and `roomEvent(message)`, `setConfig`, `setModels`,
-`setOnline`, `mute`, `cancelInput`, `start` and `stop` mirror the Rust methods (`src/web.rs`).
+`onEvent(listener)` hears the same events as `{type, data}`; `say(text, options)` answers a `Saying` (`id`,
+`cancel()`, `onEvent(listener)` for its steps, and `outcome`, a promise); `setConfig`, `setModels`, `mute`,
+`cancelInput`, `start` and `stop` mirror the Rust methods (`src/web.rs`).
 
 - **The configuration** (`VoiceConfig`, read strictly from JSON) names no model: the `language` the transcriber is
   given, the speaker's `voice` and `speed`, what ends a turn (`end_of_turn`: `silence`, or `smart-turn`, which needs
-  an `EndOfTurnModel`), the `patience` (`fast`, `normal`, `calm`), the grace before a reply (`audio_grace_ms`, 1 s),
-  the listening bar, and how long the models stay loaded with the call stopped (`idle_unload_minutes`, 10; 0 drops
-  them as it stops). A new configuration is in effect at once.
+  an `EndOfTurnModel`), the `patience` (`fast`, `normal`, `calm`), the grace before anything is said
+  (`audio_grace_ms`, 1 s), the listening bar, and how long the models stay loaded with the call stopped
+  (`idle_unload_minutes`, 10; 0 drops them as it stops). A new configuration is in effect at once.
 - **`start` loads the models** if they are not loaded. They stay across stops, and are dropped once the call has been
   stopped for `idle_unload_minutes`; the next start loads them again, on the web as natively. `smart-turn` without an
   end-of-turn model refuses to start with `end-of-turn-missing`. A model that cannot load, and every other failure a
@@ -92,9 +101,9 @@ JavaScript object with `load()` answering `{vad, transcriber, speaker, endOfTurn
   call closes the microphone and the speaker, drops the models and the tasks it started, and says it is idle; the next
   start loads the models again.
 - **`AudioIo`** is the microphone and the speaker: capture arrives as 16 kHz mono samples with the echo of the call's
-  own playback already cancelled, and the speaker plays a reply's chunks in order and says when each starts and ends
-  (that is the clock of the heard position). It says when both are ready (`IoEvent::Ready`), and only then does the
-  call listen.
+  own playback already cancelled, and the speaker plays the chunks of what is said in order and says when each
+  starts and ends (that is the clock of the heard position). It says when both are ready (`IoEvent::Ready`), and
+  only then does the call listen.
 - **Which models, and their tuning, are the app's.** The detector's numbers core used and this module was written
   against: a probability of 0.6, speech confirmed after 400 ms, ended after 200 ms.
 
@@ -121,7 +130,7 @@ The call is a pure state machine (`src/call.rs`) with three regions in parallel,
 time; a task around it (`src/voice_call.rs`) feeds it and does what it answers.
 
 - **Listening.** Each window of the app's detector opens a turn when it is speech and loud enough: the window's level (RMS
-  in dBFS, from −60 to 0, smoothed) must clear the listening bar, 0.5, raised to 0.8 while a reply plays and no turn
+  in dBFS, from −60 to 0, smoothed) must clear the listening bar, 0.5, raised to 0.8 while something plays and no turn
   is open. A turn starts with the second of audio before it, ends after the patience's silence (2, 2.5 or 3.5 s on
   top of the detector's own end), when its audio stops arriving for 5 s, or when the microphone is muted, and keeps
   at most a minute. With `smart-turn`, a pause of 0.6, 0.9 or 1.3 s (by patience) is offered to the end-of-turn model
@@ -130,40 +139,28 @@ time; a task around it (`src/voice_call.rs`) feeds it and does what it answers.
   when it is empty, written in no Latin letter for a language that is, or too unlikely; the turn is then
   `cancelled`. Otherwise it waits the merge window (none, 0.5 or 1.5 s by patience): a turn that follows within it
   joins it, and the earlier one is reported `cancelled` with `merged`.
-- **Playback.** A reply is cut into sentence chunks, each synthesized while the one before plays and never further
-  ahead (two chunks at most at the speaker unplayed). A reply waits while the person's turn is open or on its way to
-  the room, and for the grace after it. A turn that opens while a reply is on its way is a barge-in: the speaker
-  stops with a short fade, the reply is `interrupted` (`user_interrupted`; or `unplayed`, `newer_turn`, if it had not
-  sounded) and every queued reply is dropped as `unplayed` (`newer_turn`). A reply written before the person's latest
-  turn (its `revision` below the turn's) is dropped as it arrives, `unplayed` (`newer_turn`), unless it is a replay
-  the person asked for; one that arrives while the call is stopped is `unplayed` (`call_ended`) and never plays. A
-  reply that cannot be spoken is `failed`, what of it was at the speaker is flushed, and its code is an error. A
-  reply sent again under the same id is ignored, unless it is a replay.
+- **Playback.** What the app asks to say is cut into sentence chunks, each synthesized while the one before plays and
+  never further ahead (two chunks at most at the speaker unplayed). It waits while the person's turn is open or being
+  transcribed, and for the grace after it. A turn that opens while something is on its way is a barge-in: the speaker
+  stops with a short fade, what sounded is heard up to where it got, and everything queued is not played
+  (`barge-in`). A cancel through the handle does the same to it alone (`cancelled`); a stop, to all (`stopped`), and
+  what is asked while the call is stopped is not played. What cannot be spoken ends `failed` with its code, which is
+  also an error, and what of it was at the speaker is flushed.
 - **The heard position** moves at chunk boundaries: a chunk counts once its last sample left the speaker, never in
-  part. It is what `heard_chars` reports and what the karaoke shows.
-- **Offline** is a flag, not a state: everything goes on, and a turn that starts offline is reported once, as
-  `finished` with `offline`; the host's outbox keeps the messages until the room acknowledges them.
+  part. It is what a handle's progress and outcome report as `heard_chars`.
 
-## The room's messages
+## Turns and things said
 
-The module holds no socket. It emits, each with a `client_msg_id` for the host's outbox and the room's `voice-ack`:
+The call knows nothing of the room; the app translates both ways.
 
-- `voice-user-turn {turn_id, phase: started | cancelled | finished, text?, language?, offline, started_at, ended_at?,
-  merged, timings_ms?}`. The module names each turn (`turn_id`, the same in every phase; turns may overlap), and the
-  room knows it by that name. `finished` is what becomes the conversation's row. A turn that started while the room
-  was out of reach is reported only as `finished`, with `offline: true`.
-- `voice-playback {utterance_id, status: playing | heard | interrupted | unplayed | failed, heard_chars, reason?,
-  at}`, the input of the room's heard and unheard bookkeeping. `heard_chars` counts Unicode scalar values; `reason`
-  is the room's word (`user_interrupted`, `newer_turn`, `call_ended`), and a failure has none.
-
-It consumes `voice-reply {utterance_id, revision, reply_revision, thread_id, history_id, text, language, replay?}`
-and the room's answer to a started turn, `voice-user-turn {phase: started, session_id, turn_id, revision}`: the revision
-the room gave that turn of this call is its boundary, and a reply written below it is stale. A different `session_id`
-is a room session that replaced the old one: the call starts the old one's boundary over by itself, microphone and
-speaker open. A refusal of a turn's `started` for
-too many open turns (`error {key: room.turns_full, client_msg_id}`) keeps that turn, its words included, and says it
-again once another of its turns ends. It lets every other room message
-through.
+- **Turns** (`VoiceEvent::Turn`, under the call's own `turn_id`, the same in every step): `started {turn_id,
+  started_at}`, then `finished {turn_id, text, language?, started_at, ended_at, merged, timings}` (the words) or
+  `cancelled {turn_id, merged}` (nothing came of it, or it joined the next turn). Turns may overlap: one can be
+  transcribed while the next is spoken.
+- **Things said** (`say(text, {language?})` → a `Saying` handle under the call's own id): `playing`, then
+  `progress {sounding, heard_chars}` as each chunk starts and ends, then `done {outcome}`, the outcome being `heard`,
+  `heard-up-to {heard_chars, reason}` or `not-played {reason}`, with `reason` one of `cancelled`, `barge-in`,
+  `stopped`, `failed {code}`. `heard_chars` counts Unicode scalar values.
 
 ## Status
 
@@ -179,10 +176,10 @@ src/            the crate sidevoice-voice
   call.rs         the state machine: Input and Effect, the three regions
   turns.rs        segmentation: detector windows into turns; turns/level.rs, the listening bar's level
   recognition.rs  the queue and the merge window; recognition/filter.rs, the acceptance filter
-  speech.rs       a reply in sentence chunks
+  speech.rs       a text in sentence chunks
   playback.rs     the playback queue, barge-in and the heard position
-  room.rs         the room's messages (RoomMessage, RoomEvent)
-  event.rs        what a call tells its host (VoiceEvent)
+  event.rs        what a call tells its host (VoiceEvent, TurnEvent)
+  say.rs          something said: SayOptions, the Saying handle, SayEvent and SayOutcome
   config.rs       VoiceConfig
   voice_call.rs   VoiceCall, the task around the state machine
   models.rs       the model interfaces the app implements (VoiceModels, Vad, Transcriber, Speaker, EndOfTurnModel);
