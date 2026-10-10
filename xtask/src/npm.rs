@@ -23,17 +23,14 @@ const SMOKE_JS: &str = include_str!("../npm/smoke.mjs");
 /// The slots the smoke test's models fill, recorded each time the call loads them.
 const SMOKE_SLOTS: [&str; 3] = ["vad", "transcriber", "speaker"];
 /// The calls of the voice seam, `VoiceHost` (js/voice-host.d.ts), sorted.
-const SEAM: [&str; 13] = [
+const SEAM: [&str; 10] = [
     "cancelInput",
-    "hasProviderKey",
-    "models",
     "mute",
     "onError",
     "onLevel",
     "onState",
     "onTurn",
     "say",
-    "setProviderKey",
     "setSettings",
     "start",
     "stop",
@@ -167,11 +164,12 @@ fn check_smoke(report: &Value) -> Result<()> {
     let host = &report["host"];
     let want = json!({
         "missing": "settings-missing", "unknown": "model-unknown", "reloaded": 1,
-        "smartMissing": "end-of-turn-missing", "catalogue": 2, "flags": ["muted"],
+        "smartMissing": "end-of-turn-missing", "flags": ["muted"],
         "early": "not-played", "said": ["function", "heard"],
         "started": "resolved", "again": "resolved", "restarted": "resolved", "afterRestart": "listening",
         "smartLive": ["listening", []],
-        "states": host["states"], "keys": [true, "sk-smoke", false],
+        "states": host["states"],
+        "handed": {"catalog": "smoke", "model": "smoke-stt", "language": "es"}, "voiceOnly": 0,
         "seam": SEAM,
     });
     if *host != want {

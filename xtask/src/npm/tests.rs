@@ -91,12 +91,13 @@ fn a_smoke_report_must_show_a_running_call() {
         "webAudioIo": "function",
         "host": {
             "missing": "settings-missing", "unknown": "model-unknown", "reloaded": 1,
-            "smartMissing": "end-of-turn-missing", "catalogue": 2, "flags": ["muted"],
+            "smartMissing": "end-of-turn-missing", "flags": ["muted"],
             "early": "not-played", "said": ["function", "heard"],
             "started": "resolved", "again": "resolved", "restarted": "resolved", "afterRestart": "listening",
             "smartLive": ["listening", []],
             "states": ["idle", "listening", "idle"],
-            "keys": [true, "sk-smoke", false], "seam": SEAM,
+            "handed": {"catalog": "smoke", "model": "smoke-stt", "language": "es"}, "voiceOnly": 0,
+            "seam": SEAM,
         },
     });
     assert_eq!(check_smoke(&ran), Ok(()));
@@ -119,7 +120,8 @@ fn a_smoke_report_must_show_a_running_call() {
     for (key, value) in [
         ("started", json!("stopped")),
         ("states", json!(["idle", "listening"])),
-        ("keys", json!([false, null, false])),
+        ("handed", json!({"model": "smoke-stt"})),
+        ("voiceOnly", json!(1)),
         ("seam", json!(["start"])),
         ("reloaded", json!(0)),
         ("flags", json!(["listening"])),

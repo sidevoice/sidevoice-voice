@@ -72,14 +72,15 @@ call.stop();
 const callLoaded = loaded.slice();
 const callState = state;
 
-// The voice seam on a page's source of the same models: refusals by code, flags set before the settings kept, a
-// start that resolves once listening and at once after, a start straight after a stop that listens, the models
-// loaded again after a stop with 0 idle minutes, a live switch to smart-turn with an end-of-turn model, smart-turn
-// refused without one, and provider keys in the store it was given.
+// The voice seam on a page's source of the same models: refusals by code, flags set before the settings kept, the
+// slots handed to the source as the page wrote them and a change of voice that asks it nothing, a start that resolves
+// once listening and at once after, a start straight after a stop that listens, the models loaded again after a stop
+// with 0 idle minutes, a live switch to smart-turn with an end-of-turn model, and smart-turn refused without one.
 const code = (promise) => promise.then(() => "resolved", (error) => error.code);
+const asked = [];
 const source = {
-  catalogue: async () => [{ id: "smoke-stt", capabilities: ["stt"] }, { id: "smoke-tts", capabilities: ["tts"] }],
   models: async (settings) => {
+    asked.push(settings);
     if (settings.stt.model !== "smoke-stt") throw Object.assign(new Error("unknown"), { code: "model-unknown" });
     // A build that comes with an end-of-turn model, for smart-turn.
     return settings.stt.build === "ends-turns" ? ending : models;
@@ -90,9 +91,7 @@ const ending = {
     return { ...(await models.load()), endOfTurn: { endOfTurn: async () => 0.9 } };
   },
 };
-const stored = new Map();
-const keys = { get: (p) => stored.get(p) ?? null, set: (p, k) => (k == null ? stored.delete(p) : stored.set(p, k)) };
-const voice = createVoiceHost(source, { io, keys });
+const voice = createVoiceHost(source, { io });
 const states = [];
 const seen = [];
 const hostErrors = [];
@@ -111,9 +110,18 @@ host.early = (await voice.say("Too early.").outcome).status;
 voice.mute(true);
 host.unknown = await code(voice.setSettings({ stt: { model: "nope" }, tts: { model: "smoke-tts" } }));
 await voice.setSettings({
-  stt: { model: "smoke-stt", language: "es" }, tts: { model: "smoke-tts" }, patience: "fast", idle_unload_minutes: 0,
+  stt: { catalog: "smoke", model: "smoke-stt", language: "es" }, tts: { catalog: "smoke", model: "smoke-tts" },
+  patience: "fast", idle_unload_minutes: 0,
 });
+host.handed = asked.at(-1).stt;
 host.started = await code(voice.start());
+// Another voice and speed are the call's own: the source is not asked again.
+const asks = asked.length;
+await voice.setSettings({
+  stt: { model: "smoke-stt", catalog: "smoke", language: "es" }, tts: { catalog: "smoke", model: "smoke-tts", voice: "other", speed: 1.2 },
+  patience: "fast", idle_unload_minutes: 0,
+});
+host.voiceOnly = asked.length - asks;
 const first = seen.find((s) => s.listening !== "idle");
 host.flags = [first?.listening];
 voice.mute(false);
@@ -148,12 +156,7 @@ await voice.setSettings({
 host.smartMissing = await code(voice.start());
 await until(() => states.at(-1) === "idle");
 host.states = states;
-await voice.setProviderKey("openai", "sk-smoke");
-host.keys = [await voice.hasProviderKey("openai"), stored.get("openai")];
-await voice.setProviderKey("openai", null);
-host.keys.push(await voice.hasProviderKey("openai"));
 host.seam = Object.keys(voice).sort();
-host.catalogue = (await voice.models()).length;
 console.log(
   JSON.stringify({
     wasm: wasm.pathname,

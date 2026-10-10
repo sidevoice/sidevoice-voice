@@ -7,7 +7,7 @@ import { createWebAudioIo } from "./web-audio-io.js";
 
 export { default, initSync, IoSink } from "../dist/sidevoice_voice.js";
 export { createWebAudioIo };
-export { createVoiceHost, localStorageProviderKeys } from "./voice-host.js";
+export { createVoiceHost } from "./voice-host.js";
 
 export const VoiceCall = {
   create(models, config, options = {}) {
