@@ -1,12 +1,12 @@
-//! The voice call on the device: the microphone heard as turns of speech, transcribed and reported to the room as
-//! text; the room's replies spoken, played, interrupted when the person speaks over them, and reported as heard or
-//! unheard. The models it runs are the app's, through the module's own interfaces (`models`: [`VoiceModels`], [`Vad`],
-//! [`Transcriber`], [`Speaker`], [`EndOfTurnModel`]); nothing here names or links one. It holds no socket: what it says to the room and what
-//! the room says to it are messages its host carries.
+//! The voice call on the device: the microphone heard as turns of speech, transcribed, and told to the app as words;
+//! what the app asks it to say spoken, played, cut when the person speaks over it, and told back as heard, heard up to
+//! a point, or not played. The models it runs are the app's, through the module's own interfaces (`models`:
+//! [`VoiceModels`], [`Vad`], [`Transcriber`], [`Speaker`], [`EndOfTurnModel`]); nothing here names or links one. It
+//! knows nothing of what the app does with the words or where what it says comes from.
 //!
-//! Inside: `config` ([`VoiceConfig`]), `room` (the room's messages), `event` (what a call tells its host), `turns`
-//! (segmentation: detector windows into turns), `recognition` (the queue, the acceptance filter and the merge
-//! window), `speech` (a reply in sentence chunks), `playback` (the queue, barge-in and the heard position) and `call`
+//! Inside: `config` ([`VoiceConfig`]), `event` (what a call tells its host), `say` (something said and its handle),
+//! `turns` (segmentation: detector windows into turns), `recognition` (the queue, the acceptance filter and the merge
+//! window), `speech` (a text in sentence chunks), `playback` (the queue, barge-in and the heard position) and `call`
 //! (the state machine that runs the three regions).
 
 mod call;
@@ -18,8 +18,8 @@ mod models;
 mod playback;
 mod recognition;
 mod residency;
-mod room;
 mod runtime;
+mod say;
 mod speech;
 mod turns;
 mod voice_call;
@@ -34,12 +34,11 @@ mod test_support;
 #[doc(no_inline)]
 pub use async_trait::async_trait;
 pub use config::{EndOfTurn, ListeningBar, Patience, VoiceConfig};
-pub use event::{CallState, Karaoke, Listening, PlaybackState, VoiceError, VoiceEvent};
+pub use event::{
+    CallState, Listening, PlaybackState, TurnEvent, TurnTimings, VoiceError, VoiceEvent,
+};
 pub use io::{AudioIo, IoEvent, IoSink};
 pub use maybe_send::{MaybeSend, MaybeSync};
 pub use models::{EndOfTurnModel, Models, Speaker, Transcriber, Vad, VadFrame, VoiceModels};
-pub use room::{
-    Playback, PlaybackReason, PlaybackStatus, Reply, RoomEvent, RoomMessage, TurnPhase,
-    TurnTimings, UserTurn,
-};
+pub use say::{SayCancel, SayEvent, SayOptions, SayOutcome, Saying, StopReason};
 pub use voice_call::{Events, VoiceCall};

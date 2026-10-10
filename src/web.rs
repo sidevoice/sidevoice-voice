@@ -12,20 +12,20 @@
 //! - `config` is the configuration as JSON ([`VoiceConfig`]); a malformed one throws.
 //!
 //! Every event reaches the callbacks given to `onEvent`, as `{ type, data }`, the JSON of
-//! [`VoiceEvent`](crate::VoiceEvent).
+//! [`VoiceEvent`](crate::VoiceEvent). `say(text, options)` answers a `Saying` handle.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use futures_util::StreamExt;
-use js_sys::{Array, Float32Array, Function, Reflect, JSON};
+use js_sys::{Array, Float32Array, Function, Promise, Reflect, JSON};
 use wasm_bindgen::prelude::*;
 
 use crate::io::{AudioIo, IoEvent, IoSink};
 use crate::models::JsVoiceModels;
-use crate::room::RoomEvent;
 use crate::runtime::spawn;
+use crate::say::{SayCancel, SayEvent, SayOptions, Saying};
 use crate::voice_call::VoiceCall;
 use crate::VoiceConfig;
 
@@ -94,20 +94,17 @@ impl WebVoiceCall {
         Ok(())
     }
 
-    /// A message the room sent, as `{ type, data }`; messages the call does not use are let through.
-    #[wasm_bindgen(js_name = roomEvent)]
-    pub fn room_event(&self, message: JsValue) -> Result<(), JsError> {
-        let message = json(&message)?;
-        let event =
-            RoomEvent::from_json(&message).map_err(|error| JsError::new(&error.to_string()))?;
-        self.call.room_event(event);
-        Ok(())
-    }
-
-    /// Whether the room is in reach.
-    #[wasm_bindgen(js_name = setOnline)]
-    pub fn set_online(&self, online: bool) {
-        self.call.set_online(online);
+    /// Says `text` (`options`: `{ language? }`) after whatever is being said, and answers its handle.
+    pub fn say(&self, text: String, options: JsValue) -> Result<WebSaying, JsError> {
+        let language = if options.is_undefined() || options.is_null() {
+            None
+        } else {
+            Reflect::get(&options, &"language".into())
+                .ok()
+                .and_then(|language| language.as_string())
+        };
+        let saying = self.call.say(text, SayOptions { language });
+        Ok(WebSaying::new(saying))
     }
 
     /// Mutes or unmutes the microphone.
@@ -119,6 +116,74 @@ impl WebVoiceCall {
     #[wasm_bindgen(js_name = cancelInput)]
     pub fn cancel_input(&self) {
         self.call.cancel_input();
+    }
+}
+
+/// Something the call is saying, for JavaScript: its `id`, `cancel()`, `onEvent(listener)` for its steps in order
+/// (`{ type: "playing" }`, `{ type: "progress", sounding, heard_chars }`, `{ type: "done", outcome }`), and `outcome`, a
+/// promise of how it ended (`{ status: "heard" }`, `{ status: "heard-up-to", heard_chars, reason }`,
+/// `{ status: "not-played", reason }`).
+#[wasm_bindgen(js_name = Saying)]
+pub struct WebSaying {
+    id: String,
+    cancel: SayCancel,
+    listeners: Rc<RefCell<Vec<Function>>>,
+    outcome: Promise,
+}
+
+impl WebSaying {
+    fn new(mut saying: Saying) -> Self {
+        let mut resolve = None;
+        let outcome = Promise::new(&mut |resolved, _| resolve = Some(resolved));
+        let resolve = resolve.expect("the promise's resolve");
+        let listeners: Rc<RefCell<Vec<Function>>> = Rc::default();
+        let heard = Rc::clone(&listeners);
+        let (id, cancel) = (saying.id().to_owned(), saying.canceller());
+        spawn(async move {
+            while let Some(event) = saying.next().await {
+                let json = serde_json::to_string(&event).expect("events serialize");
+                let value = JSON::parse(&json).expect("JSON");
+                for listener in heard.borrow().iter() {
+                    let _ = listener.call1(&JsValue::NULL, &value);
+                }
+                if let SayEvent::Done { outcome } = event {
+                    let json = serde_json::to_string(&outcome).expect("outcomes serialize");
+                    let _ = resolve.call1(&JsValue::NULL, &JSON::parse(&json).expect("JSON"));
+                }
+            }
+        });
+        Self {
+            id,
+            cancel,
+            listeners,
+            outcome,
+        }
+    }
+}
+
+#[wasm_bindgen(js_class = Saying)]
+impl WebSaying {
+    /// The call's id for it.
+    #[wasm_bindgen(getter)]
+    pub fn id(&self) -> String {
+        self.id.clone()
+    }
+
+    /// Cancels it: the part not yet heard is dropped, and its outcome says `cancelled`.
+    pub fn cancel(&self) {
+        self.cancel.cancel();
+    }
+
+    /// Calls `listener` with each of its steps from now on.
+    #[wasm_bindgen(js_name = onEvent)]
+    pub fn on_event(&self, listener: Function) {
+        self.listeners.borrow_mut().push(listener);
+    }
+
+    /// How it ended, once it has.
+    #[wasm_bindgen(getter)]
+    pub fn outcome(&self) -> Promise {
+        self.outcome.clone()
     }
 }
 

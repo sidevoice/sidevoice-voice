@@ -1,4 +1,4 @@
-//! A reply's text in sentence chunks, each spoken on its own so the first sound comes early and the heard position
+//! A text in sentence chunks, each spoken on its own so the first sound comes early and the heard position
 //! moves chunk by chunk. A chunk ends after `.`, `!`, `?`, `…` (or their full-width forms) followed by a space, and
 //! at a line break; a chunk shorter than [`MIN_CHUNK`] characters joins the next one, and one longer than
 //! [`MAX_CHUNK`] is cut after a `,`, `;` or `:`, or else at a space.
@@ -13,7 +13,7 @@ const MIN_CHUNK: usize = 24;
 /// The longest chunk before it is cut, in characters.
 const MAX_CHUNK: usize = 240;
 
-/// One chunk of a reply: its text, trimmed, and where it sits in the reply, in characters.
+/// One chunk of a text: its words, trimmed, and where it sits in the text, in characters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Chunk {
     pub(crate) text: String,
