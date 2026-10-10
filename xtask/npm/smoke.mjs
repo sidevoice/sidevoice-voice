@@ -26,16 +26,22 @@ let ioStarted = false;
 // The microphone answers a little later, as a permission prompt does: the call must not listen before it is ready.
 let ready = false;
 let listenedEarly = false;
+let speaker = null;
 const io = {
   start(sink) {
     ioStarted = true;
+    speaker = sink;
     setTimeout(() => {
       ready = true;
       sink.ready();
       sink.captured(new Float32Array(160));
     }, 50);
   },
-  play() {},
+  // Plays at once: each chunk starts and ends as it is queued.
+  play(utterance, chunk) {
+    speaker.chunkStarted(utterance, chunk);
+    speaker.chunkPlayed(utterance, chunk);
+  },
   stopPlayback() {},
   stop() {},
 };
@@ -56,6 +62,12 @@ call.start();
 for (let waited = 0; state?.listening !== "listening" && errors.length === 0 && waited < 5000; waited += 10) {
   await new Promise((resolve) => setTimeout(resolve, 10));
 }
+// Something said: its handle tells the steps and how it ended.
+const saying = call.say("The smoke test speaks this sentence.", { language: "en" });
+const steps = [];
+saying.onEvent((step) => steps.push(step.type));
+const outcome = await Promise.race([saying.outcome, new Promise((resolve) => setTimeout(() => resolve(null), 5000))]);
+const said = { id: typeof saying.id, steps, outcome };
 call.stop();
 const callLoaded = loaded.slice();
 const callState = state;
@@ -93,8 +105,9 @@ const until = async (done) => {
   for (let waited = 0; !done() && waited < 5000; waited += 10) await new Promise((r) => setTimeout(r, 10));
 };
 const host = { missing: await code(voice.start()) };
-// Offline and muted before any settings: the call they create must start that way.
-voice.setOnline(false);
+// Said before any settings: there is no call, so it is not played.
+host.early = (await voice.say("Too early.").outcome).status;
+// Muted before any settings: the call they create must start that way.
 voice.mute(true);
 host.unknown = await code(voice.setSettings({ stt: { model: "nope" }, tts: { model: "smoke-tts" } }));
 await voice.setSettings({
@@ -102,10 +115,12 @@ await voice.setSettings({
 });
 host.started = await code(voice.start());
 const first = seen.find((s) => s.listening !== "idle");
-host.flags = [first?.listening, first?.online];
+host.flags = [first?.listening];
 voice.mute(false);
-voice.setOnline(true);
 host.again = await code(voice.start());
+// Said with the call listening: heard, its handle telling how.
+const sayingHost = voice.say("The host says this.", { language: "en" });
+host.said = [typeof sayingHost.cancel, (await sayingHost.outcome).status];
 // A stop and a start straight after it, both awaited, no pause: the call ends up listening.
 await voice.stop();
 host.restarted = await code(voice.start());
@@ -145,6 +160,7 @@ console.log(
     loaded: callLoaded,
     ioStarted,
     listenedEarly,
+    said,
     state: callState,
     errors,
     webAudioIo: typeof createWebAudioIo,

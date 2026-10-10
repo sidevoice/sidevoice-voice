@@ -1,14 +1,14 @@
 //! The call as a pure state machine: three regions in parallel, driven by [`Input`]s and a monotonic time in
 //! milliseconds, answering with [`Effect`]s. It holds no socket, no clock and no thread: whoever drives it runs the
-//! models, the speaker and the room, and feeds back what they did.
+//! models and the speaker, and feeds back what they did.
 //!
 //! - **Listening** (`turns`): `Idle → Listening ⇄ Speaking`, and back to `Listening` when a turn ends. A turn's audio
 //!   goes to recognition.
 //! - **Recognition** (`recognition`): turns are transcribed one at a time, filtered, held for the merge window and
-//!   reported as `finished`, `cancelled`, or joined into the next one.
-//! - **Playback** (`playback`): `Idle → Synthesizing → Playing → Idle`, reply by reply. A turn that opens while a
-//!   reply is on its way is a barge-in: the reply stops and every queued one is dropped. A reply waits while the
-//!   person's turn is open or on its way to the room, and for the grace after it.
+//!   reported finished (with the words), cancelled, or joined into the next one.
+//! - **Playback** (`playback`): `Idle → Synthesizing → Playing → Idle`, one thing said after another. A turn that opens
+//!   while something is on its way is a barge-in: it stops and everything queued is dropped. What is to be said waits
+//!   while the person's turn is open or being transcribed, and for the grace after it.
 
 #[cfg(test)]
 mod tests;
@@ -16,13 +16,10 @@ mod tests;
 use std::collections::{HashMap, VecDeque};
 
 use crate::config::{EndOfTurn, VoiceConfig};
-use crate::event::{CallState, Karaoke, Listening, VoiceError, VoiceEvent};
+use crate::event::{CallState, Listening, TurnEvent, TurnTimings, VoiceError, VoiceEvent};
 use crate::playback::{Action, Playback};
 use crate::recognition::{accepted, Job, Outcome, Recognition};
-use crate::room::{
-    Playback as PlaybackReport, PlaybackReason, Reply, RoomEvent, RoomMessage, TurnPhase,
-    TurnTimings, UserTurn,
-};
+use crate::say::{SayEvent, SayOutcome, StopReason};
 use crate::turns::{duration_ms, Segment, Segmentation, Segmenter};
 
 /// What happens to the call.
@@ -30,7 +27,7 @@ use crate::turns::{duration_ms, Segment, Segmentation, Segmenter};
 pub(crate) enum Input {
     /// Start listening.
     Start,
-    /// Stop: the open turn and the turns not yet transcribed are cancelled, and the playback is interrupted.
+    /// Stop: the open turn and the turns not yet transcribed are cancelled, and what is being said stops.
     Stop,
     /// A new configuration.
     Config(Box<VoiceConfig>),
@@ -41,6 +38,14 @@ pub(crate) enum Input {
         turn: usize,
         result: Result<Transcript, String>,
     },
+    /// Say `text` under `id`, in `language` (the configuration's when absent).
+    Say {
+        id: String,
+        text: String,
+        language: Option<String>,
+    },
+    /// Cancel what is said under `id`.
+    CancelSay(String),
     /// A chunk's speech (samples and their rate), or the stable code of why there is none.
     Synthesized {
         utterance: String,
@@ -51,10 +56,6 @@ pub(crate) enum Input {
     ChunkStarted { utterance: String, chunk: usize },
     /// The output played a chunk's last sample.
     ChunkPlayed { utterance: String, chunk: usize },
-    /// A message from the room.
-    Room(RoomEvent),
-    /// Whether the room is in reach.
-    Online(bool),
     /// Whether the microphone is muted: an open turn ends with what was said.
     Mute(bool),
     /// The person cancels what they said that is not reported yet.
@@ -68,17 +69,8 @@ pub(crate) enum Input {
     },
 }
 
-/// How many of the latest turns' ids are kept, to match the room's answers to their `started`.
-const TURN_IDS_KEPT: usize = 16;
-/// How many of the latest `started` and `finished` messages are kept, to match the room's refusals.
-const SENT_KEPT: usize = 32;
-
-/// A turn the room refused for too many open turns: its `started`, and its end once it has one, to send again.
-#[derive(Debug)]
-struct Parked {
-    started: UserTurn,
-    end: Option<UserTurn>,
-}
+/// How many cancels of ids not heard of yet are kept.
+const CANCELS_KEPT: usize = 64;
 
 /// The end-of-turn probability from which a paused turn is over.
 const END_OF_TURN_LIKELY: f32 = 0.5;
@@ -96,6 +88,8 @@ pub(crate) struct Transcript {
 pub(crate) enum Effect {
     /// Tell the host.
     Event(VoiceEvent),
+    /// Tell the handle of what is said under `id`.
+    Say { id: String, event: SayEvent },
     /// Transcribe a turn's 16 kHz audio, then feed [`Input::Transcribed`].
     Transcribe {
         turn: usize,
@@ -130,8 +124,6 @@ pub(crate) enum Effect {
 #[derive(Debug)]
 struct Turn {
     id: String,
-    /// Whether the room was out of reach as it started: then the room hears of it only as `finished`.
-    offline: bool,
     started_ms: u64,
     ended_ms: Option<u64>,
     audio_ms: u64,
@@ -147,23 +139,8 @@ pub(crate) struct Call {
     call_id: String,
     /// The Unix time of the call's millisecond 0.
     epoch_unix_ms: u64,
-    messages: u64,
     started: bool,
     muted: bool,
-    online: bool,
-    /// The latest revision seen on a reply.
-    revision: u64,
-    /// Replies written at a revision below this one answer an older turn than the person's latest.
-    turn_boundary: u64,
-    /// The ids of the latest turns, whose `started` answers from the room count.
-    turn_ids: VecDeque<String>,
-    /// The latest `started` and `finished` messages sent, for a refusal that names one.
-    started_sent: VecDeque<UserTurn>,
-    finished_sent: VecDeque<UserTurn>,
-    /// Turns the room could not take yet (`room.turns_full`), oldest first.
-    parked: VecDeque<Parked>,
-    /// The room session the revisions seen count in, once an answer named it.
-    session: Option<String>,
     segmenter: Segmenter,
     /// The turn being spoken.
     open: Option<usize>,
@@ -171,8 +148,10 @@ pub(crate) struct Call {
     next_turn: usize,
     recognition: Recognition,
     playback: Playback,
-    /// No reply starts before this time (the grace after a turn).
+    /// Nothing starts to be said before this time (the grace after a turn).
     quiet_until: u64,
+    /// Ids cancelled before the call heard of them: said later, they never play.
+    cancelled: VecDeque<String>,
     state: Option<CallState>,
 }
 
@@ -183,23 +162,15 @@ impl Call {
             config,
             call_id,
             epoch_unix_ms,
-            messages: 0,
             started: false,
             muted: false,
-            online: true,
-            revision: 0,
-            turn_boundary: 0,
-            turn_ids: VecDeque::new(),
-            started_sent: VecDeque::new(),
-            finished_sent: VecDeque::new(),
-            parked: VecDeque::new(),
-            session: None,
             open: None,
             turns: HashMap::new(),
             next_turn: 0,
             recognition: Recognition::default(),
             playback: Playback::default(),
             quiet_until: 0,
+            cancelled: VecDeque::new(),
             state: None,
         }
     }
@@ -216,6 +187,18 @@ impl Call {
             }
             Input::Window { pcm, speech } => self.window(now, &pcm, speech, &mut out),
             Input::Transcribed { turn, result } => self.transcribed(now, turn, result, &mut out),
+            Input::Say { id, text, language } => self.say(id, &text, language, &mut out),
+            Input::CancelSay(id) => {
+                let mut actions = Vec::new();
+                if !self.playback.cancel(&id, &mut actions) {
+                    // Not here (yet): a cancel may overtake its own `say`, which then never plays.
+                    self.cancelled.push_back(id);
+                    if self.cancelled.len() > CANCELS_KEPT {
+                        self.cancelled.pop_front();
+                    }
+                }
+                self.act(actions, &mut out);
+            }
             Input::Synthesized {
                 utterance,
                 chunk,
@@ -224,37 +207,18 @@ impl Call {
                 let mut actions = Vec::new();
                 self.playback
                     .synthesized(&utterance, chunk, result, &mut actions);
-                self.act(now, actions, &mut out);
+                self.act(actions, &mut out);
             }
             Input::ChunkStarted { utterance, chunk } => {
                 let mut actions = Vec::new();
                 self.playback.chunk_started(&utterance, chunk, &mut actions);
-                self.act(now, actions, &mut out);
+                self.act(actions, &mut out);
             }
             Input::ChunkPlayed { utterance, chunk } => {
                 let mut actions = Vec::new();
                 self.playback.chunk_played(&utterance, chunk, &mut actions);
-                self.act(now, actions, &mut out);
+                self.act(actions, &mut out);
             }
-            Input::Room(RoomEvent::Reply(reply)) => self.reply(now, reply, &mut out),
-            Input::Room(RoomEvent::TurnStarted {
-                session_id,
-                turn_id,
-                revision,
-            }) => {
-                self.room_session(session_id);
-                // Only an answer about a turn of this call moves its boundary.
-                if self.turn_ids.contains(&turn_id) && revision > self.turn_boundary {
-                    self.turn_boundary = revision;
-                    // Replies already taken that were written before this turn are stale now too.
-                    let mut actions = Vec::new();
-                    self.playback.retire_before(revision, &mut actions);
-                    self.act(now, actions, &mut out);
-                }
-            }
-            Input::Room(RoomEvent::TurnsFull { client_msg_id }) => self.turns_full(&client_msg_id),
-            Input::Room(RoomEvent::Other) => {}
-            Input::Online(online) => self.online = online,
             Input::Mute(muted) => {
                 self.muted = muted;
                 if muted {
@@ -285,14 +249,14 @@ impl Call {
     /// The earliest time [`Call::poll`] has something to do, if any.
     pub(crate) fn deadline(&self) -> Option<u64> {
         let speaking = self.segmenter.speaking();
-        // The grace is a deadline only when its end is all that holds the next reply back.
-        let reply = (self.playback.waiting() && !self.playback.busy() && self.quiet(speaking))
+        // The grace is a deadline only when its end is all that holds the next one back.
+        let say = (self.playback.waiting() && !self.playback.busy() && self.quiet(speaking))
             .then_some(self.quiet_until)
             .filter(|&until| until > 0);
         [
             self.segmenter.deadline(),
             self.recognition.deadline(speaking),
-            reply,
+            say,
         ]
         .into_iter()
         .flatten()
@@ -300,7 +264,7 @@ impl Call {
     }
 
     /// Does what is due at `now`: ends a turn whose audio stopped, reports a transcript whose merge window closed,
-    /// starts a reply whose grace is over.
+    /// starts saying what waited for the grace.
     pub(crate) fn poll(&mut self, now: u64) -> Vec<Effect> {
         let mut out = Vec::new();
         if let Some(segment) = self.segmenter.poll(now) {
@@ -327,15 +291,10 @@ impl Call {
                 let number = self.next_turn;
                 self.next_turn += 1;
                 let id = format!("{}-turn-{number}", self.call_id);
-                self.turn_ids.push_back(id.clone());
-                if self.turn_ids.len() > TURN_IDS_KEPT {
-                    self.turn_ids.pop_front();
-                }
                 self.turns.insert(
                     number,
                     Turn {
-                        id,
-                        offline: !self.online,
+                        id: id.clone(),
                         started_ms: now,
                         ended_ms: None,
                         audio_ms: 0,
@@ -344,13 +303,13 @@ impl Call {
                     },
                 );
                 self.open = Some(number);
-                // What the room wrote up to now answers what came before this turn; the room's answer to `started`
-                // gives the turn's own boundary.
-                self.turn_boundary = self.turn_boundary.max(self.revision + 1);
-                self.report_turn(number, TurnPhase::Started, None, false, out);
+                out.push(Effect::Event(VoiceEvent::Turn(TurnEvent::Started {
+                    turn_id: id,
+                    started_at: self.epoch_unix_ms + now,
+                })));
                 let mut actions = Vec::new();
-                self.playback.interrupt(false, &mut actions);
-                self.act(now, actions, out);
+                self.playback.interrupt(StopReason::BargeIn, &mut actions);
+                self.act(actions, out);
             }
             Segment::Paused { pcm, pause } => {
                 if let Some(turn) = self.open {
@@ -373,7 +332,7 @@ impl Call {
                     Ok(job) => self.transcribe(job, out),
                     Err(_) => {
                         self.error("transcription-queue-full", out);
-                        self.close_turn(now, number, TurnPhase::Cancelled, None, false, out);
+                        self.close_turn(now, number, None, false, out);
                     }
                 }
             }
@@ -410,19 +369,19 @@ impl Call {
             }
         };
         match text {
-            None => self.close_turn(now, turn, TurnPhase::Cancelled, None, false, out),
+            None => self.close_turn(now, turn, None, false, out),
             Some(text) => {
                 if let Some(record) = self.turns.get_mut(&turn) {
                     record.recognised_ms = Some(now);
                 }
                 let merge = u64::from(self.config.patience.merge_window_ms());
                 if merge == 0 {
-                    self.close_turn(now, turn, TurnPhase::Finished, Some(text), false, out);
+                    self.close_turn(now, turn, Some(text), false, out);
                 } else if let Outcome::Joined(joined) =
                     self.recognition.hold(turn, text, now + merge)
                 {
                     for earlier in joined {
-                        self.close_turn(now, earlier, TurnPhase::Cancelled, None, true, out);
+                        self.close_turn(now, earlier, None, true, out);
                     }
                 }
             }
@@ -439,39 +398,46 @@ impl Call {
         }
         turns.sort_unstable();
         for turn in turns {
-            self.close_turn(now, turn, TurnPhase::Cancelled, None, false, out);
+            self.close_turn(now, turn, None, false, out);
         }
     }
 
     fn stop(&mut self, now: u64, out: &mut Vec<Effect>) {
         self.cancel_input(now, out);
         let mut actions = Vec::new();
-        self.playback.interrupt(true, &mut actions);
-        self.act(now, actions, out);
+        self.playback.interrupt(StopReason::Stopped, &mut actions);
+        self.act(actions, out);
         self.started = false;
         // A stop is always answered with the state, even an unchanged one: the host knows it took effect.
         self.state = None;
     }
 
-    /// A reply from the room: queued, or refused unplayed when the call is stopped (`call_ended`) or it was written
-    /// before the person's latest turn (`newer_turn`; a replay the person asked for is never stale).
-    fn reply(&mut self, now: u64, reply: Reply, out: &mut Vec<Effect>) {
-        self.revision = self.revision.max(reply.revision);
-        let mut actions = Vec::new();
-        if !self.started {
-            self.playback
-                .refuse(&reply, PlaybackReason::CallEnded, &mut actions);
-        } else if !reply.replay && reply.revision < self.turn_boundary {
-            self.playback
-                .refuse(&reply, PlaybackReason::NewerTurn, &mut actions);
-        } else {
-            self.playback.push(reply, &mut actions);
+    /// Something to say: queued, or not played at all while the call is stopped.
+    fn say(&mut self, id: String, text: &str, language: Option<String>, out: &mut Vec<Effect>) {
+        let refused =
+            if let Some(index) = self.cancelled.iter().position(|cancelled| *cancelled == id) {
+                self.cancelled.remove(index);
+                Some(StopReason::Cancelled)
+            } else {
+                (!self.started).then_some(StopReason::Stopped)
+            };
+        if let Some(reason) = refused {
+            out.push(Effect::Say {
+                id,
+                event: SayEvent::Done {
+                    outcome: SayOutcome::NotPlayed { reason },
+                },
+            });
+            return;
         }
-        self.act(now, actions, out);
+        let language = language.or_else(|| self.config.language.clone());
+        let mut actions = Vec::new();
+        self.playback.push(id, text, language, &mut actions);
+        self.act(actions, out);
     }
 
-    /// Whether nothing of the person's holds a reply back: the call listens and no turn is open, being transcribed
-    /// or held for the merge window.
+    /// Whether nothing of the person's holds the playback back: the call listens and no turn is open, being
+    /// transcribed or held for the merge window.
     fn quiet(&self, speaking: bool) -> bool {
         self.started
             && !speaking
@@ -492,19 +458,12 @@ impl Call {
                     turn.started_ms = started;
                 }
             }
-            self.close_turn(
-                now,
-                *last,
-                TurnPhase::Finished,
-                Some(pending.text),
-                merged,
-                out,
-            );
+            self.close_turn(now, *last, Some(pending.text), merged, out);
         }
         if self.quiet(speaking) && now >= self.quiet_until && !self.playback.busy() {
             let mut actions = Vec::new();
             self.playback.start(&mut actions);
-            self.act(now, actions, out);
+            self.act(actions, out);
         }
         let state = CallState {
             listening: if !self.started {
@@ -518,7 +477,6 @@ impl Call {
             },
             recognising: self.recognition.len(),
             playback: self.playback.state(),
-            online: self.online,
         };
         if self.state != Some(state) {
             self.state = Some(state);
@@ -526,215 +484,78 @@ impl Call {
         }
     }
 
-    /// Reports a turn's last phase and forgets it; the grace before the next reply starts now.
+    /// Reports a turn's end, finished with `text` or cancelled without, and forgets it; the grace before anything is
+    /// said starts now.
     fn close_turn(
         &mut self,
         now: u64,
         number: usize,
-        phase: TurnPhase,
         text: Option<String>,
         merged: bool,
         out: &mut Vec<Effect>,
     ) {
-        if !self.turns.contains_key(&number) {
+        let Some(turn) = self.turns.remove(&number) else {
             return;
-        }
-        self.report_turn(number, phase, text, merged, out);
-        self.turns.remove(&number);
+        };
+        let event = match text {
+            Some(text) => {
+                let ended = turn.ended_ms.unwrap_or(now);
+                TurnEvent::Finished {
+                    turn_id: turn.id,
+                    language: self.config.language.clone(),
+                    text,
+                    started_at: self.epoch_unix_ms + turn.started_ms,
+                    ended_at: self.epoch_unix_ms + ended,
+                    merged,
+                    timings: TurnTimings {
+                        audio_ms: turn.audio_ms,
+                        endpoint_silence_ms: turn.silence_ms,
+                        recognition_ms: turn.recognised_ms.unwrap_or(now).saturating_sub(ended),
+                    },
+                }
+            }
+            None => TurnEvent::Cancelled {
+                turn_id: turn.id,
+                merged,
+            },
+        };
+        out.push(Effect::Event(VoiceEvent::Turn(event)));
         self.quiet_until = now + u64::from(self.config.audio_grace_ms);
     }
 
-    fn report_turn(
-        &mut self,
-        number: usize,
-        phase: TurnPhase,
-        text: Option<String>,
-        merged: bool,
-        out: &mut Vec<Effect>,
-    ) {
-        let Some(turn) = self.turns.get(&number) else {
-            return;
-        };
-        // A turn that started offline is never `started` to the room, so it has nothing to cancel there either.
-        if turn.offline && phase != TurnPhase::Finished {
-            return;
-        }
-        let timings = turn.ended_ms.map(|ended| TurnTimings {
-            audio_ms: turn.audio_ms,
-            endpoint_silence_ms: turn.silence_ms,
-            recognition_ms: turn
-                .recognised_ms
-                .map(|recognised| recognised.saturating_sub(ended)),
-        });
-        let message = UserTurn {
-            client_msg_id: String::new(),
-            turn_id: turn.id.clone(),
-            phase,
-            language: text.as_ref().and(self.config.language.clone()),
-            text,
-            offline: turn.offline,
-            started_at: self.epoch_unix_ms + turn.started_ms,
-            ended_at: turn.ended_ms.map(|ended| self.epoch_unix_ms + ended),
-            merged,
-            timings,
-        };
-        self.send_turn(message, out);
-    }
-
-    /// Sends a turn's message, or keeps it while the room cannot take the turn (`room.turns_full`): a parked turn's
-    /// end waits with it (its cancel drops it: the room never took it). Each end the room is sent lets the oldest
-    /// parked turn try once more.
-    fn send_turn(&mut self, message: UserTurn, out: &mut Vec<Effect>) {
-        if message.phase != TurnPhase::Started {
-            let waiting = self.parked.iter().position(|parked| {
-                parked.started.turn_id == message.turn_id && parked.end.is_none()
-            });
-            if let Some(index) = waiting {
-                if message.phase == TurnPhase::Finished {
-                    self.parked[index].end = Some(message);
-                } else {
-                    self.parked.remove(index);
-                }
-                return;
-            }
-        }
-        let ended = message.phase != TurnPhase::Started && !message.offline;
-        self.emit_turn(message, out);
-        if ended {
-            if let Some(parked) = self.parked.pop_front() {
-                self.emit_turn(parked.started, out);
-                if let Some(end) = parked.end {
-                    self.emit_turn(end, out);
-                }
-            }
-        }
-    }
-
-    /// Emits a turn's message under a new id, and remembers it for a refusal that may name it.
-    fn emit_turn(&mut self, message: UserTurn, out: &mut Vec<Effect>) {
-        let message = UserTurn {
-            client_msg_id: self.message_id(),
-            ..message
-        };
-        let kept = match message.phase {
-            TurnPhase::Started => Some(&mut self.started_sent),
-            TurnPhase::Finished => Some(&mut self.finished_sent),
-            TurnPhase::Cancelled => None,
-        };
-        if let Some(kept) = kept {
-            kept.push_back(message.clone());
-            if kept.len() > SENT_KEPT {
-                kept.pop_front();
-            }
-        }
-        out.push(Effect::Event(VoiceEvent::RoomMessage(
-            RoomMessage::UserTurn(message),
-        )));
-    }
-
-    /// The room session the latest answer counts in. Another one than before replaced the old session, whose revisions
-    /// mean nothing in it: what counted in the old one starts over (the latest revision seen, the stale-reply boundary,
-    /// the messages sent there). The microphone, the speaker, the open turns and those waiting for room stay.
-    fn room_session(&mut self, session_id: String) {
-        if self
-            .session
-            .as_ref()
-            .is_some_and(|session| *session != session_id)
-        {
-            self.revision = 0;
-            self.turn_boundary = 0;
-            self.started_sent.clear();
-            self.finished_sent.clear();
-        }
-        self.session = Some(session_id);
-    }
-
-    /// The room refused `started` message `client_msg_id` for too many open turns: that turn waits, with its end if
-    /// it has one, for one of the others to end. A turn that ended with no words has nothing to keep.
-    fn turns_full(&mut self, client_msg_id: &str) {
-        let Some(started) = self
-            .started_sent
-            .iter()
-            .find(|sent| sent.client_msg_id == client_msg_id)
-            .cloned()
-        else {
-            return;
-        };
-        if self
-            .parked
-            .iter()
-            .any(|parked| parked.started.turn_id == started.turn_id)
-        {
-            return;
-        }
-        let open = self.turns.values().any(|turn| turn.id == started.turn_id);
-        let end = self
-            .finished_sent
-            .iter()
-            .rev()
-            .find(|sent| sent.turn_id == started.turn_id)
-            .cloned();
-        if open || end.is_some() {
-            self.parked.push_back(Parked { started, end });
-        }
-    }
-
-    /// Turns the playback's actions into effects and reports.
-    fn act(&mut self, now: u64, actions: Vec<Action>, out: &mut Vec<Effect>) {
+    /// Turns the playback's actions into effects.
+    fn act(&mut self, actions: Vec<Action>, out: &mut Vec<Effect>) {
         for action in actions {
-            match action {
+            out.push(match action {
                 Action::Synthesize {
                     utterance,
                     chunk,
                     text,
                     language,
-                } => out.push(Effect::Synthesize {
+                } => Effect::Synthesize {
                     utterance,
                     chunk,
                     text,
                     language,
-                }),
+                },
                 Action::Play {
                     utterance,
                     chunk,
                     samples,
                     sample_rate,
-                } => out.push(Effect::Play {
+                } => Effect::Play {
                     utterance,
                     chunk,
                     samples,
                     sample_rate,
-                }),
-                Action::Stop => out.push(Effect::StopPlayback),
-                Action::Error(code) => self.error(&code, out),
-                Action::Status {
-                    utterance,
-                    status,
-                    heard_chars,
-                    reason,
-                } => {
-                    let report = PlaybackReport {
-                        client_msg_id: self.message_id(),
-                        utterance_id: utterance,
-                        status,
-                        heard_chars,
-                        reason,
-                        at: self.epoch_unix_ms + now,
-                    };
-                    out.push(Effect::Event(VoiceEvent::RoomMessage(
-                        RoomMessage::Playback(report),
-                    )));
-                }
-                Action::Position {
-                    utterance,
-                    chunk,
-                    heard_chars,
-                } => out.push(Effect::Event(VoiceEvent::Karaoke(Karaoke {
-                    utterance_id: utterance,
-                    sounding: chunk.map(|range| (range.start, range.end)),
-                    heard_chars,
-                }))),
-            }
+                },
+                Action::Stop => Effect::StopPlayback,
+                Action::Say { utterance, event } => Effect::Say {
+                    id: utterance,
+                    event,
+                },
+                Action::Error(code) => Effect::Event(VoiceEvent::Error(VoiceError { code })),
+            });
         }
     }
 
@@ -742,11 +563,6 @@ impl Call {
         out.push(Effect::Event(VoiceEvent::Error(VoiceError {
             code: code.to_owned(),
         })));
-    }
-
-    fn message_id(&mut self) -> String {
-        self.messages += 1;
-        format!("{}-{}", self.call_id, self.messages)
     }
 }
 

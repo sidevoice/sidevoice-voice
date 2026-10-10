@@ -23,25 +23,20 @@ const SMOKE_JS: &str = include_str!("../npm/smoke.mjs");
 /// The slots the smoke test's models fill, recorded each time the call loads them.
 const SMOKE_SLOTS: [&str; 3] = ["vad", "transcriber", "speaker"];
 /// The calls of the voice seam, `VoiceHost` (js/voice-host.d.ts), sorted.
-const SEAM: [&str; 18] = [
+const SEAM: [&str; 13] = [
     "cancelInput",
     "hasProviderKey",
     "models",
     "mute",
     "onError",
-    "onKaraoke",
     "onLevel",
-    "onPlayback",
     "onState",
-    "onUserTurn",
-    "roomRefused",
-    "setOnline",
+    "onTurn",
+    "say",
     "setProviderKey",
     "setSettings",
-    "speak",
     "start",
     "stop",
-    "turnStarted",
 ];
 
 fn parse(bytes: &[u8], what: &str) -> Result<Value> {
@@ -159,6 +154,10 @@ fn check_smoke(report: &Value) -> Result<()> {
             "the call listened before its io was ready: {report}"
         ));
     }
+    let said = json!({"id": "string", "steps": ["playing", "progress", "progress", "done"], "outcome": {"status": "heard"}});
+    if report["said"] != said {
+        return Err(format!("what the call said went otherwise: {report}"));
+    }
     if report["state"]["listening"] != "listening" {
         return Err(format!("the call told no listening state: {report}"));
     }
@@ -168,7 +167,8 @@ fn check_smoke(report: &Value) -> Result<()> {
     let host = &report["host"];
     let want = json!({
         "missing": "settings-missing", "unknown": "model-unknown", "reloaded": 1,
-        "smartMissing": "end-of-turn-missing", "catalogue": 2, "flags": ["muted", false],
+        "smartMissing": "end-of-turn-missing", "catalogue": 2, "flags": ["muted"],
+        "early": "not-played", "said": ["function", "heard"],
         "started": "resolved", "again": "resolved", "restarted": "resolved", "afterRestart": "listening",
         "smartLive": ["listening", []],
         "states": host["states"], "keys": [true, "sk-smoke", false],

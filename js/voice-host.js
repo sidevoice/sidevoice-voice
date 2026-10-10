@@ -26,14 +26,26 @@ function stages(settings) {
   return JSON.stringify([stt.model, stt.build ?? null, tts.model, tts.build ?? null, settings.end_of_turn ?? "silence"]);
 }
 
+/** The handle of something said with no call yet: never played (`stopped`), its one step told to listeners as they
+ *  subscribe. */
+function notPlayed() {
+  const outcome = { status: "not-played", reason: "stopped" };
+  return Object.freeze({
+    id: "",
+    cancel() {},
+    onEvent(listener) {
+      queueMicrotask(() => listener({ type: "done", outcome }));
+    },
+    outcome: Promise.resolve(outcome),
+  });
+}
+
 export function createVoiceHost(source, options = {}) {
   const { io, keys = localStorageProviderKeys(), ...webAudio } = options;
-  const listeners = { "user-turn": new Set(), playback: new Set(), state: new Set(), level: new Set(),
-    karaoke: new Set(), error: new Set() };
+  const listeners = { turn: new Set(), state: new Set(), level: new Set(), error: new Set() };
   let call = null;
   let chosen = null;
   // What the page asked for before or after the call exists: every new call starts with it.
-  let online = true;
   let muted = false;
   // The lifecycle: a start asked for and not ended (`active`), the call's last state not idle (`listening`), and a
   // the stops sent whose idle state has not come yet (`stopping`): until each comes, a state from before it is stale.
@@ -50,8 +62,8 @@ export function createVoiceHost(source, options = {}) {
 
   /** One event of the call, `{type, data}`, to its listeners; the lifecycle first. */
   function receive(event) {
-    let kind = event.type;
-    let data = event.data;
+    const kind = event.type;
+    const data = event.data;
     if (kind === "state") {
       const idle = data.listening === "idle";
       if (stopping > 0) {
@@ -68,9 +80,6 @@ export function createVoiceHost(source, options = {}) {
         active = false;
         settle(fail(data.code));
       }
-    } else if (kind === "room-message") {
-      kind = { "voice-user-turn": "user-turn", "voice-playback": "playback" }[data.type];
-      data = data.data;
     }
     for (const listener of (kind && listeners[kind]) || []) {
       try { listener(data); } catch (_) { /* a listener's error is the page's own */ }
@@ -102,7 +111,6 @@ export function createVoiceHost(source, options = {}) {
       if (!call) {
         call = WasmVoiceCall.create(models, io ?? createWebAudioIo(webAudio), config);
         call.onEvent(receive);
-        call.setOnline(online);
         call.mute(muted);
       } else if (models) {
         // Other models with the configuration they go with, together: a live call restarts once, on both.
@@ -131,23 +139,17 @@ export function createVoiceHost(source, options = {}) {
       listening = false;
       call.stop();
     },
-    speak: (reply) => withCall((c) => c.roomEvent({ type: "voice-reply", data: reply })),
-    turnStarted: (started) => withCall((c) => c.roomEvent({ type: "voice-user-turn", data: started })),
-    roomRefused: (refusal) => withCall((c) => c.roomEvent({ type: "error", data: refusal })),
-    setOnline(value) {
-      online = !!value;
-      withCall((c) => c.setOnline(online));
+    say(text, options = {}) {
+      return call ? call.say(String(text), options) : notPlayed();
     },
     mute(value) {
       muted = !!value;
       withCall((c) => c.mute(muted));
     },
     cancelInput: () => withCall((c) => c.cancelInput()),
-    onUserTurn: on("user-turn"),
-    onPlayback: on("playback"),
+    onTurn: on("turn"),
     onState: on("state"),
     onLevel: on("level"),
-    onKaraoke: on("karaoke"),
     onError: on("error"),
     models: () => source.catalogue(),
     async setProviderKey(provider, key) {

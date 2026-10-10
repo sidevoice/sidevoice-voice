@@ -1,6 +1,6 @@
 //! What a call is set up with ([`VoiceConfig`]): the language it listens for, the voice it speaks with, how patient
-//! the end of a turn is, the grace before a reply, the listening bar, and how long idle models stay loaded. It names
-//! no model: which models fill the call's slots is the app's ([`VoiceModels`](crate::VoiceModels)). Read from JSON
+//! the end of a turn is, the grace before anything is said, the listening bar, and how long idle models stay loaded.
+//! It names no model: which models fill the call's slots is the app's ([`VoiceModels`](crate::VoiceModels)). Read from JSON
 //! strictly: an unknown key is an error.
 
 use serde::{Deserialize, Serialize};
@@ -27,7 +27,7 @@ pub struct VoiceConfig {
     /// How long a pause ends a turn, and how long a finished turn waits for the next one to join it.
     #[serde(default)]
     pub patience: Patience,
-    /// How long after a turn ends a reply waits before it starts, in milliseconds.
+    /// How long after a turn ends what is to be said waits before it starts, in milliseconds.
     #[serde(default = "default_audio_grace_ms")]
     pub audio_grace_ms: u32,
     /// How long the models stay loaded while the call is stopped, in minutes (0: they are dropped as it stops). The
@@ -120,7 +120,7 @@ impl Patience {
 pub struct ListeningBar {
     /// The bar while nothing plays.
     pub quiet: f32,
-    /// The bar while a reply plays and no turn is open: what starts a barge-in.
+    /// The bar while something plays and no turn is open: what starts a barge-in.
     pub playing: f32,
 }
 

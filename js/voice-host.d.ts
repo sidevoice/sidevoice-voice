@@ -7,10 +7,17 @@
 // where `source` is the page's `VoiceModelSource`: its catalogue, and the models that fill the call's slots for the
 // person's settings (sidevoice-engine's, wired into `voice-models.d.ts`'s interfaces, say).
 //
-// The payloads are the room's messages as sidevoice-voice writes and reads them (its README, "The room's messages").
+// The call knows nothing of the room: it tells the page the person's turns under its own ids, and says what the page
+// asks it to through a handle that tells how it went (`voice-events.d.ts`). The page translates both ways.
 
 import type { AudioIo, WebAudioIoOptions } from "./web-audio-io.js";
 import type { VoiceModels } from "./voice-models.js";
+import type {
+  VoiceCallState,
+  VoiceSaying,
+  VoiceSayOptions,
+  VoiceTurnEvent,
+} from "./voice-events.js";
 
 /** The person's choices. Each host fills the rest: the voice activity detector, the builds, grace, listening bar. */
 export interface VoiceSettings {
@@ -34,94 +41,6 @@ export interface VoiceSettings {
   /** How long the models stay in memory with the call stopped, in minutes (10 by default; 0: they leave as it stops).
    *  The next `start` loads them again. */
   idle_unload_minutes?: number;
-}
-
-/** One phase of a turn of the person's speech: `voice-user-turn`'s `data`. */
-export interface VoiceUserTurn {
-  /** Unique per message: the outbox's id and what the room acknowledges. */
-  client_msg_id: string;
-  /** The call's name for the turn: the same in every phase, and how the room knows it. Turns may overlap. */
-  turn_id: string;
-  /** A turn that started while offline is only ever `finished`. */
-  phase: "started" | "cancelled" | "finished";
-  /** In `finished`, and in a `cancelled` merged into the next turn. */
-  text?: string;
-  language?: string;
-  /** The turn started while `setOnline(false)`: the room takes its `finished` as words said while away. */
-  offline: boolean;
-  /** Unix milliseconds. */
-  started_at: number;
-  ended_at?: number;
-  /** `finished`: it joined earlier turns. `cancelled`: it was joined into the next. */
-  merged: boolean;
-  timings_ms?: { audio_ms: number; endpoint_silence_ms: number; recognition_ms?: number };
-}
-
-/** What became of a reply: `voice-playback`'s `data`. Per utterance: `playing` (if it sounds), then exactly one of
- *  `heard`, `interrupted`, `unplayed`, `failed`. */
-export interface VoicePlayback {
-  client_msg_id: string;
-  utterance_id: string;
-  status: "playing" | "heard" | "interrupted" | "unplayed" | "failed";
-  /** Characters (Unicode scalar values) of the text heard from its start, at chunk boundaries. */
-  heard_chars: number;
-  /** Why it stopped short or never played, in the room's words. A `failed` one has none: its code is an `error`. */
-  reason?: "user_interrupted" | "newer_turn" | "call_ended";
-  /** Unix milliseconds. */
-  at: number;
-}
-
-/** The room's answer to a turn's `started`: `voice-user-turn`'s `data` with `phase: "started"`, as the room sent it. */
-export interface VoiceTurnStarted {
-  phase: "started";
-  /** The room session `revision` counts in (opaque): the same after a resume; another one replaced the old session,
-   *  and the call starts its stale-reply boundary over by itself. */
-  session_id: string;
-  /** The call's `turn_id`, echoed. */
-  turn_id: string;
-  /** The revision the room gave the turn: a reply written below it answers an older turn. */
-  revision: number;
-  thread_id?: string | null;
-}
-
-/** A refusal the room sent about one of the call's messages: the `error` frame's `data`, as the room sent it. */
-export interface VoiceRoomRefusal {
-  /** The refusal's stable key: `room.turns_full` (a turn's `started` while the call has as many turns open as the
-   *  room keeps) is the one the call acts on; others are ignored. */
-  key: string;
-  /** The message it refuses. */
-  client_msg_id?: string;
-  message?: string;
-}
-
-/** A reply the room wants spoken: `voice-reply`'s `data`, as the room sent it. */
-export interface VoiceReply {
-  utterance_id: string;
-  revision: number;
-  reply_revision: number;
-  thread_id: string;
-  history_id: string;
-  text: string;
-  language?: string | null;
-  /** Said again because the person asked: spoken even though its id was seen. */
-  replay?: boolean;
-}
-
-/** Where the call is. */
-export interface VoiceState {
-  listening: "idle" | "muted" | "listening" | "speaking";
-  /** Turns waiting for, or in, transcription. */
-  recognising: number;
-  playback: "idle" | "synthesizing" | "playing";
-  online: boolean;
-}
-
-/** Where the reader of a reply is, in characters of its text. Only for utterances given to `speak`. */
-export interface VoiceKaraoke {
-  utterance_id: string;
-  /** The chunk sounding now, `[from, to)`; null between chunks. */
-  sounding: [number, number] | null;
-  heard_chars: number;
 }
 
 /** What a failed call rejects with, and what `onError` hears: rely on `code`. The desktop app adds its `key`. */
@@ -177,32 +96,25 @@ export interface VoiceHost {
    *  state whose `listening` is not `idle` (at once if the call listens already; a second `start` while one is pending
    *  settles with it). Rejects `VoiceHostError`; with `{code: "stopped"}` when `stop()` comes first. */
   start(): Promise<void>;
-  /** Stops listening and speaking: the turn not reported is cancelled, the reply playing interrupted, the queue
-   *  dropped. The models stay loaded. Safe at any time; a `start` after it, awaited or not, starts the call again. */
+  /** Stops listening and speaking: the turn not told yet is cancelled, and what is being said or waits to be ends
+   *  (`stopped`). The models stay loaded. Safe at any time; a `start` after it, awaited or not, starts the call
+   *  again. */
   stop(): Promise<void>;
-  /** A room `voice-reply`'s `data`. A reply whose `utterance_id` was seen is ignored unless `replay`. */
-  speak(reply: VoiceReply): void;
-  /** The room's answer to a turn's `started` (`VoiceTurnStarted`): the call drops replies written before that turn. */
-  turnStarted(started: VoiceTurnStarted): void;
-  /** A refusal the room sent naming one of the call's messages (`VoiceRoomRefusal`): a turn refused for too many open
-   *  turns keeps its words and is said again when another ends. */
-  roomRefused(refusal: VoiceRoomRefusal): void;
-  /** Whether the room is in reach: turns emitted while it is not carry `offline: true`. Kept from the first call, even
-   *  before `setSettings`. */
-  setOnline(online: boolean): void;
+  /** Says `text` after whatever is being said, once nothing of the person's holds it back. The handle tells its steps
+   *  and how it ended, and cancels it. Before `setSettings`, or with the call stopped, its outcome is `not-played`
+   *  (`stopped`). */
+  say(text: string, options?: VoiceSayOptions): VoiceSaying;
   /** Mutes or unmutes the microphone; muting ends the open turn with what was said. Kept from the first call, even
    *  before `setSettings`. */
   mute(muted: boolean): void;
-  /** Cancels what the person said that is not reported yet. */
+  /** Cancels what the person said that is not told yet. */
   cancelInput(): void;
-  /** For each `turn_id`: `started`, then exactly one `finished` or `cancelled`. */
-  onUserTurn(listener: (turn: VoiceUserTurn) => void): () => void;
-  onPlayback(listener: (report: VoicePlayback) => void): () => void;
+  /** For each `turn_id`: `started`, then exactly one `finished` (the words) or `cancelled`. */
+  onTurn(listener: (turn: VoiceTurnEvent) => void): () => void;
   /** The state, each time it changes (the first once the call starts). */
-  onState(listener: (state: VoiceState) => void): () => void;
+  onState(listener: (state: VoiceCallState) => void): () => void;
   /** The microphone's level, 0 to 1, once per detector window (about 30 a second). */
   onLevel(listener: (level: number) => void): () => void;
-  onKaraoke(listener: (karaoke: VoiceKaraoke) => void): () => void;
   onError(listener: (error: VoiceHostError) => void): () => void;
   /** The catalogue the settings choose from (the model source's). */
   models(): Promise<VoiceModel[]>;
