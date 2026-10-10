@@ -1,6 +1,7 @@
 name: ci
 
-# Every pull request: format and Clippy (native and wasm32), the tests on macOS and Linux, and the wasm32 build.
+# Every pull request: format and Clippy (native and wasm32), and the tests on macOS and Linux and on wasm32 in Node:
+# the call on recorded speech, with fake models. Real models run in the apps' CI, which wire them in.
 on:
   # Into any branch, so a pull request stacked on another is checked before its base merges.
   pull_request:
@@ -40,12 +41,14 @@ jobs:
       - uses: ./.github/actions/setup
       - run: cargo test --locked
 
-  build-wasm:
-    name: Build wasm
+  test-wasm:
+    name: Test wasm (Node)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: ./.github/actions/setup
         with:
           wasm: true
-      - run: cargo build --locked --target wasm32-unknown-unknown
+      # The module's tests compiled to wasm32 and run in Node by wasm-bindgen-test-runner (the runner in
+      # .cargo/config.toml; doctests cannot run on wasm32).
+      - run: cargo test --locked --target wasm32-unknown-unknown --lib

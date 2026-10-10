@@ -1,0 +1,6 @@
+# `cargo test --target wasm32-unknown-unknown --lib` runs the module's tests in Node through the wasm-bindgen CLI's
+# test runner, which must be on the PATH at the version of `wasm-bindgen` in Cargo.lock (.github/actions/setup
+# installs it in CI). Doctests are left out: rustdoc cannot run them on wasm32.
+[target.wasm32-unknown-unknown]
+runner = "wasm-bindgen-test-runner"
+

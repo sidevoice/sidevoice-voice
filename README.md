@@ -17,17 +17,18 @@ already have with your agent into a voice call. The agent keeps its context and 
 speaks its replies, and you answer by voice and can interrupt it — from the sofa or on a walk, not only at your desk.
 
 **sidevoice-voice** is the call itself, on the device you call from. It listens to the microphone, tells when you
-start and stop speaking, has what you said transcribed, and reports your turn to the room as text. It takes the
-agent's replies as text, has them spoken, plays them, stops when you speak over them, and reports how much of each
-you heard. It runs every model through [sidevoice-engine](https://github.com/sidevoice/sidevoice-engine), local or
-remote alike, and holds no socket: the app carries its messages to the room and back.
+start and stop speaking, has what you said transcribed, and tells the app your turns as words. It says what the app
+asks it to, plays it, stops when you speak over it, and tells the app how much of it you heard. It runs models it does
+not know, through interfaces of its own the app fills (with
+[sidevoice-engine](https://github.com/sidevoice/sidevoice-engine)'s models, say), and knows nothing of the room:
+only the app talks to it, and the app carries what it hears to the room and what the room sends to it.
 
 ## How it fits
 
 | Piece | Role |
 |---|---|
 | **sidevoice-voice** (this repository) | The call on the device: capture, echo cancellation, turns, transcription, speech, playback, barge-in, and what was heard. |
-| [sidevoice-engine](https://github.com/sidevoice/sidevoice-engine) | The models: the catalogue, which build fits here, and the backends that run them (voice activity, speech to text, text to speech). |
+| [sidevoice-engine](https://github.com/sidevoice/sidevoice-engine) | The models: the catalogue, which build fits here, and the backends that run them. The apps wire its models into this module's interfaces; this module does not depend on it. |
 | [sidevoice-core](https://github.com/sidevoice/sidevoice-core) | The room: the conversations, presence, routing to the agents, and the bookkeeping of what was heard. Text and events only, no audio. |
 | [sidevoice-connector](https://github.com/sidevoice/sidevoice-connector) | What you install on the machine where your agents run. It gives them their voice tools and runs the core. |
 | [sidevoice-desktop](https://github.com/sidevoice/sidevoice-desktop) | The app you call from: it compiles this crate in, with native capture and playback. |
@@ -37,18 +38,162 @@ One Rust repository, one version, shaped like sidevoice-engine. Native consumers
 crate at a release's git tag and compile it themselves; the web gets a WebAssembly build, published on npm as
 `@sidevoice/voice`. The design is [sidevoice-core#89](https://github.com/sidevoice/sidevoice-core/issues/89).
 
+## Using a call
+
+The call runs models it does not know: the app supplies them through the module's own interfaces, and chooses which
+model fills each slot. Natively they are Rust traits (`src/models.rs`; implement them with the re-exported
+`#[async_trait]`):
+
+| Interface | What it does |
+|---|---|
+| `Vad` | A voice activity detector's stream over 16 kHz mono audio: `accept(pcm)` answers one `VadFrame {end, speech, probability?}` per window; speech starts and ends where `speech` changes. `reset()` starts over. |
+| `Transcriber` | `transcribe(pcm, sample_rate, language?)` → the text. |
+| `Speaker` | `speak(text, voice?, language?, speed)` → mono samples and their rate. |
+| `EndOfTurnModel` | Optional: `end_of_turn(pcm, sample_rate)` → the probability that the turn is over, for `smart-turn`. |
+| `VoiceModels` | `load()` → `Models {vad, transcriber, speaker, end_of_turn?}`: called as the call starts; what it returned is dropped once the call has been stopped for `idle_unload_minutes`. |
+
+A native app (the desktop app, wiring sidevoice-engine's models into these) creates a call with them, a microphone
+and speaker (`AudioIo`), and a configuration, and runs it on its Tokio runtime:
+
+```rust
+let config: VoiceConfig = serde_json::from_value(json!({"language": "es", "voice": "ef_dora", "patience": "normal"}))?;
+let (call, mut events) = VoiceCall::new(Arc::new(my_models), io, config);
+call.start(); // loads the models, opens the microphone and the speaker, listens
+while let Some(event) = events.next().await {
+    match event {
+        VoiceEvent::Turn(TurnEvent::Finished { turn_id, text, .. }) => send_words(turn_id, text),
+        VoiceEvent::Turn(turn) => show_turn(turn),  // started, cancelled
+        VoiceEvent::State(state) => show(state),   // listening, recognising, playback
+        VoiceEvent::Level(level) => meter(level),  // the microphone, from 0 to 1
+        VoiceEvent::Error(error) => tell(error.code),
+    }
+}
+// Something to say: a handle, which tells how it goes and can be cancelled.
+let mut saying = call.say("Hecho, ya está en la rama.", SayOptions::default());
+while let Some(step) = saying.next().await {
+    match step {
+        SayEvent::Playing => {}
+        SayEvent::Progress { sounding, heard_chars } => highlight(sounding, heard_chars),
+        SayEvent::Done { outcome } => report(outcome), // heard, heard up to N, or not played, and why
+    }
+}
+// Other models (another transcriber, say), with the configuration they go with: call.set_models(Arc::new(other),
+// config), which restarts a running call once, on both.
+```
+
+A page does the same with the WebAssembly build: `VoiceCall.create(models, io, config)`, where `models` is a
+JavaScript object with `load()` answering `{vad, transcriber, speaker, endOfTurn?}`, objects with the same methods
+(called through wasm-bindgen's structural imports, `src/models/web.rs`), and `io` a JavaScript microphone and speaker.
+`onEvent(listener)` hears the same events as `{type, data}`; `say(text, options)` answers a `Saying` (`id`,
+`cancel()`, `onEvent(listener)` for its steps, and `outcome`, a promise); `setConfig`, `setModels`, `mute`,
+`cancelInput`, `start` and `stop` mirror the Rust methods (`src/web.rs`).
+
+- **The configuration** (`VoiceConfig`, read strictly from JSON) names no model: the `language` the transcriber is
+  given, the speaker's `voice` and `speed`, what ends a turn (`end_of_turn`: `silence`, or `smart-turn`, which needs
+  an `EndOfTurnModel`), the `patience` (`fast`, `normal`, `calm`), the grace before anything is said
+  (`audio_grace_ms`, 1 s), the listening bar, and how long the models stay loaded with the call stopped
+  (`idle_unload_minutes`, 10; 0 drops them as it stops). A new configuration is in effect at once.
+- **`start` loads the models** if they are not loaded. They stay across stops, and are dropped once the call has been
+  stopped for `idle_unload_minutes`; the next start loads them again, on the web as natively. `smart-turn` without an
+  end-of-turn model refuses to start with `end-of-turn-missing`. A model that cannot load, and every other failure a
+  person may be told of, is a `VoiceEvent::Error` with a stable code.
+- **A stop, or dropping the call, never waits on a model that does not answer**: after half a second behind one, the
+  call closes the microphone and the speaker, drops the models and the tasks it started, and says it is idle; the next
+  start loads the models again.
+- **`AudioIo`** is the microphone and the speaker: capture arrives as 16 kHz mono samples with the echo of the call's
+  own playback already cancelled, and the speaker plays the chunks of what is said in order and says when each
+  starts and ends (that is the clock of the heard position). It says when both are ready (`IoEvent::Ready`), and
+  only then does the call listen.
+- **Which models, and their tuning, are the app's.** The detector's numbers core used and this module was written
+  against: a probability of 0.6, speech confirmed after 400 ms, ended after 200 ms.
+
+## What the call does
+
+The call is a pure state machine (`src/call.rs`) with three regions in parallel, driven by events and a monotonic
+time; a task around it (`src/voice_call.rs`) feeds it and does what it answers.
+
+- **Listening.** Each window of the app's detector opens a turn when it is speech and loud enough: the window's level (RMS
+  in dBFS, from −60 to 0, smoothed) must clear the listening bar, 0.5, raised to 0.8 while something plays and no turn
+  is open. A turn starts with the second of audio before it, ends after the patience's silence (2, 2.5 or 3.5 s on
+  top of the detector's own end), when its audio stops arriving for 5 s, or when the microphone is muted, and keeps
+  at most a minute. With `smart-turn`, a pause of 0.6, 0.9 or 1.3 s (by patience) is offered to the end-of-turn model
+  once; a probability of 0.5 or more ends the turn there, and a pause of 2.5, 3 or 4 s ends it anyway.
+- **Recognition.** Turns are transcribed in order, one at a time, at most eight waiting. A transcript is dropped
+  when it is empty, written in no Latin letter for a language that is, or too unlikely; the turn is then
+  `cancelled`. Otherwise it waits the merge window (none, 0.5 or 1.5 s by patience): a turn that follows within it
+  joins it, and the earlier one is reported `cancelled` with `merged`.
+- **Playback.** What the app asks to say is cut into sentence chunks, each synthesized while the one before plays and
+  never further ahead (two chunks at most at the speaker unplayed). It waits while the person's turn is open or being
+  transcribed, and for the grace after it. A turn that opens while something is on its way is a barge-in: the speaker
+  stops with a short fade, what sounded is heard up to where it got, and everything queued is not played
+  (`barge-in`). A cancel through the handle does the same to it alone (`cancelled`); a stop, to all (`stopped`), and
+  what is asked while the call is stopped is not played. What cannot be spoken ends `failed` with its code, which is
+  also an error, and what of it was at the speaker is flushed.
+- **The heard position** moves at chunk boundaries: a chunk counts once its last sample left the speaker, never in
+  part. It is what a handle's progress and outcome report as `heard_chars`.
+
+## Turns and things said
+
+The call knows nothing of the room; the app translates both ways.
+
+- **Turns** (`VoiceEvent::Turn`, under the call's own `turn_id`, the same in every step): `started {turn_id,
+  started_at}`, then `finished {turn_id, text, language?, started_at, ended_at, merged, timings}` (the words) or
+  `cancelled {turn_id, merged}` (nothing came of it, or it joined the next turn). Turns may overlap: one can be
+  transcribed while the next is spoken.
+- **Things said** (`say(text, {language?})` → a `Saying` handle under the call's own id): `playing`, then
+  `progress {sounding, heard_chars}` as each chunk starts and ends, then `done {outcome}`, the outcome being `heard`,
+  `heard-up-to {heard_chars, reason}` or `not-played {reason}`, with `reason` one of `cancelled`, `barge-in`,
+  `stopped`, `failed {code}`. `heard_chars` counts Unicode scalar values.
+
 ## Status
 
-A skeleton: the repository, its rules and its CI. The call lands in the pull requests that follow.
+The state machine and its task, on the app's models through the module's interfaces, natively and in the browser.
+Still to come: the native microphone and speaker with echo cancellation (cpal and WebRTC AEC3), the browser's
+(`getUserMedia` and Web Audio), and the npm package.
+
+## Layout
+
+```
+src/            the crate sidevoice-voice
+  lib.rs          the front door: declares the packages, exports the public API
+  call.rs         the state machine: Input and Effect, the three regions
+  turns.rs        segmentation: detector windows into turns; turns/level.rs, the listening bar's level
+  recognition.rs  the queue and the merge window; recognition/filter.rs, the acceptance filter
+  speech.rs       a text in sentence chunks
+  playback.rs     the playback queue, barge-in and the heard position
+  event.rs        what a call tells its host (VoiceEvent, TurnEvent)
+  say.rs          something said: SayOptions, the Saying handle, SayEvent and SayOutcome
+  config.rs       VoiceConfig
+  voice_call.rs   VoiceCall, the task around the state machine
+  models.rs       the model interfaces the app implements (VoiceModels, Vad, Transcriber, Speaker, EndOfTurnModel);
+                  models/web.rs, the page's JavaScript models through structural imports (wasm32)
+  residency.rs    when idle models are dropped
+  io.rs           AudioIo, the microphone and the speaker
+  runtime.rs      spawning, sleeping and clocks; runtime/native.rs (Tokio), runtime/web.rs (the browser)
+  web.rs          the bridge to JavaScript, only in the wasm32 build
+  maybe_send.rs   Send and Sync in native builds only
+tests/          fixtures/, the recorded clips the unit tests hear
+build.rs        the two cfg aliases: web, native
+```
 
 ## Build and test
 
-You need Rust 1.98.1 (the version `.github/actions/setup` installs). The wasm32 build needs the
-`wasm32-unknown-unknown` target.
+You need Rust 1.98.1 (the version `.github/actions/setup` installs). The module links no model runtime.
+
+The tests drive the state machine with the recorded clips of `tests/fixtures` and a detector on energy, and the task
+with fake models (a fake end-of-turn classifier among them) and a fake microphone and speaker; nothing is downloaded.
+The call with real models is the apps' to run: they wire the models in, and their CI fails when a model and this
+module do not fit.
 
 ```sh
 cargo test --locked
-cargo build --locked --target wasm32-unknown-unknown
+```
+
+The wasm32 tests run in Node and need the wasm32 target, Node.js, and the wasm-bindgen CLI at the version of
+`wasm-bindgen` in `Cargo.lock` on the `PATH`:
+
+```sh
+cargo test --locked --target wasm32-unknown-unknown --lib
 ```
 
 ## Contributing

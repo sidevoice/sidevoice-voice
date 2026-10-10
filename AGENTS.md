@@ -17,14 +17,16 @@ Rules for any coding agent (and person) working in this repository.
 Read `README.md` (what the module is and where things are). The repository is Rust only: one crate (`src/`), and,
 as it grows, the build tooling `cargo xtask` (`xtask/`). The design is sidevoice-core#89.
 
-- **The module holds no socket.** What it reports to the room and what the room sends it are serde messages; the
-  app carries them, keeps the outbox and the acknowledgements. Nothing here knows the room's address.
+- **The module knows nothing of the room.** Only the app talks to it: it tells the app the person's turns (under its
+  own ids) and how what it was asked to say went (through each `say` handle), and the app translates both ways. No
+  room message, revision, session or room rule belongs here.
 - **The call is a pure state machine.** It is driven by events and a monotonic time argument, and answers with what
-  to do: no I/O, no clock, no threads in it. Capture, playback, the engine's models and the room are around it, and
+  to do: no I/O, no clock, no threads in it. Capture, playback and the app's models are around it, and
   the tests drive it with recorded audio and fakes.
-- **Every model goes through sidevoice-engine.** Voice activity, speech to text and text to speech, local or remote,
-  are engine capabilities; the module never links a model runtime of its own and never holds a provider's key beyond
-  handing the app's to the engine.
+- **The models are the app's.** Voice activity, speech to text, text to speech and end of turn reach the call
+  through the module's own interfaces (`src/models.rs`), which the app implements (with sidevoice-engine, say). The
+  module names no model, links no model runtime and depends on no engine; which model fills each slot, and its keys,
+  are the app's.
 - **No compatibility code.** There are no users yet: a change replaces what it changes, without fallbacks, migrations
   or support for older messages.
 - **Everything is closed by default.** Each item gets the narrowest visibility that works: private, then
