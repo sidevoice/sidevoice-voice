@@ -23,6 +23,9 @@ pub(crate) const AHEAD: usize = 2;
 pub(crate) struct Utterance {
     pub(crate) id: String,
     pub(crate) language: Option<String>,
+    /// The room's revision it was written at, and whether it is a replay the person asked for (never stale).
+    revision: u64,
+    replay: bool,
     chars: usize,
     chunks: Vec<Chunk>,
 }
@@ -101,6 +104,8 @@ impl Playback {
         self.queue.push_back(Utterance {
             id: reply.utterance_id,
             language: reply.language,
+            revision: reply.revision,
+            replay: reply.replay,
             chars: reply.text.chars().count(),
             chunks,
         });
@@ -289,6 +294,42 @@ impl Playback {
         }
         for utterance in self.queue.drain(..) {
             actions.push(ended(&utterance.id, PlaybackStatus::Unplayed, 0, dropped));
+        }
+    }
+
+    /// Retires every reply written before `boundary` (a turn of the person's the room has since taken), but replays
+    /// the person asked for: the one being spoken stops (interrupted if it had sounded, unplayed if not), and the
+    /// queued ones are dropped as unplayed, all for a `newer_turn`.
+    pub(crate) fn retire_before(&mut self, boundary: u64, actions: &mut Vec<Action>) {
+        let stale = |utterance: &Utterance| !utterance.replay && utterance.revision < boundary;
+        if self
+            .current
+            .as_ref()
+            .is_some_and(|current| stale(&current.utterance))
+        {
+            let current = self.current.take().expect("the current reply");
+            actions.push(Action::Stop);
+            let state = if current.started {
+                PlaybackStatus::Interrupted
+            } else {
+                PlaybackStatus::Unplayed
+            };
+            actions.push(ended(
+                &current.utterance.id,
+                state,
+                heard(&current),
+                PlaybackReason::NewerTurn,
+            ));
+        }
+        let (retired, kept) = self.queue.drain(..).partition::<Vec<_>, _>(stale);
+        self.queue = kept.into();
+        for utterance in retired {
+            actions.push(ended(
+                &utterance.id,
+                PlaybackStatus::Unplayed,
+                0,
+                PlaybackReason::NewerTurn,
+            ));
         }
     }
 

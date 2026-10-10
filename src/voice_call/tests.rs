@@ -1,7 +1,7 @@
 //! The call's task on fakes: models that detect on energy, transcribe to a fixed text and speak silence, and a
 //! microphone and speaker the test plays by hand, on a Tokio runtime as an app runs it.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -24,6 +24,8 @@ struct FakeModels {
     /// How many times the models were loaded, and how many detectors are alive (one per load not dropped yet).
     loads: Arc<AtomicUsize>,
     alive: Arc<AtomicUsize>,
+    /// Once set, the detector never answers again.
+    hang: Arc<AtomicBool>,
 }
 
 #[async_trait]
@@ -40,6 +42,7 @@ impl VoiceModels for FakeModels {
                 pending: Vec::new(),
                 end: 0,
                 alive: Arc::clone(&self.alive),
+                hang: Arc::clone(&self.hang),
             }),
             transcriber: Arc::new(FakeTranscriber),
             speaker: Arc::new(FakeSpeaker),
@@ -53,6 +56,7 @@ struct FakeDetector {
     pending: Vec<f32>,
     end: u64,
     alive: Arc<AtomicUsize>,
+    hang: Arc<AtomicBool>,
 }
 
 impl Drop for FakeDetector {
@@ -64,6 +68,9 @@ impl Drop for FakeDetector {
 #[async_trait]
 impl Vad for FakeDetector {
     async fn accept(&mut self, pcm: &[f32]) -> Result<Vec<VadFrame>, String> {
+        if self.hang.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
         self.pending.extend_from_slice(pcm);
         let whole = self.pending.len() / WINDOW * WINDOW;
         let windows: Vec<f32> = self.pending.drain(..whole).collect();
@@ -573,5 +580,67 @@ fn every_stop_is_answered_with_an_idle_state() {
             _ => None,
         })
         .await;
+    });
+}
+
+/// A call listening on a detector that has stopped answering, the task stuck in it.
+async fn stuck(models: FakeModels) -> (VoiceCall, Events, Arc<Mutex<Speakers>>) {
+    let hang = Arc::clone(&models.hang);
+    let (call, mut events, speakers) = call(models);
+    call.start();
+    next(&mut events, |event| match event {
+        VoiceEvent::State(state) if state.listening == crate::Listening::Listening => Some(()),
+        _ => None,
+    })
+    .await;
+    hang.store(true, Ordering::SeqCst);
+    let sink = speakers.lock().unwrap().sink.clone().unwrap();
+    sink.send(IoEvent::Captured(vec![0.0; 1_600]));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    (call, events, speakers)
+}
+
+#[test]
+fn dropping_the_call_ends_it_while_its_detector_never_answers() {
+    runtime().block_on(async {
+        let alive = Arc::new(AtomicUsize::new(0));
+        let (call, mut events, speakers) = stuck(FakeModels {
+            alive: Arc::clone(&alive),
+            ..FakeModels::default()
+        })
+        .await;
+        drop(call);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while events.next().await.is_some() {}
+        })
+        .await
+        .expect("the events end though the detector never answered");
+        assert!(speakers.lock().unwrap().sink.is_none(), "the io stopped");
+        assert_eq!(alive.load(Ordering::SeqCst), 0, "the models were dropped");
+    });
+}
+
+#[test]
+fn a_stop_ends_the_call_while_its_detector_never_answers_and_it_starts_again() {
+    runtime().block_on(async {
+        let models = FakeModels::default();
+        let (loads, hang) = (Arc::clone(&models.loads), Arc::clone(&models.hang));
+        let (call, mut events, speakers) = stuck(models).await;
+        call.stop();
+        next(&mut events, |event| match event {
+            VoiceEvent::State(state) if state.listening == crate::Listening::Idle => Some(()),
+            _ => None,
+        })
+        .await;
+        assert!(speakers.lock().unwrap().sink.is_none(), "the io stopped");
+        // The models were dropped with the detector: the next start loads them again, and listens.
+        hang.store(false, Ordering::SeqCst);
+        call.start();
+        next(&mut events, |event| match event {
+            VoiceEvent::State(state) if state.listening == crate::Listening::Listening => Some(()),
+            _ => None,
+        })
+        .await;
+        assert_eq!(loads.load(Ordering::SeqCst), 2);
     });
 }

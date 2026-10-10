@@ -192,3 +192,33 @@ const LONG: [&str; 5] = [
     "The fourth sentence is long enough alone.",
     "The fifth sentence is long enough alone.",
 ];
+
+#[test]
+fn a_boundary_retires_the_stale_reply_being_spoken_and_those_queued() {
+    let mut playback = Playback::default();
+    let mut actions = Vec::new();
+    let mut old = reply("old", &LONG[..2].join(" "));
+    old.revision = 3;
+    let mut fresh = reply("fresh", "Written after the turn.");
+    fresh.revision = 9;
+    let mut queued = reply("queued", "Also old.");
+    queued.revision = 4;
+    playback.push(old, &mut actions);
+    playback.push(fresh, &mut actions);
+    playback.push(queued, &mut actions);
+    playback.start(&mut actions);
+    playback.synthesized("old", 0, Ok((vec![0.0], 16_000)), &mut actions);
+    playback.chunk_started("old", 0, &mut actions);
+    actions.clear();
+    playback.retire_before(8, &mut actions);
+    assert!(matches!(actions[0], Action::Stop));
+    assert_eq!(
+        reasons(&actions),
+        [
+            (PlaybackStatus::Interrupted, Some(PlaybackReason::NewerTurn)),
+            (PlaybackStatus::Unplayed, Some(PlaybackReason::NewerTurn)),
+        ]
+    );
+    assert!(!playback.busy());
+    assert!(playback.waiting(), "the reply written after the turn stays");
+}
