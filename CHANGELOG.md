@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.1](https://github.com/sidevoice/sidevoice-voice/compare/v0.3.0...v0.3.1) (2026-10-11)
+
+
+### Bug Fixes
+
+* **web:** a capture worklet whose processor throws fails the capture as audio-capture-failed ([#16](https://github.com/sidevoice/sidevoice-voice/issues/16)) ([852ce34](https://github.com/sidevoice/sidevoice-voice/commit/852ce345ebf6298b4de9cb982ae8ddb7922aea25))
+* **web:** a microphone whose track the browser mutes is told in the call's state ([#17](https://github.com/sidevoice/sidevoice-voice/issues/17)) ([ddf7ba0](https://github.com/sidevoice/sidevoice-voice/commit/ddf7ba056f5038aff544022d767b31dd1a5b0053))
+
 ## [0.3.0](https://github.com/sidevoice/sidevoice-voice/compare/v0.2.0...v0.3.0) (2026-10-11)
 
 
