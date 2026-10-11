@@ -27,6 +27,7 @@ let ioStarted = false;
 let ready = false;
 let listenedEarly = false;
 let speaker = null;
+const switched = [];
 const io = {
   start(sink) {
     ioStarted = true;
@@ -43,6 +44,10 @@ const io = {
     speaker.chunkPlayed(utterance, chunk);
   },
   stopPlayback() {},
+  // Its devices chosen by id, each switch recorded; it can choose its output.
+  outputSelectable: true,
+  async setInputDevice(id) { switched.push(["input", id]); },
+  async setOutputDevice(id) { switched.push(["output", id]); },
   stop() {},
 };
 
@@ -91,6 +96,17 @@ const ending = {
     return { ...(await models.load()), endOfTurn: { endOfTurn: async () => 0.9 } };
   },
 };
+// The browser's audio devices, as it lists them, and its devicechange.
+let deviceList = [
+  { kind: "audioinput", deviceId: "default", label: "Default" },
+  { kind: "audioinput", deviceId: "mic-a", label: "Mic A" },
+  { kind: "audiooutput", deviceId: "out-b", label: "Speakers B" },
+];
+let deviceChange = null;
+Object.defineProperty(globalThis, "navigator", { configurable: true, value: { mediaDevices: {
+  enumerateDevices: async () => deviceList,
+  addEventListener: (name, listener) => { if (name === "devicechange") deviceChange = listener; },
+} } });
 const voice = createVoiceHost(source, { io });
 const states = [];
 const seen = [];
@@ -126,6 +142,18 @@ const first = seen.find((s) => s.listening !== "idle");
 host.flags = [first?.listening];
 voice.mute(false);
 host.again = await code(voice.start());
+// Audio devices with the call listening: the list (the default one is no entry: it is null), a choice the io switches
+// to at once, and the chosen microphone gone: the default one again, said once with the list.
+const listed = await voice.audioDevices();
+host.devices = [listed.inputs.map((device) => device.id), listed.outputs.map((device) => device.label), listed.input, listed.outputSelectable];
+const chosen = await voice.setAudioDevices({ input: "mic-a", output: "out-b" });
+host.chosen = [chosen.input, chosen.output, switched.slice()];
+const told = [];
+voice.onAudioDevices((devices) => told.push(devices));
+deviceList = deviceList.filter((device) => device.deviceId !== "mic-a");
+deviceChange();
+await until(() => told.length > 0);
+host.deviceGone = [told[0].input, told[0].lost?.input ?? null, switched.at(-1), (await voice.audioDevices()).lost ?? null];
 // Said with the call listening: heard, its handle telling how.
 const sayingHost = voice.say("The host says this.", { language: "en" });
 host.said = [typeof sayingHost.cancel, (await sayingHost.outcome).status];
@@ -157,43 +185,60 @@ host.smartMissing = await code(voice.start());
 await until(() => states.at(-1) === "idle");
 host.states = states;
 host.seam = Object.keys(voice).sort();
-// The default microphone and speaker on a fake browser, whose capture worklet's processor throws once it runs: what
-// the sink hears, in order.
-const browser = { node: null };
-const track = { stop() {}, onended: null };
-Object.defineProperty(globalThis, "navigator", {
-  configurable: true,
-  value: { mediaDevices: { getUserMedia: async () => ({ getTracks: () => [track], getAudioTracks: () => [track] }) } },
-});
-globalThis.AudioContext = class {
-  destination = {};
-  audioWorklet = { addModule: async () => {} };
-  createGain = () => ({ gain: {}, connect() {} });
-  createMediaStreamSource = () => ({ connect: (node) => node });
-  resume = async () => {};
-  close = async () => {};
+
+// The browser's own microphone and speaker (createWebAudioIo) over a fake getUserMedia and Web Audio: a chosen
+// microphone, switched mid-call (the new one open before the old one is let go, the worklet kept), the chosen one
+// gone (the default one again, said through onDeviceLost, the call going on), the output chosen with setSinkId, and the
+// default one gone (the call ends: microphone-lost).
+const webAudio = { asked: [], stopped: [], sinks: [], lost: [], failed: [], ready: 0 };
+let opened = 0;
+const media = (deviceId) => {
+  const track = { id: `track-${++opened}`, onended: null, stop() { webAudio.stopped.push(track.id); } };
+  return { getTracks: () => [track], getAudioTracks: () => [track], track, deviceId };
 };
+let lastStream = null;
+Object.defineProperty(globalThis, "navigator", { configurable: true, value: { mediaDevices: {
+  getUserMedia: async ({ audio }) => { webAudio.asked.push(audio.deviceId?.exact ?? null); return (lastStream = media(audio.deviceId?.exact ?? null)); },
+} } });
+// Every capture worklet made, the last one first.
+const worklets = [];
 globalThis.AudioWorkletNode = class {
-  port = {};
-  onprocessorerror = null;
-  constructor() {
-    browser.node = this;
-  }
-  connect() {}
+  constructor() { worklets.unshift(this); this.port = {}; this.onprocessorerror = null; }
+  connect(node) { return node; }
 };
-const heard = [];
-await new Promise((resolve) => {
-  createWebAudioIo().start({
-    ready: () => resolve(heard.push("ready")),
-    captured() {},
-    chunkStarted() {},
-    chunkPlayed() {},
-    failed: (code) => resolve(heard.push(code)),
-  });
-  setTimeout(resolve, 5000);
+globalThis.AudioContext = class {
+  constructor() { this.audioWorklet = { addModule: async () => {} }; this.destination = {}; this.currentTime = 0; }
+  createMediaStreamSource(stream) { return { stream, connect(node) { return node; }, disconnect() {} }; }
+  createGain() { return { connect() {}, disconnect() {}, gain: { value: 1, setValueAtTime() {}, linearRampToValueAtTime() {} } }; }
+  async setSinkId(id) { webAudio.sinks.push(id); }
+  async resume() {}
+  async close() {}
+};
+const webIo = createWebAudioIo({ inputDevice: "mic-a", onDeviceLost: (kind, id) => webAudio.lost.push([kind, id]) });
+webIo.start({ ready: () => webAudio.ready++, captured() {}, chunkStarted() {}, chunkPlayed() {}, failed: (code) => webAudio.failed.push(code) });
+await until(() => webAudio.ready > 0);
+await webIo.setInputDevice("mic-b");
+await webIo.setOutputDevice("out-c");
+lastStream.track.onended();
+await until(() => webAudio.lost.length > 0);
+lastStream.track.onended();
+await until(() => webAudio.failed.length > 0);
+webAudio.outputSelectable = webIo.outputSelectable;
+webAudio.worklets = worklets.length;
+const devicesSeen = structuredClone(webAudio);
+
+// The default microphone again, whose capture worklet's processor throws once it runs: what the sink hears, in order.
+const processorError = [];
+createWebAudioIo().start({
+  ready: () => processorError.push("ready"),
+  captured() {},
+  chunkStarted() {},
+  chunkPlayed() {},
+  failed: (code) => processorError.push(code),
 });
-browser.node?.onprocessorerror?.(new Event("processorerror"));
-const webAudio = { processorError: heard };
+await until(() => processorError.length > 0);
+worklets[0].onprocessorerror?.(new Event("processorerror"));
+await until(() => processorError.length > 1);
 console.log(
   JSON.stringify({
     wasm: wasm.pathname,
@@ -204,7 +249,7 @@ console.log(
     state: callState,
     errors,
     webAudioIo: typeof createWebAudioIo,
-    webAudio,
+    webAudio: { ...devicesSeen, processorError },
     host,
   }),
 );

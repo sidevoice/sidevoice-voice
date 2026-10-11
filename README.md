@@ -82,6 +82,13 @@ while let Some(step) = saying.next().await {
 // config), which restarts a running call once, on both.
 ```
 
+Which microphone and speaker it uses is a `NativeDevices` handle: `NativeIo::with_devices(devices.clone())`, and the
+app keeps the other clone. `devices.list()` gives the system's inputs and outputs (`{id, label}`, the id cpal's) and
+the chosen ones (`None`: the system's default); `devices.choose(input, output)` changes them at any time
+(`Some(None)`: back to the default; `None`: as it is). A running call switches its microphone at once and its speaker
+once what it is playing has ended. A chosen device that goes away gives way to the default one, said once as `lost`
+on the next list; the list is polled, cpal telling no changes.
+
 A page does the same with the npm package `@sidevoice/voice`, the WebAssembly build with the browser's microphone and
 speaker. Its models are JavaScript objects with the interfaces' methods, typed in `js/voice-models.d.ts` and called
 through wasm-bindgen's structural imports (`src/models/web.rs`); the page wires its models into them (those of
@@ -103,7 +110,8 @@ const outcome = await saying.outcome; // { status: "heard" | "heard-up-to" | "no
 `cancel()`, `onEvent(listener)` for its steps, and `outcome`, a promise); `setConfig`, `setModels`, `mute`,
 `cancelInput`, `start` and `stop` mirror the Rust methods (`src/web.rs`). The microphone is `getUserMedia` with the
 browser's echo cancellation, noise suppression and gain control, brought to 16 kHz mono in an AudioWorklet; the speaker
-is Web Audio (`js/web-audio-io.js`). `VoiceCall.create(models, config, {outputDevice})` plays on another output where
+is Web Audio (`js/web-audio-io.js`). `VoiceCall.create(models, config, {inputDevice, outputDevice})` captures from another
+microphone, and plays on another output where
 the browser lets an `AudioContext` choose one (a non-default output may escape the browser's canceller, an open point
 of sidevoice-core#89), and `{io}` brings a microphone and speaker of the page's own, with `start(sink)`,
 `play(utterance, chunk, samples, sampleRate)`, `stopPlayback()` and `stop()` (`createWebAudioIo` is the default).
@@ -179,6 +187,14 @@ What both promise, beyond the types:
   the source as the page wrote it. A rejected `setSettings` changes nothing. A change to what chooses models (any other
   field of a slot, or the end of turn) gives the call other models, which restarts it while it runs (the open turn
   cancelled, what is being said stopped); the language, voice, speed, patience and idle minutes apply live.
+- **Audio devices.** `audioDevices()` lists the microphones and outputs (`{id, label}`; the system's default is the
+  choice `null`, not an entry) and which are chosen, and whether the output can be chosen here (`outputSelectable`:
+  in a browser, `AudioContext.setSinkId`). `setAudioDevices({input?, output?})` chooses either at any time: a call that
+  runs switches without ending (the new microphone open before the old one is let go), and the choice holds for every
+  call after. An output that cannot be chosen is refused (`audio-output-unselectable`), never pretended.
+  `onAudioDevices(listener)` hears the list each time it changes, and when a chosen device goes away: the default one
+  is in use from then, and that list says which was lost (`lost`). Only the default microphone going away ends a call
+  (`microphone-lost`).
 
 ## Echo cancellation
 
@@ -191,8 +207,9 @@ The call cancels the echo of its own playback, never relying on the operating sy
   estimates the delay left between them (the output buffer, the room, the input buffer). The same processing applies
   the high-pass filter, moderate noise suppression and the adaptive digital gain, as the browser does with its
   constraints. The devices' callbacks only move samples through lock-free rings; the C++ runs on the module's audio
-  thread, never in a callback. A device that changes under a stream starts the canceller over; one that goes away
-  stops the call with `audio-device-unavailable`.
+  thread, never in a callback. A device that changes under a stream starts the canceller over; a chosen one that goes
+  away gives way to the default one (said once, as `lost`, with the next list); the default one going away stops the
+  call with `audio-device-unavailable`.
 - **In the browser**, the browser's own: the page's microphone asks `getUserMedia` for `echoCancellation`, and no
   canceller is linked into the wasm32 build, so audio is never processed twice.
 - **Windows** is out of the beta: the canceller's C++ does not build there yet.
@@ -261,8 +278,9 @@ src/            the crate sidevoice-voice
                   models/web.rs, the page's JavaScript models through structural imports (wasm32)
   residency.rs    when idle models are dropped
   io.rs           AudioIo, the microphone and the speaker; io/native.rs, NativeIo (cpal), with io/native/output.rs
-                  (what the output callback plays, and where each chunk is) and io/native/pipeline.rs (the capture
-                  through the echo canceller)
+                  (what the output callback plays, and where each chunk is), io/native/pipeline.rs (the capture
+                  through the echo canceller) and io/native/devices.rs (NativeDevices: which devices, listed and
+                  chosen)
   audio.rs        mono, resampling and 10 ms frames, natively
   echo.rs         echo cancellation: echo/native.rs (AEC3), echo/web.rs (the browser's)
   runtime.rs      spawning, sleeping and clocks; runtime/native.rs (Tokio), runtime/web.rs (the browser)
