@@ -54,6 +54,27 @@ export interface VoiceHostError {
   key?: string;
 }
 
+/** An audio device as the platform lists it. `label` may be empty until the page may use the microphone. */
+export interface VoiceAudioDevice {
+  id: string;
+  label: string;
+}
+
+/** The audio devices, and which are chosen. */
+export interface VoiceAudioDevices {
+  inputs: VoiceAudioDevice[];
+  outputs: VoiceAudioDevice[];
+  /** The chosen microphone's id; null is the system's default (not an entry of `inputs`). */
+  input: string | null;
+  /** The chosen output's id; null is the system's default. */
+  output: string | null;
+  /** Whether the output can be chosen here. When not, `outputs` still lists what exists, and playback stays on the
+   *  default one. */
+  outputSelectable: boolean;
+  /** Once, on the list after a chosen device went away: its id. The default one is in use from then on. */
+  lost?: { input?: string; output?: string };
+}
+
 /** The voice seam. Every event of a call reaches the listeners subscribed when it is emitted, in the order the call
  *  emitted it, across kinds; nothing is buffered, so subscribe before `start`. Each `on…` returns `stop`. */
 export interface VoiceHost {
@@ -84,6 +105,15 @@ export interface VoiceHost {
   /** The microphone's level, 0 to 1, once per detector window (about 30 a second). */
   onLevel(listener: (level: number) => void): () => void;
   onError(listener: (error: VoiceHostError) => void): () => void;
+  /** The audio devices now, and which are chosen. */
+  audioDevices(): Promise<VoiceAudioDevices>;
+  /** Chooses the microphone, the output or both by id (null: the system's default), at any time: a call that runs
+   *  switches without ending, and the choice holds for every call after it. Resolves with the devices then; rejects
+   *  `VoiceHostError` (`microphone-denied`, `microphone-unavailable`, `audio-output-unselectable`,
+   *  `audio-output-failed`), the choice unchanged. */
+  setAudioDevices(choice: { input?: string | null; output?: string | null }): Promise<VoiceAudioDevices>;
+  /** The devices, each time the platform's list changes or a chosen one goes away (then with `lost`). */
+  onAudioDevices(listener: (devices: VoiceAudioDevices) => void): () => void;
 }
 
 /** The page's side of `createVoiceHost`: which models fill the call's slots. */
