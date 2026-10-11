@@ -396,6 +396,9 @@ impl Driver {
             Message::Io(IoEvent::ChunkPlayed { utterance, chunk }) => {
                 self.input(Input::ChunkPlayed { utterance, chunk });
             }
+            Message::Io(IoEvent::MicrophoneMuted(muted)) => {
+                self.input(Input::MicrophoneMuted(muted));
+            }
             Message::Io(IoEvent::Failed(code)) => {
                 self.error(code);
                 self.halt().await;

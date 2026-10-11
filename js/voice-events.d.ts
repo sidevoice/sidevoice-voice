@@ -25,6 +25,11 @@ export interface VoiceCallState {
   /** How many of the person's turns wait for, or are in, transcription. */
   recognising: number;
   playback: "idle" | "synthesizing" | "playing";
+  /**
+   * Whether the microphone gives audio: `muted` while its device gives none (a muted track: another app or the system
+   * holds it, or the device stopped delivering), which is not the person's mute (`listening: "muted"`).
+   */
+  microphone: "live" | "muted";
 }
 
 /** Every event a call's `onEvent` hears. */

@@ -3,7 +3,7 @@
 
 use super::{Call, Effect, Input};
 use crate::config::{Patience, VoiceConfig};
-use crate::event::{Listening, TurnEvent, TurnTimings, VoiceEvent};
+use crate::event::{CallState, Listening, Microphone, TurnEvent, TurnTimings, VoiceEvent};
 use crate::say::{SayEvent, SayOutcome, StopReason};
 use crate::test_support::{clip, config, silence, EnergyVad, FLEURS_ES, QUILTER, WINDOW};
 
@@ -635,6 +635,64 @@ fn muting_ends_the_turn_and_cancelling_drops_it() {
     assert_eq!(turns[0].phase, TurnPhase::Cancelled);
     run.transcribed(0, "too late");
     assert!(Run::turns(&run.take()).is_empty());
+}
+
+#[test]
+fn a_microphone_whose_device_gives_no_audio_is_a_state_until_it_does_or_the_call_stops() {
+    let states = |run: &mut Run| -> Vec<CallState> {
+        run.take()
+            .into_iter()
+            .filter_map(|effect| match effect {
+                Effect::Event(VoiceEvent::State(state)) => Some(state),
+                _ => None,
+            })
+            .collect()
+    };
+    // Reported before the call starts listening, as a track muted from the outset is: told once it is started.
+    let mut run = Run::new(config());
+    run.call = Call::new(config(), "c".into(), EPOCH);
+    run.take();
+    run.input(Input::MicrophoneMuted(true));
+    assert!(states(&mut run)
+        .iter()
+        .all(|state| state.microphone == Microphone::Live));
+    run.input(Input::Start);
+    let told = states(&mut run);
+    assert_eq!(
+        told.last().map(|state| state.microphone),
+        Some(Microphone::Muted)
+    );
+    assert_eq!(
+        told.last().map(|state| state.listening),
+        Some(Listening::Listening)
+    );
+
+    run.input(Input::MicrophoneMuted(false));
+    let told = states(&mut run);
+    assert_eq!(
+        told.last().map(|state| state.microphone),
+        Some(Microphone::Live)
+    );
+    run.input(Input::MicrophoneMuted(true));
+    let told = states(&mut run);
+    assert_eq!(
+        told.last().map(|state| state.microphone),
+        Some(Microphone::Muted)
+    );
+
+    // A stop forgets it: the next start's microphone tells its own.
+    run.input(Input::Stop);
+    let told = states(&mut run);
+    assert_eq!(
+        told.last().map(|state| state.microphone),
+        Some(Microphone::Live)
+    );
+    run.input(Input::Start);
+    let told = states(&mut run);
+    assert_eq!(
+        told.last().map(|state| state.microphone),
+        Some(Microphone::Live)
+    );
 }
 
 #[test]
