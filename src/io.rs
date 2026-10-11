@@ -10,7 +10,7 @@ use crate::voice_call::Message;
 mod native;
 
 #[cfg(native)]
-pub use native::NativeIo;
+pub use native::{AudioDevice, AudioDevices, LostDevices, NativeDevices, NativeIo};
 
 /// What the microphone and the speaker tell the call.
 #[derive(Debug, Clone, PartialEq)]
