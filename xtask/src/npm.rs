@@ -23,14 +23,17 @@ const SMOKE_JS: &str = include_str!("../npm/smoke.mjs");
 /// The slots the smoke test's models fill, recorded each time the call loads them.
 const SMOKE_SLOTS: [&str; 3] = ["vad", "transcriber", "speaker"];
 /// The calls of the voice seam, `VoiceHost` (js/voice-host.d.ts), sorted.
-const SEAM: [&str; 10] = [
+const SEAM: [&str; 13] = [
+    "audioDevices",
     "cancelInput",
     "mute",
+    "onAudioDevices",
     "onError",
     "onLevel",
     "onState",
     "onTurn",
     "say",
+    "setAudioDevices",
     "setSettings",
     "start",
     "stop",
@@ -167,15 +170,17 @@ fn check_smoke(report: &Value) -> Result<()> {
             "the call's state did not follow its microphone's device: {report}"
         ));
     }
-    // A track muted from the outset, unmuted, muted again, and a capture worklet whose processor throws: each reaches
-    // the sink, the processor's as a failure.
-    let web_audio =
-        json!({"heard": ["muted", "ready", "unmuted", "muted", "audio-capture-failed"]});
+    // The browser's microphone and speaker, chosen and switched mid-call: the worklet kept, the old microphone let go
+    // once the new one works (whether it gives audio said), a chosen one gone falling back to the default, only the
+    // default one gone ending it. And a track muted from the outset, unmuted, muted again, and a capture worklet whose
+    // processor throws: each reaches the sink, the processor's as a failure.
+    let web_audio = json!({
+        "asked": ["mic-a", "mic-b", null], "stopped": ["track-1", "track-2", "track-3"], "sinks": ["out-c"],
+        "lost": [["input", "mic-b"]], "failed": ["microphone-lost"], "muted": [false, false], "ready": 1, "worklets": 1,
+        "outputSelectable": true, "heard": ["muted", "ready", "unmuted", "muted", "audio-capture-failed"],
+    });
     if report["webAudio"] != web_audio {
-        return Err(format!(
-            "the web microphone and speaker answered {}, not {web_audio}",
-            report["webAudio"]
-        ));
+        return Err(format!("the browser's devices went otherwise: {report}"));
     }
     let host = &report["host"];
     let want = json!({
@@ -186,6 +191,9 @@ fn check_smoke(report: &Value) -> Result<()> {
         "smartLive": ["listening", []],
         "states": host["states"],
         "handed": {"catalog": "smoke", "model": "smoke-stt", "language": "es"}, "voiceOnly": 0,
+        "devices": [["mic-a"], ["Speakers B"], null, true],
+        "chosen": ["mic-a", "out-b", [["input", "mic-a"], ["output", "out-b"]]],
+        "deviceGone": [null, "mic-a", ["input", null], null],
         "seam": SEAM,
     });
     if *host != want {

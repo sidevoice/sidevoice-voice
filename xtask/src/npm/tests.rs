@@ -90,7 +90,11 @@ fn a_smoke_report_must_show_a_running_call() {
         "state": {"listening": "listening", "recognising": 0, "playback": "idle", "online": true},
         "webAudioIo": "function",
         "microphone": ["muted", "live"],
-        "webAudio": {"heard": ["muted", "ready", "unmuted", "muted", "audio-capture-failed"]},
+        "webAudio": {
+            "asked": ["mic-a", "mic-b", null], "stopped": ["track-1", "track-2", "track-3"], "sinks": ["out-c"],
+            "lost": [["input", "mic-b"]], "failed": ["microphone-lost"], "muted": [false, false], "ready": 1, "worklets": 1,
+            "outputSelectable": true, "heard": ["muted", "ready", "unmuted", "muted", "audio-capture-failed"],
+        },
         "host": {
             "missing": "settings-missing", "unknown": "model-unknown", "reloaded": 1,
             "smartMissing": "end-of-turn-missing", "flags": ["muted"],
@@ -99,6 +103,9 @@ fn a_smoke_report_must_show_a_running_call() {
             "smartLive": ["listening", []],
             "states": ["idle", "listening", "idle"],
             "handed": {"catalog": "smoke", "model": "smoke-stt", "language": "es"}, "voiceOnly": 0,
+        "devices": [["mic-a"], ["Speakers B"], null, true],
+        "chosen": ["mic-a", "out-b", [["input", "mic-a"], ["output", "out-b"]]],
+        "deviceGone": [null, "mic-a", ["input", null], null],
             "seam": SEAM,
         },
     });
@@ -116,7 +123,15 @@ fn a_smoke_report_must_show_a_running_call() {
         ("microphone", json!(["live", "live"])),
         (
             "webAudio",
-            json!({"heard": ["ready", "audio-capture-failed"]}),
+            json!({"asked": ["mic-a"], "failed": ["microphone-lost"]}),
+        ),
+        (
+            "webAudio",
+            json!({
+                "asked": ["mic-a", "mic-b", null], "stopped": ["track-1", "track-2", "track-3"], "sinks": ["out-c"],
+                "lost": [["input", "mic-b"]], "failed": ["microphone-lost"], "muted": [false, false], "ready": 1, "worklets": 1,
+                "outputSelectable": true, "heard": ["muted", "ready", "unmuted", "muted"],
+            }),
         ),
         ("host", json!(null)),
     ] {
@@ -129,6 +144,10 @@ fn a_smoke_report_must_show_a_running_call() {
         ("states", json!(["idle", "listening"])),
         ("handed", json!({"model": "smoke-stt"})),
         ("voiceOnly", json!(1)),
+        (
+            "deviceGone",
+            json!(["mic-a", null, ["input", "mic-a"], null]),
+        ),
         ("seam", json!(["start"])),
         ("reloaded", json!(0)),
         ("flags", json!(["listening"])),

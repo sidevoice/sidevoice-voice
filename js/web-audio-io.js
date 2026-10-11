@@ -13,8 +13,14 @@
 // - Failures reach `sink.failed(code)` as stable codes: `microphone-denied`, `microphone-unavailable`,
 //   `microphone-lost`, `audio-capture-failed` (the worklet failed to load, or its processor threw),
 //   `audio-output-failed`. Once failed, it is stopped.
+// - The microphone and the output can be chosen by id, at start (`inputDevice`, `outputDevice`) or at any time
+//   (`setInputDevice`, `setOutputDevice`): a call that runs switches without ending. A chosen microphone that goes
+//   away falls back to the default one, and `onDeviceLost` hears it; only the default one going away ends the call.
 
 const FADE_SECONDS = 0.03;
+
+/** Whether this browser lets an `AudioContext` choose its output. */
+const outputSelectable = () => typeof AudioContext !== "undefined" && typeof AudioContext.prototype.setSinkId === "function";
 
 const CAPTURE = {
   echoCancellation: true,
@@ -24,9 +30,10 @@ const CAPTURE = {
 };
 
 /**
- * A microphone and speaker on Web Audio. `options.outputDevice` is the id of an audio output (`enumerateDevices`)
- * to play on instead of the default one, where the browser lets a context choose (`AudioContext.setSinkId`); where it
- * does not, playback stays on the default output.
+ * A microphone and speaker on Web Audio. `options.inputDevice` is the id of an audio input (`enumerateDevices`) to
+ * capture from instead of the default one; `options.outputDevice` the id of an output to play on, where the browser lets
+ * a context choose (`AudioContext.setSinkId`, `outputSelectable`); where it does not, playback stays on the default
+ * output. Both can be changed later (`setInputDevice`, `setOutputDevice`).
  *
  * A non-default output may escape the browser's echo canceller, which takes its reference from what it plays out:
  * whether it does on each browser is an open point of sidevoice-core#89, to be checked before the web beta.
@@ -35,10 +42,16 @@ const CAPTURE = {
  * does without it; noise suppression and gain control stay as they are.
  */
 export function createWebAudioIo(options = {}) {
-  const { outputDevice, echoCancellation = true } = options;
+  const { echoCancellation = true, onDeviceLost } = options;
+  // The chosen devices' ids; null is the system's default.
+  let inputDevice = options.inputDevice || null;
+  let outputDevice = options.outputDevice || null;
   let sink = null;
   let context = null;
   let stream = null;
+  // The microphone's node and the worklet it feeds: a switch replaces the first and keeps the second.
+  let microphone = null;
+  let capture = null;
   let output = null;
   let sources = new Set();
   let queueEnd = 0;
@@ -60,6 +73,8 @@ export function createWebAudioIo(options = {}) {
       track.stop();
     }
     stream = null;
+    microphone = null;
+    capture = null;
     for (const source of sources) {
       source.onended = null;
     }
@@ -89,32 +104,74 @@ export function createWebAudioIo(options = {}) {
     output.connect(context.destination);
   }
 
-  async function open(opened) {
-    const current = () => opened === session;
+  /** The microphone `id` (null: the default), with the call's capture constraints. Rejects with a stable `code`. */
+  async function microphoneStream(id) {
     if (!navigator.mediaDevices?.getUserMedia) {
-      return fail("microphone-unavailable");
+      throw Object.assign(new Error("no getUserMedia"), { code: "microphone-unavailable" });
     }
-    let media;
+    const audio = { ...CAPTURE, echoCancellation: echoCancellation !== false, ...(id ? { deviceId: { exact: id } } : {}) };
     try {
-      const audio = { ...CAPTURE, echoCancellation: echoCancellation !== false };
-      media = await navigator.mediaDevices.getUserMedia({ audio });
+      return await navigator.mediaDevices.getUserMedia({ audio });
     } catch (error) {
       const denied = error?.name === "NotAllowedError" || error?.name === "SecurityError";
-      return current() && fail(denied ? "microphone-denied" : "microphone-unavailable");
+      throw Object.assign(new Error(error?.message || "getUserMedia"), { code: denied ? "microphone-denied" : "microphone-unavailable" });
+    }
+  }
+
+  /** `media` as the microphone from now: its tracks watched, and fed to the worklet when there is one. */
+  function useStream(media, current) {
+    const replaced = stream !== null;
+    for (const track of stream?.getTracks() ?? []) {
+      track.onended = null;
+      track.onmute = null;
+      track.onunmute = null;
+      track.stop();
+    }
+    stream = media;
+    for (const track of stream.getAudioTracks()) {
+      track.onended = () => current() && microphoneEnded();
+      track.onmute = () => current() && sink.microphoneMuted(true);
+      track.onunmute = () => current() && sink.microphoneMuted(false);
+    }
+    // Muted from the outset is said at once; another microphone says whether it gives audio.
+    const muted = stream.getAudioTracks().some((track) => track.muted);
+    if (muted || replaced) {
+      sink.microphoneMuted(muted);
+    }
+    if (capture) {
+      microphone?.disconnect();
+      microphone = context.createMediaStreamSource(stream);
+      microphone.connect(capture);
+    }
+  }
+
+  // The chosen microphone went away: the default one takes over, and the page is told. The default one going away
+  // ends the call.
+  function microphoneEnded() {
+    if (!inputDevice) return fail("microphone-lost");
+    const lost = inputDevice;
+    inputDevice = null;
+    const opened = session;
+    microphoneStream(null).then((media) => {
+      if (opened !== session) return media.getTracks().forEach((track) => track.stop());
+      useStream(media, () => opened === session);
+      onDeviceLost?.("input", lost);
+    }, () => opened === session && fail("microphone-lost"));
+  }
+
+  async function open(opened) {
+    const current = () => opened === session;
+    let media;
+    try {
+      media = await microphoneStream(inputDevice);
+    } catch (error) {
+      return current() && fail(error.code);
     }
     if (!current()) {
       media.getTracks().forEach((track) => track.stop());
       return;
     }
-    stream = media;
-    for (const track of stream.getAudioTracks()) {
-      track.onended = () => current() && fail("microphone-lost");
-      track.onmute = () => current() && sink.microphoneMuted(true);
-      track.onunmute = () => current() && sink.microphoneMuted(false);
-      if (track.muted) {
-        sink.microphoneMuted(true);
-      }
-    }
+    useStream(media, current);
     try {
       await context.audioWorklet.addModule(new URL("./capture-worklet.js", import.meta.url).href);
     } catch {
@@ -123,15 +180,15 @@ export function createWebAudioIo(options = {}) {
     if (!current()) {
       return;
     }
-    const microphone = context.createMediaStreamSource(stream);
-    const capture = new AudioWorkletNode(context, "sidevoice-capture");
+    microphone = context.createMediaStreamSource(stream);
+    capture = new AudioWorkletNode(context, "sidevoice-capture");
     capture.port.onmessage = ({ data }) => current() && sink.captured(data);
     // A processor that throws posts nothing again: the capture is over, not quiet.
     capture.onprocessorerror = () => current() && fail("audio-capture-failed");
     // Connected through to the destination so that every browser runs it; it outputs silence.
     microphone.connect(capture).connect(context.destination);
     try {
-      if (outputDevice && typeof context.setSinkId === "function") {
+      if (outputDevice && outputSelectable()) {
         await context.setSinkId(outputDevice);
       }
       await context.resume();
@@ -145,6 +202,48 @@ export function createWebAudioIo(options = {}) {
   }
 
   return {
+    /** Whether the output can be chosen in this browser (`AudioContext.setSinkId`). */
+    get outputSelectable() {
+      return outputSelectable();
+    },
+
+    /** The microphone from now: `id`, or the default one with null. A call that runs switches without ending, the old
+     *  microphone kept until the new one works; one that does not uses it from its next start. Rejects with `code`. */
+    async setInputDevice(id) {
+      const next = id || null;
+      if (!stream) {
+        inputDevice = next;
+        return;
+      }
+      const opened = session;
+      const media = await microphoneStream(next);
+      if (opened !== session) {
+        media.getTracks().forEach((track) => track.stop());
+        inputDevice = next;
+        return;
+      }
+      inputDevice = next;
+      useStream(media, () => opened === session);
+    },
+
+    /** The output from now: `id`, or the default one with null, on the running call too. Rejects
+     *  `audio-output-unselectable` where the browser cannot choose one, `audio-output-failed` when it refuses it. */
+    async setOutputDevice(id) {
+      const next = id || null;
+      if (!outputSelectable()) {
+        if (next) throw Object.assign(new Error("setSinkId"), { code: "audio-output-unselectable" });
+        return;
+      }
+      if (context) {
+        try {
+          await context.setSinkId(next ?? "");
+        } catch (error) {
+          throw Object.assign(new Error(error?.message || "setSinkId"), { code: "audio-output-failed" });
+        }
+      }
+      outputDevice = next;
+    },
+
     start(newSink) {
       release(teardown());
       try {

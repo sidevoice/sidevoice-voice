@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.0](https://github.com/sidevoice/sidevoice-voice/compare/v0.2.0...v0.3.0) (2026-10-11)
+
+
+### Features
+
+* **native:** choose the call's microphone and speaker, mid-call too ([#19](https://github.com/sidevoice/sidevoice-voice/issues/19)) ([a03cdf1](https://github.com/sidevoice/sidevoice-voice/commit/a03cdf196b63e429eec82eabb76945589ffdd995))
+* **web:** choose the call's microphone and output, mid-call too ([#18](https://github.com/sidevoice/sidevoice-voice/issues/18)) ([a2d2677](https://github.com/sidevoice/sidevoice-voice/commit/a2d26773b88ba467bf7a304bb4f6fdcd7a1fa234))
+
 ## [0.2.0](https://github.com/sidevoice/sidevoice-voice/compare/v0.1.0...v0.2.0) (2026-10-10)
 
 

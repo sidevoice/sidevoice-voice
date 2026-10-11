@@ -64,6 +64,8 @@ export declare const VoiceCall: {
 
 export { createVoiceHost } from "./voice-host.js";
 export type {
+  VoiceAudioDevice,
+  VoiceAudioDevices,
   VoiceHost,
   VoiceHostError,
   VoiceHostOptions,

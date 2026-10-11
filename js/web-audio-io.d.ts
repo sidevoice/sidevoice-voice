@@ -27,9 +27,20 @@ export interface AudioIo {
   stopPlayback(): void;
   /** Stops capturing and closes the speaker. */
   stop(): void;
+  /** Optional: the microphone from now, by id (null: the default); a running one switches without ending. Rejects with
+   *  a stable `code`. */
+  setInputDevice?(id: string | null): Promise<void>;
+  /** Optional: the output from now, by id (null: the default), on what is playing too. Rejects with a stable `code`. */
+  setOutputDevice?(id: string | null): Promise<void>;
+  /** Optional: whether `setOutputDevice` can choose an output here. */
+  readonly outputSelectable?: boolean;
 }
 
 export interface WebAudioIoOptions {
+  /** The id of an audio input (`MediaDeviceInfo.deviceId`) to capture from; the default microphone otherwise. */
+  inputDevice?: string;
+  /** Hears that a chosen device went away (`"input"`, its id): the default one is in use from then on. */
+  onDeviceLost?: (kind: "input" | "output", id: string) => void;
   /**
    * The id of an audio output (`MediaDeviceInfo.deviceId`) to play on, where the browser lets an `AudioContext`
    * choose; the default output otherwise. A non-default output may escape the browser's echo canceller.
@@ -45,6 +56,7 @@ export interface WebAudioIoOptions {
 /**
  * The browser's microphone (`getUserMedia` with its echo cancellation, at 16 kHz mono) and speaker (Web Audio).
  * Failures reach `sink.failed` as `microphone-denied`, `microphone-unavailable`, `microphone-lost`,
- * `audio-capture-failed` or `audio-output-failed`.
+ * `audio-capture-failed` or `audio-output-failed`. Its devices can be chosen at any time (`setInputDevice`,
+ * `setOutputDevice`); a chosen microphone that goes away falls back to the default one (`onDeviceLost`).
  */
 export function createWebAudioIo(options?: WebAudioIoOptions): AudioIo;

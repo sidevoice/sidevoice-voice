@@ -41,7 +41,7 @@ pub use event::{
     CallState, Listening, Microphone, PlaybackState, TurnEvent, TurnTimings, VoiceError, VoiceEvent,
 };
 #[cfg(native)]
-pub use io::NativeIo;
+pub use io::{AudioDevice, AudioDevices, LostDevices, NativeDevices, NativeIo};
 pub use io::{AudioIo, IoEvent, IoSink};
 pub use maybe_send::{MaybeSend, MaybeSync};
 pub use models::{EndOfTurnModel, Models, Speaker, Transcriber, Vad, VadFrame, VoiceModels};

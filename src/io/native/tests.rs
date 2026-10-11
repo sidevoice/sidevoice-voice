@@ -205,3 +205,48 @@ fn a_stop_drops_what_waits_and_flushes_what_is_in_the_ring() {
         "nothing was left waiting"
     );
 }
+
+#[test]
+fn a_queue_is_idle_once_nothing_waits_or_is_left_to_play() {
+    let (mut playback, _player, _reference, counters) = output(4);
+    let mut queue = Queue::default();
+    assert!(queue.is_idle());
+    queue.play("u".into(), 0, vec![0.5; 10]);
+    assert!(!queue.is_idle());
+    queue.feed(&mut playback);
+    assert!(!queue.is_idle());
+    queue.schedule.due(10);
+    assert!(queue.is_idle());
+    queue.play("u".into(), 1, vec![0.5; 10]);
+    queue.stop(&counters);
+    assert!(queue.is_idle());
+}
+
+#[test]
+fn an_abandoned_queue_ends_every_chunk_in_order() {
+    let (mut playback, _player, _reference, _counters) = output(4);
+    let mut queue = Queue::default();
+    queue.play("u".into(), 0, vec![0.5; 10]);
+    queue.feed(&mut playback);
+    queue.schedule.due(1);
+    queue.play("u".into(), 1, vec![0.5; 10]);
+    let chunk = |chunk| (String::from("u"), chunk);
+    let events: Vec<_> = queue
+        .abandon()
+        .into_iter()
+        .map(|event| match event {
+            IoEvent::ChunkStarted { utterance, chunk } => ("started", (utterance, chunk)),
+            IoEvent::ChunkPlayed { utterance, chunk } => ("played", (utterance, chunk)),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        events,
+        [
+            ("played", chunk(0)),
+            ("started", chunk(1)),
+            ("played", chunk(1)),
+        ]
+    );
+    assert!(queue.is_idle());
+}

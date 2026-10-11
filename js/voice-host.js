@@ -39,9 +39,23 @@ function notPlayed() {
   });
 }
 
+/** The audio devices the browser lists of `kind`, as `{id, label}`: the default one is not an entry of its own (it is
+ *  the choice `null`). Labels are empty until the page may use the microphone. */
+function devicesOf(listed, kind) {
+  return listed
+    .filter((device) => device.kind === kind && device.deviceId && device.deviceId !== "default" && device.deviceId !== "communications")
+    .map((device) => ({ id: device.deviceId, label: device.label || "" }));
+}
+
 export function createVoiceHost(source, options = {}) {
-  const { io, ...webAudio } = options;
-  const listeners = { turn: new Set(), state: new Set(), level: new Set(), error: new Set() };
+  const { io: given, ...webAudio } = options;
+  const listeners = { turn: new Set(), state: new Set(), level: new Set(), error: new Set(), devices: new Set() };
+  // The chosen microphone and output (null: the system's default), kept across calls like `muted`.
+  let input = webAudio.inputDevice || null;
+  let output = webAudio.outputDevice || null;
+  // A chosen device that went away, said once with the next list.
+  let lost = null;
+  const io = given ?? createWebAudioIo({ ...webAudio, onDeviceLost: (kind, id) => void deviceLost(kind, id) });
   let call = null;
   let chosen = null;
   // What the page asked for before or after the call exists: every new call starts with it.
@@ -95,6 +109,45 @@ export function createVoiceHost(source, options = {}) {
     if (call) action(call);
   };
 
+  const mediaDevices = () => globalThis.navigator?.mediaDevices;
+  /** The devices now, and what is chosen; `lost` once, after a chosen one went away. */
+  async function devices() {
+    let listed = [];
+    try {
+      listed = (await mediaDevices()?.enumerateDevices?.()) ?? [];
+    } catch (_) { /* a browser that lists nothing lists no device */ }
+    const inputs = devicesOf(listed, "audioinput");
+    const outputs = devicesOf(listed, "audiooutput");
+    // A chosen device that is not listed any more is gone: the default one from now.
+    if (input && listed.length && !inputs.some((device) => device.id === input)) await deviceLost("input", input, false);
+    if (output && listed.length && !outputs.some((device) => device.id === output)) await deviceLost("output", output, false);
+    const report = { inputs, outputs, input, output, outputSelectable: io.outputSelectable === true, ...(lost ? { lost } : {}) };
+    lost = null;
+    return report;
+  }
+  /** Tells the device listeners what is listed now. */
+  async function announce() {
+    if (!listeners.devices.size) return;
+    const report = await devices();
+    for (const listener of listeners.devices) {
+      try { listener(report); } catch (_) { /* a listener's error is the page's own */ }
+    }
+  }
+  /** A chosen device went away: the default one is used from now, and the next list says which was lost. */
+  async function deviceLost(kind, id, tell = true) {
+    if (kind === "input" && input === id) {
+      input = null;
+      await io.setInputDevice?.(null).catch(() => {});
+    } else if (kind === "output" && output === id) {
+      output = null;
+      await io.setOutputDevice?.(null).catch(() => {});
+    } else return;
+    lost = { ...lost, [kind]: id };
+    if (tell) await announce();
+  }
+  // The browser says when its devices change (one plugged in or out): listeners are told what is listed then.
+  mediaDevices()?.addEventListener?.("devicechange", () => void announce());
+
   return Object.freeze({
     async setSettings(settings) {
       const changed = chosen === null || stages(settings) !== chosen;
@@ -108,7 +161,7 @@ export function createVoiceHost(source, options = {}) {
         ...(settings.idle_unload_minutes != null ? { idle_unload_minutes: settings.idle_unload_minutes } : {}),
       };
       if (!call) {
-        call = WasmVoiceCall.create(models, io ?? createWebAudioIo(webAudio), config);
+        call = WasmVoiceCall.create(models, io, config);
         call.onEvent(receive);
         call.mute(muted);
       } else if (models) {
@@ -150,5 +203,22 @@ export function createVoiceHost(source, options = {}) {
     onState: on("state"),
     onLevel: on("level"),
     onError: on("error"),
+    audioDevices: () => devices(),
+    async setAudioDevices(choice = {}) {
+      if ("input" in choice) {
+        const id = choice.input || null;
+        if (id && !io.setInputDevice) throw fail("audio-device-unsupported");
+        await io.setInputDevice?.(id).catch((error) => { throw fail(error?.code || "microphone-unavailable"); });
+        input = id;
+      }
+      if ("output" in choice) {
+        const id = choice.output || null;
+        if (id && !(io.outputSelectable === true && io.setOutputDevice)) throw fail("audio-output-unselectable");
+        await io.setOutputDevice?.(id).catch((error) => { throw fail(error?.code || "audio-output-failed"); });
+        output = id;
+      }
+      return devices();
+    },
+    onAudioDevices: on("devices"),
   });
 }
