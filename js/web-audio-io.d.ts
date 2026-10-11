@@ -8,6 +8,8 @@ export interface AudioIoSink {
   chunkStarted(utterance: string, chunk: number): void;
   /** The last sample of a chunk reached the speaker. */
   chunkPlayed(utterance: string, chunk: number): void;
+  /** Whether the microphone's device gives no audio for now (muted by the browser or the system, not by the person). */
+  microphoneMuted(muted: boolean): void;
   /** The microphone or the speaker failed, with a stable code; the call stops. */
   failed(code: string): void;
 }

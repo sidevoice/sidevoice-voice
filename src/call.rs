@@ -16,7 +16,9 @@ mod tests;
 use std::collections::{HashMap, VecDeque};
 
 use crate::config::{EndOfTurn, VoiceConfig};
-use crate::event::{CallState, Listening, TurnEvent, TurnTimings, VoiceError, VoiceEvent};
+use crate::event::{
+    CallState, Listening, Microphone, TurnEvent, TurnTimings, VoiceError, VoiceEvent,
+};
 use crate::playback::{Action, Playback};
 use crate::recognition::{accepted, Job, Outcome, Recognition};
 use crate::say::{SayEvent, SayOutcome, StopReason};
@@ -58,6 +60,8 @@ pub(crate) enum Input {
     ChunkPlayed { utterance: String, chunk: usize },
     /// Whether the microphone is muted: an open turn ends with what was said.
     Mute(bool),
+    /// Whether the microphone's device gives no audio for now (not the person's mute).
+    MicrophoneMuted(bool),
     /// The person cancels what they said that is not reported yet.
     Cancel,
     /// What the end-of-turn model said of a turn's pause: the probability that the turn is over, or the stable code
@@ -133,6 +137,8 @@ pub(crate) struct Call {
     epoch_unix_ms: u64,
     started: bool,
     muted: bool,
+    /// Whether the microphone's device gives no audio, until the call stops.
+    microphone_muted: bool,
     segmenter: Segmenter,
     /// The turn being spoken.
     open: Option<usize>,
@@ -156,6 +162,7 @@ impl Call {
             epoch_unix_ms,
             started: false,
             muted: false,
+            microphone_muted: false,
             open: None,
             turns: HashMap::new(),
             next_turn: 0,
@@ -219,6 +226,7 @@ impl Call {
                     }
                 }
             }
+            Input::MicrophoneMuted(muted) => self.microphone_muted = muted,
             Input::Cancel => self.cancel_input(now, &mut out),
             Input::EndOfTurn {
                 turn,
@@ -400,6 +408,7 @@ impl Call {
         self.playback.interrupt(StopReason::Stopped, &mut actions);
         self.act(actions, out);
         self.started = false;
+        self.microphone_muted = false;
         // A stop is always answered with the state, even an unchanged one: the host knows it took effect.
         self.state = None;
     }
@@ -469,6 +478,11 @@ impl Call {
             },
             recognising: self.recognition.len(),
             playback: self.playback.state(),
+            microphone: if self.started && self.microphone_muted {
+                Microphone::Muted
+            } else {
+                Microphone::Live
+            },
         };
         if self.state != Some(state) {
             self.state = Some(state);

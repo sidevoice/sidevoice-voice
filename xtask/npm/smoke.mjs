@@ -67,6 +67,16 @@ call.start();
 for (let waited = 0; state?.listening !== "listening" && errors.length === 0 && waited < 5000; waited += 10) {
   await new Promise((resolve) => setTimeout(resolve, 10));
 }
+// The microphone's device going quiet and giving audio again: the call's state says each.
+const microphone = [];
+for (const muted of [true, false]) {
+  speaker.microphoneMuted(muted);
+  const want = muted ? "muted" : "live";
+  for (let waited = 0; state?.microphone !== want && waited < 5000; waited += 10) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  microphone.push(state?.microphone);
+}
 // Something said: its handle tells the steps and how it ended.
 const saying = call.say("The smoke test speaks this sentence.", { language: "en" });
 const steps = [];
@@ -190,10 +200,15 @@ host.seam = Object.keys(voice).sort();
 // microphone, switched mid-call (the new one open before the old one is let go, the worklet kept), the chosen one
 // gone (the default one again, said through onDeviceLost, the call going on), the output chosen with setSinkId, and the
 // default one gone (the call ends: microphone-lost).
-const webAudio = { asked: [], stopped: [], sinks: [], lost: [], failed: [], ready: 0 };
+const webAudio = { asked: [], stopped: [], sinks: [], lost: [], failed: [], muted: [], ready: 0 };
 let opened = 0;
+// Whether the next microphone's track starts muted.
+let startsMuted = false;
 const media = (deviceId) => {
-  const track = { id: `track-${++opened}`, onended: null, stop() { webAudio.stopped.push(track.id); } };
+  const track = {
+    id: `track-${++opened}`, muted: startsMuted, onended: null, onmute: null, onunmute: null,
+    stop() { webAudio.stopped.push(track.id); },
+  };
   return { getTracks: () => [track], getAudioTracks: () => [track], track, deviceId };
 };
 let lastStream = null;
@@ -215,7 +230,10 @@ globalThis.AudioContext = class {
   async close() {}
 };
 const webIo = createWebAudioIo({ inputDevice: "mic-a", onDeviceLost: (kind, id) => webAudio.lost.push([kind, id]) });
-webIo.start({ ready: () => webAudio.ready++, captured() {}, chunkStarted() {}, chunkPlayed() {}, failed: (code) => webAudio.failed.push(code) });
+webIo.start({
+  ready: () => webAudio.ready++, captured() {}, chunkStarted() {}, chunkPlayed() {},
+  microphoneMuted: (muted) => webAudio.muted.push(muted), failed: (code) => webAudio.failed.push(code),
+});
 await until(() => webAudio.ready > 0);
 await webIo.setInputDevice("mic-b");
 await webIo.setOutputDevice("out-c");
@@ -227,18 +245,23 @@ webAudio.outputSelectable = webIo.outputSelectable;
 webAudio.worklets = worklets.length;
 const devicesSeen = structuredClone(webAudio);
 
-// The default microphone again, whose capture worklet's processor throws once it runs: what the sink hears, in order.
-const processorError = [];
+// The default microphone again, whose track starts muted, gives audio, then is muted again, and whose capture worklet's
+// processor throws once it runs: what the sink hears, in order.
+const heard = [];
+startsMuted = true;
 createWebAudioIo().start({
-  ready: () => processorError.push("ready"),
+  ready: () => heard.push("ready"),
   captured() {},
   chunkStarted() {},
   chunkPlayed() {},
-  failed: (code) => processorError.push(code),
+  microphoneMuted: (muted) => heard.push(muted ? "muted" : "unmuted"),
+  failed: (code) => heard.push(code),
 });
-await until(() => processorError.length > 0);
+await until(() => heard.includes("ready"));
+lastStream.track.onunmute?.();
+lastStream.track.onmute?.();
 worklets[0].onprocessorerror?.(new Event("processorerror"));
-await until(() => processorError.length > 1);
+await until(() => heard.includes("audio-capture-failed"));
 console.log(
   JSON.stringify({
     wasm: wasm.pathname,
@@ -248,8 +271,9 @@ console.log(
     said,
     state: callState,
     errors,
+    microphone,
     webAudioIo: typeof createWebAudioIo,
-    webAudio: { ...devicesSeen, processorError },
+    webAudio: { ...devicesSeen, heard },
     host,
   }),
 );

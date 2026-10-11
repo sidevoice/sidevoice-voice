@@ -212,6 +212,13 @@ impl IoSink {
         self.send(IoEvent::ChunkPlayed { utterance, chunk });
     }
 
+    /// Whether the microphone's device gives no audio for now (muted by the browser or the system, not by the
+    /// person), each time that changes.
+    #[wasm_bindgen(js_name = microphoneMuted)]
+    pub fn microphone_muted(&self, muted: bool) {
+        self.send(IoEvent::MicrophoneMuted(muted));
+    }
+
     /// The microphone or the speaker failed, with a stable code; the call stops.
     pub fn failed(&self, code: String) {
         self.send(IoEvent::Failed(code));

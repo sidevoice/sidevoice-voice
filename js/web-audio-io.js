@@ -8,6 +8,8 @@
 // - Playback is Web Audio, on the same context: each chunk an AudioBuffer at its own rate, scheduled right after
 //   what is queued. A chunk has started when the context's clock reaches its start time, and is played when its
 //   source ends.
+// - A microphone whose track the browser mutes (another app or the system holds it, or the device stopped delivering)
+//   gives silence, not a failure: `sink.microphoneMuted(true)` says so, and `false` once it gives audio again.
 // - Failures reach `sink.failed(code)` as stable codes: `microphone-denied`, `microphone-unavailable`,
 //   `microphone-lost`, `audio-capture-failed` (the worklet failed to load, or its processor threw),
 //   `audio-output-failed`. Once failed, it is stopped.
@@ -66,6 +68,8 @@ export function createWebAudioIo(options = {}) {
     sink = null;
     for (const track of stream?.getTracks() ?? []) {
       track.onended = null;
+      track.onmute = null;
+      track.onunmute = null;
       track.stop();
     }
     stream = null;
@@ -116,13 +120,23 @@ export function createWebAudioIo(options = {}) {
 
   /** `media` as the microphone from now: its tracks watched, and fed to the worklet when there is one. */
   function useStream(media, current) {
+    const replaced = stream !== null;
     for (const track of stream?.getTracks() ?? []) {
       track.onended = null;
+      track.onmute = null;
+      track.onunmute = null;
       track.stop();
     }
     stream = media;
     for (const track of stream.getAudioTracks()) {
       track.onended = () => current() && microphoneEnded();
+      track.onmute = () => current() && sink.microphoneMuted(true);
+      track.onunmute = () => current() && sink.microphoneMuted(false);
+    }
+    // Muted from the outset is said at once; another microphone says whether it gives audio.
+    const muted = stream.getAudioTracks().some((track) => track.muted);
+    if (muted || replaced) {
+      sink.microphoneMuted(muted);
     }
     if (capture) {
       microphone?.disconnect();

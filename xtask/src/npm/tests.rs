@@ -89,10 +89,11 @@ fn a_smoke_report_must_show_a_running_call() {
         "said": {"id": "string", "steps": ["playing", "progress", "progress", "done"], "outcome": {"status": "heard"}},
         "state": {"listening": "listening", "recognising": 0, "playback": "idle", "online": true},
         "webAudioIo": "function",
+        "microphone": ["muted", "live"],
         "webAudio": {
             "asked": ["mic-a", "mic-b", null], "stopped": ["track-1", "track-2", "track-3"], "sinks": ["out-c"],
-            "lost": [["input", "mic-b"]], "failed": ["microphone-lost"], "ready": 1, "worklets": 1, "outputSelectable": true,
-            "processorError": ["ready", "audio-capture-failed"],
+            "lost": [["input", "mic-b"]], "failed": ["microphone-lost"], "muted": [false, false], "ready": 1, "worklets": 1,
+            "outputSelectable": true, "heard": ["muted", "ready", "unmuted", "muted", "audio-capture-failed"],
         },
         "host": {
             "missing": "settings-missing", "unknown": "model-unknown", "reloaded": 1,
@@ -119,6 +120,7 @@ fn a_smoke_report_must_show_a_running_call() {
         ),
         ("state", json!(null)),
         ("webAudioIo", json!("undefined")),
+        ("microphone", json!(["live", "live"])),
         (
             "webAudio",
             json!({"asked": ["mic-a"], "failed": ["microphone-lost"]}),
@@ -127,8 +129,8 @@ fn a_smoke_report_must_show_a_running_call() {
             "webAudio",
             json!({
                 "asked": ["mic-a", "mic-b", null], "stopped": ["track-1", "track-2", "track-3"], "sinks": ["out-c"],
-                "lost": [["input", "mic-b"]], "failed": ["microphone-lost"], "ready": 1, "worklets": 1, "outputSelectable": true,
-                "processorError": ["ready"],
+                "lost": [["input", "mic-b"]], "failed": ["microphone-lost"], "muted": [false, false], "ready": 1, "worklets": 1,
+                "outputSelectable": true, "heard": ["muted", "ready", "unmuted", "muted"],
             }),
         ),
         ("host", json!(null)),

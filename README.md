@@ -64,7 +64,7 @@ while let Some(event) = events.next().await {
     match event {
         VoiceEvent::Turn(TurnEvent::Finished { turn_id, text, .. }) => send_words(turn_id, text),
         VoiceEvent::Turn(turn) => show_turn(turn),  // started, cancelled
-        VoiceEvent::State(state) => show(state),   // listening, recognising, playback
+        VoiceEvent::State(state) => show(state),   // listening, recognising, playback, microphone
         VoiceEvent::Level(level) => meter(level),  // the microphone, from 0 to 1
         VoiceEvent::Error(error) => tell(error.code),
     }
