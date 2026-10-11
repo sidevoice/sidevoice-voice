@@ -187,6 +187,28 @@ impl Queue {
         counters.flush_to.store(self.produced, Ordering::Release);
     }
 
+    /// Whether nothing waits and nothing queued is left to play.
+    pub(crate) fn is_idle(&self) -> bool {
+        self.pending.is_empty() && self.schedule.chunks.is_empty()
+    }
+
+    /// Gives up on everything queued, as on a speaker that went away: each chunk not yet over starts, if it had not,
+    /// and ends, in order. The queue is empty after.
+    pub(crate) fn abandon(&mut self) -> Vec<IoEvent> {
+        let mut events = self.schedule.due(u64::MAX);
+        for pending in self.pending.drain(..) {
+            events.push(IoEvent::ChunkStarted {
+                utterance: pending.utterance.clone(),
+                chunk: pending.chunk,
+            });
+            events.push(IoEvent::ChunkPlayed {
+                utterance: pending.utterance,
+                chunk: pending.chunk,
+            });
+        }
+        events
+    }
+
     /// Moves what waits into `ring`, as much as it has room for, in order.
     pub(crate) fn feed(&mut self, ring: &mut Producer<f32>) {
         while let Some(pending) = self.pending.front_mut() {
