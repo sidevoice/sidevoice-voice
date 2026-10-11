@@ -136,8 +136,8 @@ pub(crate) fn smoke() -> Result<()> {
 }
 
 /// Whether the smoke test's report shows a call that ran: it loaded the page's models once, started the microphone and
-/// speaker, and told its state as listening; the package offers the default web microphone and speaker; and its voice
-/// seam answers as `VoiceHost` says.
+/// speaker, and told its state as listening; the package offers the default web microphone and speaker, which reports a
+/// capture processor that threw as a failure; and its voice seam answers as `VoiceHost` says.
 fn check_smoke(report: &Value) -> Result<()> {
     let (loaded, want) = (&report["loaded"], json!(SMOKE_SLOTS));
     if *loaded != want {
@@ -160,6 +160,14 @@ fn check_smoke(report: &Value) -> Result<()> {
     }
     if report["webAudioIo"] != "function" {
         return Err(format!("the package has no createWebAudioIo: {report}"));
+    }
+    // A capture worklet whose processor throws ends the capture, as a failure the page hears.
+    let web_audio = json!({"processorError": ["ready", "audio-capture-failed"]});
+    if report["webAudio"] != web_audio {
+        return Err(format!(
+            "the web microphone and speaker answered {}, not {web_audio}",
+            report["webAudio"]
+        ));
     }
     let host = &report["host"];
     let want = json!({

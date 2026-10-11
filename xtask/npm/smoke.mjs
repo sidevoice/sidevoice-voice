@@ -1,8 +1,8 @@
 // `cargo xtask npm-smoke` (xtask/src/npm.rs) runs this from a directory where @sidevoice/voice was installed from
 // its tarball, as a consumer installs it: the package as Node resolves it, its wasm (the file named by the first
 // argument, relative to the entry point) read from node_modules, and a call started on plain-object models (the
-// interfaces of js/voice-models.d.ts) and a plain-object microphone and speaker. It prints what it saw; the checks
-// are xtask's.
+// interfaces of js/voice-models.d.ts) and a plain-object microphone and speaker, and the default web microphone and
+// speaker on a fake browser. It prints what it saw; the checks are xtask's.
 import { readFileSync } from "node:fs";
 import { createVoiceHost, createWebAudioIo, initSync, VoiceCall } from "@sidevoice/voice";
 
@@ -157,6 +157,43 @@ host.smartMissing = await code(voice.start());
 await until(() => states.at(-1) === "idle");
 host.states = states;
 host.seam = Object.keys(voice).sort();
+// The default microphone and speaker on a fake browser, whose capture worklet's processor throws once it runs: what
+// the sink hears, in order.
+const browser = { node: null };
+const track = { stop() {}, onended: null };
+Object.defineProperty(globalThis, "navigator", {
+  configurable: true,
+  value: { mediaDevices: { getUserMedia: async () => ({ getTracks: () => [track], getAudioTracks: () => [track] }) } },
+});
+globalThis.AudioContext = class {
+  destination = {};
+  audioWorklet = { addModule: async () => {} };
+  createGain = () => ({ gain: {}, connect() {} });
+  createMediaStreamSource = () => ({ connect: (node) => node });
+  resume = async () => {};
+  close = async () => {};
+};
+globalThis.AudioWorkletNode = class {
+  port = {};
+  onprocessorerror = null;
+  constructor() {
+    browser.node = this;
+  }
+  connect() {}
+};
+const heard = [];
+await new Promise((resolve) => {
+  createWebAudioIo().start({
+    ready: () => resolve(heard.push("ready")),
+    captured() {},
+    chunkStarted() {},
+    chunkPlayed() {},
+    failed: (code) => resolve(heard.push(code)),
+  });
+  setTimeout(resolve, 5000);
+});
+browser.node?.onprocessorerror?.(new Event("processorerror"));
+const webAudio = { processorError: heard };
 console.log(
   JSON.stringify({
     wasm: wasm.pathname,
@@ -167,6 +204,7 @@ console.log(
     state: callState,
     errors,
     webAudioIo: typeof createWebAudioIo,
+    webAudio,
     host,
   }),
 );
