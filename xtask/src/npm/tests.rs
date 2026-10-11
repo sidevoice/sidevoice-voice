@@ -92,6 +92,7 @@ fn a_smoke_report_must_show_a_running_call() {
         "webAudio": {
             "asked": ["mic-a", "mic-b", null], "stopped": ["track-1", "track-2", "track-3"], "sinks": ["out-c"],
             "lost": [["input", "mic-b"]], "failed": ["microphone-lost"], "ready": 1, "worklets": 1, "outputSelectable": true,
+            "processorError": ["ready", "audio-capture-failed"],
         },
         "host": {
             "missing": "settings-missing", "unknown": "model-unknown", "reloaded": 1,
@@ -121,6 +122,14 @@ fn a_smoke_report_must_show_a_running_call() {
         (
             "webAudio",
             json!({"asked": ["mic-a"], "failed": ["microphone-lost"]}),
+        ),
+        (
+            "webAudio",
+            json!({
+                "asked": ["mic-a", "mic-b", null], "stopped": ["track-1", "track-2", "track-3"], "sinks": ["out-c"],
+                "lost": [["input", "mic-b"]], "failed": ["microphone-lost"], "ready": 1, "worklets": 1, "outputSelectable": true,
+                "processorError": ["ready"],
+            }),
         ),
         ("host", json!(null)),
     ] {

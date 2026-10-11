@@ -1,8 +1,8 @@
 // `cargo xtask npm-smoke` (xtask/src/npm.rs) runs this from a directory where @sidevoice/voice was installed from
 // its tarball, as a consumer installs it: the package as Node resolves it, its wasm (the file named by the first
 // argument, relative to the entry point) read from node_modules, and a call started on plain-object models (the
-// interfaces of js/voice-models.d.ts) and a plain-object microphone and speaker. It prints what it saw; the checks
-// are xtask's.
+// interfaces of js/voice-models.d.ts) and a plain-object microphone and speaker, and the default web microphone and
+// speaker on a fake browser. It prints what it saw; the checks are xtask's.
 import { readFileSync } from "node:fs";
 import { createVoiceHost, createWebAudioIo, initSync, VoiceCall } from "@sidevoice/voice";
 
@@ -190,7 +190,7 @@ host.seam = Object.keys(voice).sort();
 // microphone, switched mid-call (the new one open before the old one is let go, the worklet kept), the chosen one
 // gone (the default one again, said through onDeviceLost, the call going on), the output chosen with setSinkId, and the
 // default one gone (the call ends: microphone-lost).
-const webAudio = { asked: [], stopped: [], sinks: [], lost: [], failed: [], ready: 0, worklets: 0 };
+const webAudio = { asked: [], stopped: [], sinks: [], lost: [], failed: [], ready: 0 };
 let opened = 0;
 const media = (deviceId) => {
   const track = { id: `track-${++opened}`, onended: null, stop() { webAudio.stopped.push(track.id); } };
@@ -200,7 +200,12 @@ let lastStream = null;
 Object.defineProperty(globalThis, "navigator", { configurable: true, value: { mediaDevices: {
   getUserMedia: async ({ audio }) => { webAudio.asked.push(audio.deviceId?.exact ?? null); return (lastStream = media(audio.deviceId?.exact ?? null)); },
 } } });
-globalThis.AudioWorkletNode = class { constructor() { webAudio.worklets++; this.port = {}; } connect(node) { return node; } };
+// Every capture worklet made, the last one first.
+const worklets = [];
+globalThis.AudioWorkletNode = class {
+  constructor() { worklets.unshift(this); this.port = {}; this.onprocessorerror = null; }
+  connect(node) { return node; }
+};
 globalThis.AudioContext = class {
   constructor() { this.audioWorklet = { addModule: async () => {} }; this.destination = {}; this.currentTime = 0; }
   createMediaStreamSource(stream) { return { stream, connect(node) { return node; }, disconnect() {} }; }
@@ -219,6 +224,21 @@ await until(() => webAudio.lost.length > 0);
 lastStream.track.onended();
 await until(() => webAudio.failed.length > 0);
 webAudio.outputSelectable = webIo.outputSelectable;
+webAudio.worklets = worklets.length;
+const devicesSeen = structuredClone(webAudio);
+
+// The default microphone again, whose capture worklet's processor throws once it runs: what the sink hears, in order.
+const processorError = [];
+createWebAudioIo().start({
+  ready: () => processorError.push("ready"),
+  captured() {},
+  chunkStarted() {},
+  chunkPlayed() {},
+  failed: (code) => processorError.push(code),
+});
+await until(() => processorError.length > 0);
+worklets[0].onprocessorerror?.(new Event("processorerror"));
+await until(() => processorError.length > 1);
 console.log(
   JSON.stringify({
     wasm: wasm.pathname,
@@ -229,7 +249,7 @@ console.log(
     state: callState,
     errors,
     webAudioIo: typeof createWebAudioIo,
-    webAudio,
+    webAudio: { ...devicesSeen, processorError },
     host,
   }),
 );

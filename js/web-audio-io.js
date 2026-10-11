@@ -9,7 +9,8 @@
 //   what is queued. A chunk has started when the context's clock reaches its start time, and is played when its
 //   source ends.
 // - Failures reach `sink.failed(code)` as stable codes: `microphone-denied`, `microphone-unavailable`,
-//   `microphone-lost`, `audio-capture-failed`, `audio-output-failed`. Once failed, it is stopped.
+//   `microphone-lost`, `audio-capture-failed` (the worklet failed to load, or its processor threw),
+//   `audio-output-failed`. Once failed, it is stopped.
 // - The microphone and the output can be chosen by id, at start (`inputDevice`, `outputDevice`) or at any time
 //   (`setInputDevice`, `setOutputDevice`): a call that runs switches without ending. A chosen microphone that goes
 //   away falls back to the default one, and `onDeviceLost` hears it; only the default one going away ends the call.
@@ -168,6 +169,8 @@ export function createWebAudioIo(options = {}) {
     microphone = context.createMediaStreamSource(stream);
     capture = new AudioWorkletNode(context, "sidevoice-capture");
     capture.port.onmessage = ({ data }) => current() && sink.captured(data);
+    // A processor that throws posts nothing again: the capture is over, not quiet.
+    capture.onprocessorerror = () => current() && fail("audio-capture-failed");
     // Connected through to the destination so that every browser runs it; it outputs silence.
     microphone.connect(capture).connect(context.destination);
     try {
