@@ -9,7 +9,8 @@
 //   what is queued. A chunk has started when the context's clock reaches its start time, and is played when its
 //   source ends.
 // - Failures reach `sink.failed(code)` as stable codes: `microphone-denied`, `microphone-unavailable`,
-//   `microphone-lost`, `audio-capture-failed`, `audio-output-failed`. Once failed, it is stopped.
+//   `microphone-lost`, `audio-capture-failed` (the worklet failed to load, or its processor threw),
+//   `audio-output-failed`. Once failed, it is stopped.
 
 const FADE_SECONDS = 0.03;
 
@@ -116,6 +117,8 @@ export function createWebAudioIo(options = {}) {
     const microphone = context.createMediaStreamSource(stream);
     const capture = new AudioWorkletNode(context, "sidevoice-capture");
     capture.port.onmessage = ({ data }) => current() && sink.captured(data);
+    // A processor that throws posts nothing again: the capture is over, not quiet.
+    capture.onprocessorerror = () => current() && fail("audio-capture-failed");
     // Connected through to the destination so that every browser runs it; it outputs silence.
     microphone.connect(capture).connect(context.destination);
     try {

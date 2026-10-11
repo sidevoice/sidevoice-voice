@@ -89,6 +89,7 @@ fn a_smoke_report_must_show_a_running_call() {
         "said": {"id": "string", "steps": ["playing", "progress", "progress", "done"], "outcome": {"status": "heard"}},
         "state": {"listening": "listening", "recognising": 0, "playback": "idle", "online": true},
         "webAudioIo": "function",
+        "webAudio": {"processorError": ["ready", "audio-capture-failed"]},
         "host": {
             "missing": "settings-missing", "unknown": "model-unknown", "reloaded": 1,
             "smartMissing": "end-of-turn-missing", "flags": ["muted"],
@@ -111,6 +112,7 @@ fn a_smoke_report_must_show_a_running_call() {
         ),
         ("state", json!(null)),
         ("webAudioIo", json!("undefined")),
+        ("webAudio", json!({"processorError": ["ready"]})),
         ("host", json!(null)),
     ] {
         let mut report = ran.clone();
