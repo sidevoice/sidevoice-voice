@@ -62,6 +62,16 @@ call.start();
 for (let waited = 0; state?.listening !== "listening" && errors.length === 0 && waited < 5000; waited += 10) {
   await new Promise((resolve) => setTimeout(resolve, 10));
 }
+// The microphone's device going quiet and giving audio again: the call's state says each.
+const microphone = [];
+for (const muted of [true, false]) {
+  speaker.microphoneMuted(muted);
+  const want = muted ? "muted" : "live";
+  for (let waited = 0; state?.microphone !== want && waited < 5000; waited += 10) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  microphone.push(state?.microphone);
+}
 // Something said: its handle tells the steps and how it ended.
 const saying = call.say("The smoke test speaks this sentence.", { language: "en" });
 const steps = [];
@@ -157,10 +167,10 @@ host.smartMissing = await code(voice.start());
 await until(() => states.at(-1) === "idle");
 host.states = states;
 host.seam = Object.keys(voice).sort();
-// The default microphone and speaker on a fake browser, whose capture worklet's processor throws once it runs: what
-// the sink hears, in order.
+// The default microphone and speaker on a fake browser, whose microphone track starts muted, gives audio, then is muted
+// again, and whose capture worklet's processor throws once it runs: what the sink hears, in order.
 const browser = { node: null };
-const track = { stop() {}, onended: null };
+const track = { stop() {}, muted: true, onended: null, onmute: null, onunmute: null };
 Object.defineProperty(globalThis, "navigator", {
   configurable: true,
   value: { mediaDevices: { getUserMedia: async () => ({ getTracks: () => [track], getAudioTracks: () => [track] }) } },
@@ -188,12 +198,15 @@ await new Promise((resolve) => {
     captured() {},
     chunkStarted() {},
     chunkPlayed() {},
+    microphoneMuted: (muted) => heard.push(muted ? "muted" : "unmuted"),
     failed: (code) => resolve(heard.push(code)),
   });
   setTimeout(resolve, 5000);
 });
+track.onunmute?.();
+track.onmute?.();
 browser.node?.onprocessorerror?.(new Event("processorerror"));
-const webAudio = { processorError: heard };
+const webAudio = { heard };
 console.log(
   JSON.stringify({
     wasm: wasm.pathname,
@@ -203,6 +216,7 @@ console.log(
     said,
     state: callState,
     errors,
+    microphone,
     webAudioIo: typeof createWebAudioIo,
     webAudio,
     host,

@@ -67,6 +67,20 @@ pub struct CallState {
     pub recognising: usize,
     /// The speaker.
     pub playback: PlaybackState,
+    /// Whether the microphone gives audio.
+    pub microphone: Microphone,
+}
+
+/// Whether the microphone gives audio, whatever the person's mute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Microphone {
+    /// It gives audio, or the call is not started.
+    Live,
+    /// Its device gives none for now (a muted `MediaStreamTrack`: another app or the system holds it, or the device
+    /// stopped delivering); the call hears silence until it is live again. Not the person's mute, which is
+    /// [`Listening::Muted`].
+    Muted,
 }
 
 /// Where the microphone is.

@@ -33,6 +33,9 @@ pub enum IoEvent {
         /// The chunk's index in it.
         chunk: usize,
     },
+    /// Whether the microphone's device gives no audio for now (muted by the browser or the system, not by the person),
+    /// each time that changes.
+    MicrophoneMuted(bool),
     /// The microphone or the speaker failed, as a stable code; the call stops.
     Failed(String),
 }
