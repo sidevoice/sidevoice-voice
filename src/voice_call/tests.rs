@@ -846,3 +846,45 @@ fn a_take_ends_before_the_failure_that_ends_its_listening() {
         assert_eq!(code, "microphone-lost");
     });
 }
+
+#[test]
+fn fatal_live_configuration_ends_take_and_playback_before_error() {
+    runtime().block_on(async {
+        let (call, mut events, speakers) = call(FakeModels::default());
+        call.start(StartOptions { take: true });
+        next(&mut events, |event| match event {
+            VoiceEvent::State(state) if state.listening == crate::Listening::Listening => Some(()),
+            _ => None,
+        })
+        .await;
+        let sink = speakers.lock().unwrap().sink.clone().unwrap();
+        sink.send(IoEvent::Rendered(vec![0.8; WINDOW]));
+        sink.send(IoEvent::Captured(vec![0.0; WINDOW]));
+        next(&mut events, |event| match event {
+            VoiceEvent::PlaybackLevel(level) if level > 0.0 => Some(()),
+            _ => None,
+        })
+        .await;
+        call.set_config(VoiceConfig {
+            end_of_turn: crate::EndOfTurn::SmartTurn,
+            ..config()
+        });
+        let sequence = next(&mut events, |event| match event {
+            VoiceEvent::Take(_) => Some("take"),
+            VoiceEvent::PlaybackLevel(level) if level == 0.0 => Some("zero"),
+            VoiceEvent::Error(error) if error.code == "end-of-turn-missing" => Some("error"),
+            _ => None,
+        })
+        .await;
+        assert_eq!(sequence, "take");
+        for expected in ["zero", "error"] {
+            let actual = next(&mut events, |event| match event {
+                VoiceEvent::PlaybackLevel(level) if level == 0.0 => Some("zero"),
+                VoiceEvent::Error(error) if error.code == "end-of-turn-missing" => Some("error"),
+                _ => None,
+            })
+            .await;
+            assert_eq!(actual, expected);
+        }
+    });
+}

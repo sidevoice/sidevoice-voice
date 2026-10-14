@@ -38,10 +38,26 @@ class PlaybackProcessor extends AudioWorkletProcessor {
     this.previous = 0;
     this.frame = new Float32Array(FRAME);
     this.filled = 0;
-    // A stalled page may keep only four frames in flight; old envelopes are discarded.
+    this.frameStart = 0;
+    this.frameEnd = 0;
+    this.outputFrame = 0;
+    // A stalled page keeps the newest unposted frame, replacing obsolete telemetry.
     this.inFlight = 0;
+    this.latest = null;
     this.port.onmessage = ({ data }) => {
-      if (data === "ack") this.inFlight = Math.max(0, this.inFlight - 1);
+      if (data === "ack") {
+        this.inFlight = Math.max(0, this.inFlight - 1);
+        if (this.latest) {
+          const latest = this.latest;
+          this.latest = null;
+          this.report(latest);
+        }
+      } else if (data?.type === "fence") {
+        // Port messages are ordered: all reports posted before this processor boundary arrive before the marker.
+        // An unposted frame is obsolete telemetry, so a fence discards it.
+        this.latest = null;
+        this.port.postMessage({ type: "fence", id: data.id });
+      }
     };
   }
 
@@ -50,6 +66,8 @@ class PlaybackProcessor extends AudioWorkletProcessor {
     const output = outputs[0] || [];
     const length = output[0]?.length ?? input[0]?.length ?? 0;
     if (!length) return true;
+    const blockStart = typeof currentFrame === "number" ? currentFrame : this.outputFrame;
+    this.outputFrame = blockStart + length;
     for (let channel = 0; channel < output.length; channel++) {
       output[channel].set(input[channel] ?? input[0] ?? new Float32Array(length));
     }
@@ -62,7 +80,7 @@ class PlaybackProcessor extends AudioWorkletProcessor {
       const index = Math.floor(this.position);
       const before = index < 0 ? this.previous : mono[index];
       const after = mono[index + 1];
-      this.push(before + (after - before) * (this.position - index));
+      this.push(before + (after - before) * (this.position - index), blockStart + this.position);
       this.position += this.step;
     }
     this.position -= length;
@@ -70,13 +88,21 @@ class PlaybackProcessor extends AudioWorkletProcessor {
     return true;
   }
 
-  push(sample) {
+  report(frame) {
+    if (this.inFlight < 4) {
+      this.port.postMessage(frame, [frame.samples.buffer]);
+      this.inFlight++;
+    } else {
+      this.latest = frame;
+    }
+  }
+
+  push(sample, position) {
+    if (this.filled === 0) this.frameStart = position;
+    this.frameEnd = position + 1;
     this.frame[this.filled++] = sample;
     if (this.filled === FRAME) {
-      if (this.inFlight < 4) {
-        this.port.postMessage(this.frame, [this.frame.buffer]);
-        this.inFlight++;
-      }
+      this.report({ samples: this.frame, startFrame: this.frameStart, endFrame: this.frameEnd });
       this.frame = new Float32Array(FRAME);
       this.filled = 0;
     }

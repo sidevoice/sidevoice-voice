@@ -1,5 +1,6 @@
 // The browser's microphone and speaker for a call, `createWebAudioIo(options)`: an object with `start(sink)`,
 // `play(utterance, chunk, samples, sampleRate)`, `stopPlayback()` and `stop()`, reporting to `sink` (`captured`,
+// `rendered(samples)` (16 kHz output after gain/fade), `playbackEnded()` (terminal zero),
 // `chunkStarted`, `chunkPlayed`, `failed`).
 //
 // - Capture is `getUserMedia` with the browser's echo cancellation, noise suppression and gain control: the browser's
@@ -11,8 +12,8 @@
 // - A microphone whose track the browser mutes (another app or the system holds it, or the device stopped delivering)
 //   gives silence, not a failure: `sink.microphoneMuted(true)` says so, and `false` once it gives audio again.
 // - Failures reach `sink.failed(code)` as stable codes: `microphone-denied`, `microphone-unavailable`,
-//   `microphone-lost`, `audio-capture-failed` (the worklet failed to load, or its processor threw),
-//   `audio-output-failed`. Once failed, it is stopped.
+//   `microphone-lost`, `audio-capture-failed` (capture worklet load/processor),
+//   `audio-output-failed` (playback worklet/output). Once failed, it is stopped.
 // - The microphone and the output can be chosen by id, at start (`inputDevice`, `outputDevice`) or at any time
 //   (`setInputDevice`, `setOutputDevice`): a call that runs switches without ending. A chosen microphone that goes
 //   away falls back to the default one, and `onDeviceLost` hears it; only the default one going away ends the call.
@@ -55,6 +56,9 @@ export function createWebAudioIo(options = {}) {
   let output = null;
   let meter = null;
   let rendering = false;
+  let active = null;
+  const closing = new Map();
+  let deferred = null;
   let sources = new Set();
   let queueEnd = 0;
   // Each callback checks the generation it was made in, so that nothing reports after what dropped it: `session`
@@ -91,6 +95,9 @@ export function createWebAudioIo(options = {}) {
     meter && (meter.port.onmessage = null);
     meter = null;
     rendering = false;
+    active = null;
+    closing.clear();
+    deferred = null;
     context?.close().catch(() => {});
     context = null;
     output = null;
@@ -114,6 +121,24 @@ export function createWebAudioIo(options = {}) {
   function newOutput() {
     output = context.createGain();
     output.connect(meter);
+  }
+
+  const outputFrame = (time) => Math.ceil(time * (context?.sampleRate || 16000));
+
+  // The processor's fence is ordered behind its posted frames. A later play may already be scheduled, so hold its
+  // first report until the old playback's terminal zero has crossed the sink.
+  function closePlayback(epoch, endTime, waitMs = 0) {
+    if (!epoch || closing.has(epoch.id)) return;
+    epoch.endFrame = outputFrame(endTime);
+    if (active === epoch) active = null;
+    rendering = false;
+    closing.set(epoch.id, epoch);
+    const opened = session;
+    setTimeout(() => {
+      if (opened === session && closing.has(epoch.id)) {
+        meter.port.postMessage({ type: "fence", id: epoch.id });
+      }
+    }, waitMs);
   }
 
   /** The microphone `id` (null: the default), with the call's capture constraints. Rejects with a stable `code`. */
@@ -186,9 +211,13 @@ export function createWebAudioIo(options = {}) {
     useStream(media, current);
     try {
       await context.audioWorklet.addModule(new URL("./capture-worklet.js", import.meta.url).href);
-      await context.audioWorklet.addModule(new URL("./playback-worklet.js", import.meta.url).href);
     } catch {
       return current() && fail("audio-capture-failed");
+    }
+    try {
+      await context.audioWorklet.addModule(new URL("./playback-worklet.js", import.meta.url).href);
+    } catch {
+      return current() && fail("audio-output-failed");
     }
     if (!current()) {
       return;
@@ -202,8 +231,26 @@ export function createWebAudioIo(options = {}) {
     microphone.connect(capture).connect(context.destination);
     meter = new AudioWorkletNode(context, "sidevoice-playback", { outputChannelCount: [1] });
     meter.port.onmessage = ({ data }) => {
+      if (!current()) return;
+      if (data?.type === "fence") {
+        if (!closing.delete(data.id)) return;
+        sink.playbackEnded();
+        if (closing.size === 0 && deferred && active && deferred.id === active.id) {
+          sink.rendered(deferred.samples);
+        }
+        if (closing.size === 0) deferred = null;
+        return;
+      }
       meter.port.postMessage("ack");
-      if (current() && rendering) sink.rendered(data);
+      const { samples, startFrame, endFrame } = data ?? {};
+      if (!(samples instanceof Float32Array) || !Number.isFinite(startFrame) || !Number.isFinite(endFrame)) return;
+      // A suspended main thread may receive seconds-old output after the processor has moved on.
+      if (outputFrame(context.currentTime) - endFrame > (context.sampleRate || 16000) / 4) return;
+      const epoch = active && startFrame >= active.startFrame ? active
+        : [...closing.values()].find((past) => startFrame >= past.startFrame && endFrame <= past.endFrame);
+      if (!epoch || (epoch.endFrame !== undefined && endFrame > epoch.endFrame)) return;
+      if (epoch === active && closing.size > 0) deferred = { id: epoch.id, samples };
+      else sink.rendered(samples);
     };
     meter.onprocessorerror = () => current() && fail("audio-output-failed");
     meter.connect(context.destination);
@@ -258,6 +305,12 @@ export function createWebAudioIo(options = {}) {
       if (context) {
         try {
           await context.setSinkId(next ?? "");
+          // A changed output is a boundary for queued telemetry, even if playback continues on the new device.
+          const boundary = outputFrame(context.currentTime);
+          if (active) active.startFrame = boundary;
+          for (const past of closing.values()) past.startFrame = Math.max(past.startFrame, boundary);
+          deferred = null;
+          sink?.playbackEnded();
         } catch (error) {
           throw Object.assign(new Error(error?.message || "setSinkId"), { code: "audio-output-failed" });
         }
@@ -280,8 +333,13 @@ export function createWebAudioIo(options = {}) {
       if (!context || !output) {
         return;
       }
-      rendering = true;
+      if (!rendering) {
+        playback++;
+        active = { id: playback, startFrame: outputFrame(Math.max(context.currentTime, queueEnd)) };
+        rendering = true;
+      }
       const played = playback;
+      const epoch = active;
       const current = () => played === playback;
       let buffer;
       try {
@@ -302,8 +360,8 @@ export function createWebAudioIo(options = {}) {
         if (current()) {
           sink.chunkPlayed(utterance, chunk);
           if (sources.size === 0) {
-            rendering = false;
-            sink.playbackEnded();
+            playback++;
+            closePlayback(epoch, queueEnd);
           }
         }
       };
@@ -328,7 +386,6 @@ export function createWebAudioIo(options = {}) {
         return;
       }
       playback++;
-      const played = playback;
       const now = context.currentTime;
       output.gain.setValueAtTime(output.gain.value, now);
       output.gain.linearRampToValueAtTime(0, now + FADE_SECONDS);
@@ -338,12 +395,10 @@ export function createWebAudioIo(options = {}) {
       }
       sources = new Set();
       const faded = output;
+      const epoch = active;
+      closePlayback(epoch, now + FADE_SECONDS, FADE_SECONDS * 2000);
       setTimeout(() => {
         faded.disconnect();
-        if (played === playback && sources.size === 0 && sink) {
-          rendering = false;
-          sink.playbackEnded();
-        }
       }, FADE_SECONDS * 2000);
       newOutput();
       queueEnd = 0;

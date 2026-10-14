@@ -5,9 +5,9 @@ use std::sync::atomic::Ordering;
 
 use rtrb::RingBuffer;
 
-use super::drain;
 use super::output::{Counters, Output, Queue, Schedule};
 use super::pipeline::Pipeline;
+use super::{drain, playback_complete};
 use crate::io::IoEvent;
 use crate::test_support::{clip, QUILTER};
 
@@ -34,6 +34,60 @@ fn what_plays_is_the_reference_and_silence_fills_the_gaps() {
     assert_eq!(counters.consumed.load(Ordering::Acquire), 3);
     let copied: Vec<f32> = (0..5).map(|_| reference.pop().unwrap()).collect();
     assert_eq!(copied, out);
+}
+
+#[test]
+fn completion_waits_for_a_callback_that_publishes_after_the_reference_drain() {
+    let (mut playback, mut player, mut reference, counters) = output(4);
+    let mut queue = Queue::default();
+    queue.play("u".into(), 0, vec![0.8; 160]);
+    queue.feed(&mut playback);
+    let mut drained = Vec::new();
+    drain(&mut reference, &mut drained, 1);
+    let mut count = drained.len() as u64;
+    // The output callback completes between the worker's drain and its completion observation.
+    for _ in 0..160 {
+        player.next(&counters);
+    }
+    player.publish(&counters);
+    let consumed = counters.consumed.load(Ordering::Acquire);
+    queue.schedule.due(consumed);
+    assert!(queue.is_idle());
+    assert!(!playback_complete(
+        None,
+        true,
+        true,
+        consumed,
+        counters.referenced.load(Ordering::Acquire),
+        count,
+    ));
+    drain(&mut reference, &mut drained, 1);
+    count += drained.len() as u64;
+    assert!(drained.iter().any(|sample| *sample > 0.0));
+    let mut pipeline = Pipeline::new(16_000, 1, 16_000).unwrap();
+    let mut events = vec![IoEvent::Rendered(pipeline.render(&drained))];
+    assert!(playback_complete(
+        None,
+        true,
+        true,
+        consumed,
+        counters.referenced.load(Ordering::Acquire),
+        count,
+    ));
+    events.push(IoEvent::PlaybackEnded);
+    pipeline.reset_playback_meter();
+    for _ in 0..160 {
+        player.next(&counters);
+    }
+    drain(&mut reference, &mut drained, 1);
+    assert!(pipeline
+        .render(&drained)
+        .iter()
+        .all(|sample| *sample == 0.0));
+    assert!(matches!(events.last(), Some(IoEvent::PlaybackEnded)));
+    assert!(!playback_complete(
+        None, false, true, consumed, count, count
+    ));
 }
 
 #[test]

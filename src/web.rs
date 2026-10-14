@@ -7,6 +7,7 @@
 //! - `io` is an object with `start(sink)`, `play(utterance, chunk, samples, sampleRate)`, `stopPlayback()` and
 //!   `stop()`; it reports through `sink` (an [`IoSink`](crate::IoSink): `ready()` once the microphone and the
 //!   speaker work, which is when the call listens, `captured(samples)`, with 16 kHz mono samples,
+//!   `rendered(samples)` with 16 kHz post-gain speaker samples, `playbackEnded()` as the terminal playback marker,
 //!   `chunkStarted(utterance, chunk)`, `chunkPlayed(utterance, chunk)`, `failed(code)`). `start` may throw an error
 //!   with a `code`.
 //! - `config` is the configuration as JSON ([`VoiceConfig`]); a malformed one throws.

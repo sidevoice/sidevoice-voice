@@ -14,8 +14,8 @@ mod tests;
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use futures_channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures_util::future::{abortable, ready, select, AbortHandle, Either};
@@ -24,7 +24,7 @@ use futures_util::{stream, Stream, StreamExt};
 use crate::call::{Call, Effect, Input};
 use crate::config::{EndOfTurn, VoiceConfig};
 use crate::event::{VoiceError, VoiceEvent};
-use crate::io::{AudioIo, IoEvent, IoSink};
+use crate::io::{AudioIo, IoEvent, IoSink, RenderedMailbox};
 use crate::level::{instant, Level};
 use crate::maybe_send::MaybeSend;
 use crate::models::{Models, VadFrame, VoiceModels};
@@ -79,6 +79,7 @@ pub(crate) enum Message {
     CancelInput,
     Models(Arc<dyn VoiceModels>, Box<VoiceConfig>),
     Io(u64, IoEvent),
+    Rendered(u64),
     EndOfTurn {
         turn: usize,
         pause: u32,
@@ -137,7 +138,7 @@ impl VoiceCall {
             captured: VecDeque::new(),
             rendered: VecDeque::new(),
             playback_level: Level::default(),
-            pending_rendered: Arc::new(AtomicUsize::new(0)),
+            rendered_mailbox: Arc::new(Mutex::new(RenderedMailbox::default())),
             generation: 0,
             taken: 0,
             taking: false,
@@ -232,7 +233,7 @@ struct Driver {
     /// Rendered 16 kHz speaker samples waiting for capture's detector windows.
     rendered: VecDeque<f32>,
     playback_level: Level,
-    pending_rendered: Arc<AtomicUsize>,
+    rendered_mailbox: Arc<Mutex<RenderedMailbox>>,
     /// A new start rejects any queued report from an older microphone or speaker.
     generation: u64,
     /// The detector's position: samples taken into windows since its last reset.
@@ -376,9 +377,6 @@ impl Driver {
     }
 
     async fn receive(&mut self, message: Message) {
-        if let Message::Io(_, IoEvent::Rendered(_)) = &message {
-            self.pending_rendered.fetch_sub(1, Ordering::AcqRel);
-        }
         match message {
             Message::Start(options) => {
                 if !self.running {
@@ -399,6 +397,7 @@ impl Driver {
                 self.configure(config);
                 if self.running && self.end_of_turn_missing() {
                     self.end_take();
+                    self.reset_playback();
                     self.error("end-of-turn-missing".into());
                     self.halt().await;
                 }
@@ -434,6 +433,25 @@ impl Driver {
             }
             Message::CancelInput => self.input(Input::Cancel),
             Message::Io(generation, _) if generation != self.generation => {}
+            Message::Rendered(generation) => {
+                let frame = self
+                    .rendered_mailbox
+                    .lock()
+                    .expect("rendered mailbox")
+                    .take(generation);
+                if generation == self.generation && self.running && !self.opening {
+                    if let Some(frame) = frame {
+                        let stale = monotonic_ms().saturating_sub(frame.at_ms) > 500;
+                        if frame.skipped || stale {
+                            self.rendered.clear();
+                            self.playback_level.reset();
+                        }
+                        if !stale {
+                            self.accept_rendered(&frame.samples);
+                        }
+                    }
+                }
+            }
             Message::Io(_, IoEvent::Ready) => {
                 if self.running && self.opening {
                     self.opening = false;
@@ -444,17 +462,7 @@ impl Driver {
             }
             Message::Io(_, IoEvent::Captured(pcm)) => self.captured(&pcm).await,
             Message::Io(_, IoEvent::Rendered(pcm)) => {
-                if self.running && !self.opening {
-                    // No leading silence may accumulate ahead of the next audible sample. Keep silence following
-                    // audio, so a short gap inside a reply still reaches the meter.
-                    if !self.rendered.is_empty() || pcm.iter().any(|sample| *sample != 0.0) {
-                        self.rendered.extend(pcm);
-                        // Drift and a stalled consumer cannot replay an old envelope seconds later.
-                        while self.rendered.len() > 4_096 {
-                            self.rendered.pop_front();
-                        }
-                    }
-                }
+                self.accept_rendered(&pcm);
             }
             Message::Io(_, IoEvent::PlaybackEnded) => self.reset_playback(),
             Message::Io(_, IoEvent::ChunkStarted { utterance, chunk }) => {
@@ -533,10 +541,14 @@ impl Driver {
         }
         self.generation = self.generation.wrapping_add(1);
         self.reset_playback();
+        self.rendered_mailbox
+            .lock()
+            .expect("rendered mailbox")
+            .advance(self.generation);
         let sink = IoSink {
             messages: self.messages.clone(),
             generation: self.generation,
-            pending_rendered: Arc::clone(&self.pending_rendered),
+            rendered: Arc::clone(&self.rendered_mailbox),
         };
         if let Err(code) = self.io.start(sink) {
             self.error(code);
@@ -630,6 +642,18 @@ impl Driver {
         self.rendered.clear();
         self.playback_level.reset();
         let _ = self.events.unbounded_send(VoiceEvent::PlaybackLevel(0.0));
+    }
+
+    fn accept_rendered(&mut self, pcm: &[f32]) {
+        if self.running && !self.opening {
+            // A silent start must not queue seconds of zeros ahead of the first audible sample.
+            if !self.rendered.is_empty() || pcm.iter().any(|sample| *sample != 0.0) {
+                self.rendered.extend(pcm);
+                while self.rendered.len() > 4_096 {
+                    self.rendered.pop_front();
+                }
+            }
+        }
     }
 
     /// Hands over the take being kept, if one is, with the marks the call kept for it: the stretch of listening it
