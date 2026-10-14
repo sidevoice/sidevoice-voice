@@ -99,6 +99,31 @@ fn something_with_nothing_to_say_is_heard_at_once() {
 }
 
 #[test]
+fn several_same_turn_replies_play_fifo_without_replacement() {
+    let mut playback = Playback::default();
+    let mut actions = Vec::new();
+    for (id, text) in [
+        ("ack", LONG[0]),
+        ("checkpoint", LONG[1]),
+        ("result", LONG[2]),
+    ] {
+        push(&mut playback, id, text, &mut actions);
+    }
+    for id in ["ack", "checkpoint", "result"] {
+        playback.start(&mut actions);
+        assert!(actions.iter().any(|action| matches!(action,
+            Action::Synthesize { utterance, chunk: 0, .. } if utterance == id)));
+        actions.clear();
+        playback.synthesized(id, 0, Ok((vec![0.0], 16_000)), &mut actions);
+        playback.chunk_started(id, 0, &mut actions);
+        playback.chunk_played(id, 0, &mut actions);
+        assert_eq!(outcomes(&actions), [(id.into(), SayOutcome::Heard)]);
+        actions.clear();
+    }
+    assert!(!playback.waiting() && !playback.busy());
+}
+
+#[test]
 fn a_barge_in_cuts_what_sounds_where_it_was_heard_and_drops_the_queue() {
     let mut playback = Playback::default();
     let mut actions = Vec::new();

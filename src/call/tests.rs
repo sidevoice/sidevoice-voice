@@ -302,6 +302,14 @@ fn speech() -> Vec<f32> {
     clip(QUILTER, 0.9)
 }
 
+fn continuous_loud_speech(windows: usize) -> Vec<f32> {
+    (0..windows * WINDOW)
+        .map(|sample| {
+            (0.3 * (2.0 * std::f64::consts::PI * 1_000.0 * sample as f64 / 16_000.0).sin()) as f32
+        })
+        .collect()
+}
+
 #[test]
 fn a_spoken_sentence_is_one_turn_reported_after_the_merge_window() {
     let mut run = Run::new(config());
@@ -431,12 +439,7 @@ fn speech_over_a_reply_interrupts_it_and_drops_the_queue() {
     run.sound("u1", 1);
     run.take();
 
-    run.hear(
-        &clip(QUILTER, 1.0)
-            .iter()
-            .map(|s| s * 1.6)
-            .collect::<Vec<_>>(),
-    );
+    run.hear(&continuous_loud_speech(80));
     let effects = run.take();
     assert!(effects.contains(&Effect::StopPlayback));
     let turns = Run::turns(&effects);
@@ -449,9 +452,62 @@ fn speech_over_a_reply_interrupts_it_and_drops_the_queue() {
             ("u2".into(), PlaybackStatus::Unplayed, 0),
         ]
     );
+    let cuts: Vec<_> = effects
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::Event(VoiceEvent::AgentInterrupted(cut)) => {
+                Some((cut.utterance_id.as_str(), cut.heard_until, cut.played))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(cuts, [("u1", 24, true), ("u2", 0, false)]);
     // A chunk the output reports after the stop changes nothing.
     run.played("u1", 1);
     assert!(Run::playbacks(&run.take()).is_empty());
+}
+
+#[test]
+fn accepted_before_sounding_is_never_played_after_a_spoken_turn_even_if_it_has_no_words() {
+    for words in ["new request", ""] {
+        let mut run = Run::new(config());
+        run.reply(
+            "pending",
+            "This accepted reply has not reached the speaker.",
+        );
+        assert_eq!(Run::synthesize(&run.take()).len(), 1);
+        run.hear(&speech());
+        let effects = run.take();
+        assert_eq!(
+            Run::outcomes(&effects),
+            [(
+                "pending".into(),
+                SayOutcome::NotPlayed {
+                    reason: StopReason::BargeIn
+                }
+            )]
+        );
+        assert_eq!(
+            Run::turns(&effects)
+                .iter()
+                .filter(|turn| turn.phase == TurnPhase::Started)
+                .count(),
+            1
+        );
+        assert!(
+            !effects.contains(&Effect::StopPlayback),
+            "no output was queued"
+        );
+        run.hear(&silence(3_000));
+        let (turn, _) = Run::transcribe(&run.take()).expect("normal transcription");
+        run.transcribed(turn, words);
+        run.wait(2_000);
+        let effects = run.take();
+        assert!(
+            Run::synthesize(&effects).is_empty(),
+            "withdrawn audio cannot start after the turn"
+        );
+    }
 }
 
 #[test]
@@ -476,6 +532,45 @@ fn the_listening_bar_rises_while_a_reply_plays() {
     run.hear(&silence(1_000));
     run.hear(&clip(QUILTER, 0.1));
     assert_eq!(Run::turns(&run.take())[0].phase, TurnPhase::Started);
+}
+
+#[test]
+fn short_overlap_is_discarded_without_turn_transcription_or_playback_cut() {
+    let mut run = Run::new(config());
+    run.reply(
+        "ack",
+        "The agent keeps speaking through a short acknowledgement.",
+    );
+    run.sound("ack", 0);
+    run.take();
+    // Settle the 400 ms loudness block while confidence says the room contains no person speech.
+    let tone = continuous_loud_speech(64);
+    for window in tone.chunks(WINDOW) {
+        run.now += WINDOW_MS;
+        run.input(Input::Window {
+            pcm: window.to_vec(),
+            speech: false,
+            probability: Some(0.02),
+        });
+    }
+    run.take();
+    for window in continuous_loud_speech(31).chunks(WINDOW) {
+        run.now += WINDOW_MS;
+        run.input(Input::Window {
+            pcm: window.to_vec(),
+            speech: true,
+            probability: Some(0.9),
+        });
+    }
+    let effects = run.take();
+    assert!(Run::turns(&effects).is_empty());
+    assert!(Run::transcribe(&effects).is_none());
+    assert!(!effects.contains(&Effect::StopPlayback));
+    run.played("ack", 0);
+    assert_eq!(
+        Run::outcomes(&run.take()),
+        [("ack".into(), SayOutcome::Heard)]
+    );
 }
 
 #[test]
@@ -728,13 +823,18 @@ fn muting_ends_the_turn_and_cancelling_drops_it() {
     run.hear(&speech()[..16_000 * 2]);
     run.input(Input::Mute(true));
     let effects = run.take();
-    assert!(Run::transcribe(&effects).is_some());
+    assert!(
+        Run::transcribe(&effects).is_none(),
+        "mute is ordinary silence, not an instant close"
+    );
     assert!(effects.iter().any(|effect| matches!(
         effect,
         Effect::Event(VoiceEvent::State(state)) if state.listening == Listening::Muted
     )));
     run.hear(&speech());
     assert!(Run::turns(&run.take()).is_empty(), "muted");
+    run.hear(&silence(3_000));
+    assert!(Run::transcribe(&run.take()).is_some());
 
     run.input(Input::Cancel);
     let turns = Run::turns(&run.take());

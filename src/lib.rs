@@ -39,9 +39,10 @@ mod test_support;
 /// in the wasm32 build.
 #[doc(no_inline)]
 pub use async_trait::async_trait;
-pub use config::{EndOfTurn, ListeningBar, Patience, VoiceConfig};
+pub use config::{BargeInMinSpeech, EndOfTurn, ListeningBar, Patience, VoiceConfig};
 pub use event::{
-    CallState, Listening, Microphone, PlaybackState, TurnEvent, TurnTimings, VoiceError, VoiceEvent,
+    AgentInterrupted, CallState, Listening, Microphone, PlaybackState, TurnEvent, TurnTimings,
+    VoiceError, VoiceEvent,
 };
 #[cfg(native)]
 pub use io::{AudioDevice, AudioDevices, LostDevices, NativeDevices, NativeIo};

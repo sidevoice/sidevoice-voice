@@ -17,7 +17,8 @@ use std::collections::{HashMap, VecDeque};
 
 use crate::config::{EndOfTurn, VoiceConfig};
 use crate::event::{
-    CallState, Listening, Microphone, TurnEvent, TurnTimings, VoiceError, VoiceEvent,
+    AgentInterrupted, CallState, Listening, Microphone, TurnEvent, TurnTimings, VoiceError,
+    VoiceEvent,
 };
 use crate::playback::{Action, Playback};
 use crate::recognition::{accepted, Job, Outcome, Recognition};
@@ -249,11 +250,6 @@ impl Call {
             }
             Input::Mute(muted) => {
                 self.muted = muted;
-                if muted {
-                    if let Some(segment) = self.segmenter.close(0) {
-                        self.segment(now, segment, &mut out);
-                    }
-                }
             }
             Input::MicrophoneMuted(muted) => self.microphone_muted = muted,
             Input::Cancel => self.cancel_input(now, &mut out),
@@ -314,6 +310,9 @@ impl Call {
     fn window(&mut self, now: u64, pcm: &[f32], confidence: f32, out: &mut Vec<Effect>) {
         self.heard += pcm.len();
         if !self.started || self.muted {
+            if self.started && self.muted {
+                self.window_silence(now, pcm.len(), out);
+            }
             return;
         }
         let playing = self.playback.sounding();
@@ -324,6 +323,18 @@ impl Call {
             self.segment(now, segment, out);
         }
         out.push(Effect::Event(VoiceEvent::Level(self.segmenter.level())));
+    }
+
+    fn window_silence(&mut self, now: u64, samples: usize, out: &mut Vec<Effect>) {
+        let silence = vec![0.0; samples];
+        let paused = self.segmenter.paused();
+        if let Some(segment) = self
+            .segmenter
+            .window(now, &silence, 0.0, self.playback.sounding())
+        {
+            self.segment(now, segment, out);
+        }
+        self.mark_pause(paused);
     }
 
     /// What a segment does to the turns, where what was heard so far ends (a window's, the end of that window).
@@ -625,7 +636,7 @@ impl Call {
     /// Turns the playback's actions into effects.
     fn act(&mut self, actions: Vec<Action>, out: &mut Vec<Effect>) {
         for action in actions {
-            out.push(match action {
+            let effect = match action {
                 Action::Synthesize {
                     utterance,
                     chunk,
@@ -649,12 +660,40 @@ impl Call {
                     sample_rate,
                 },
                 Action::Stop => Effect::StopPlayback,
-                Action::Say { utterance, event } => Effect::Say {
-                    id: utterance,
-                    event,
-                },
+                Action::Say { utterance, event } => {
+                    let interrupted = match &event {
+                        SayEvent::Done {
+                            outcome:
+                                SayOutcome::HeardUpTo {
+                                    heard_chars,
+                                    reason: StopReason::BargeIn,
+                                },
+                        } => Some((*heard_chars, true)),
+                        SayEvent::Done {
+                            outcome:
+                                SayOutcome::NotPlayed {
+                                    reason: StopReason::BargeIn,
+                                },
+                        } => Some((0, false)),
+                        _ => None,
+                    };
+                    if let Some((heard_until, played)) = interrupted {
+                        out.push(Effect::Event(VoiceEvent::AgentInterrupted(
+                            AgentInterrupted {
+                                utterance_id: utterance.clone(),
+                                heard_until,
+                                played,
+                            },
+                        )));
+                    }
+                    Effect::Say {
+                        id: utterance,
+                        event,
+                    }
+                }
                 Action::Error(code) => Effect::Event(VoiceEvent::Error(VoiceError { code })),
-            });
+            };
+            out.push(effect);
         }
     }
 
@@ -684,5 +723,6 @@ fn segmentation(config: &VoiceConfig) -> Segmentation {
         ask: smart,
         quiet_bar: config.listening_bar.quiet,
         playing_bar: config.listening_bar.playing,
+        barge_in_min_ms: (config.barge_in_min_speech.seconds() * 1_000.0).ceil() as u32,
     }
 }

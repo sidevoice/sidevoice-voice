@@ -50,7 +50,7 @@ function devicesOf(listed, kind) {
 export function createVoiceHost(source, options = {}) {
   const { io: given, ...webAudio } = options;
   const listeners = {
-    turn: new Set(), state: new Set(), level: new Set(), "playback-level": new Set(), error: new Set(), devices: new Set(), take: new Set(),
+    turn: new Set(), state: new Set(), level: new Set(), "playback-level": new Set(), "agent-interrupted": new Set(), error: new Set(), devices: new Set(), take: new Set(),
   };
   // The chosen microphone and output (null: the system's default), kept across calls like `muted`.
   let input = webAudio.inputDevice || null;
@@ -168,6 +168,7 @@ export function createVoiceHost(source, options = {}) {
         end_of_turn: settings.end_of_turn ?? "silence",
         ...(settings.patience ? { patience: settings.patience } : {}),
         ...(settings.idle_unload_minutes != null ? { idle_unload_minutes: settings.idle_unload_minutes } : {}),
+        ...(settings.barge_in_min_speech != null ? { barge_in_min_speech: settings.barge_in_min_speech } : {}),
       };
       if (!call) {
         call = WasmVoiceCall.create(models, io, config);
@@ -218,6 +219,7 @@ export function createVoiceHost(source, options = {}) {
     onState: on("state"),
     onLevel: on("level"),
     onPlaybackLevel: on("playback-level"),
+    onAgentInterrupted: on("agent-interrupted"),
     onError: on("error"),
     onTake: on("take"),
     audioDevices: () => devices(),

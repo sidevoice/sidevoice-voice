@@ -123,7 +123,8 @@ Their failures are errors with stable codes: `microphone-denied`, `microphone-un
 - **The configuration** (`VoiceConfig`, read strictly from JSON) names no model: the `language` the transcriber is
   given, the speaker's `voice` and `speed`, what ends a turn (`end_of_turn`: `silence`, or `smart-turn`, which needs
   an `EndOfTurnModel`), the `patience` (`fast`, `normal`, `calm`), the grace before anything is said
-  (`audio_grace_ms`, 1 s), the listening bar, and how long the models stay loaded with the call stopped
+  (`audio_grace_ms`, 1 s), the listening bar, `barge_in_min_speech` (1.0 s of continuous qualified
+  capture while audio sounds), and how long the models stay loaded with the call stopped
   (`idle_unload_minutes`, 10; 0 drops them as it stops). A new configuration is in effect at once.
 - **`start` loads the models** if they are not loaded. They stay across stops, and are dropped once the call has been
   stopped for `idle_unload_minutes`; the next start loads them again, on the web as natively. `smart-turn` without an
@@ -198,7 +199,14 @@ What both promise, beyond the types:
   (`playing`, `progress` as each chunk starts and ends, then `done`), and `outcome`, a promise of how it ended: `heard`,
   `heard-up-to` with `heard_chars`, or `not-played`, the reason being `cancelled`, `barge-in`, `stopped` or `failed`
   with a code. What is said before `setSettings`, or with the call stopped, is `not-played` (`stopped`).
-- **Settings** are a choice per slot, `stt` and `tts`, with the patience, the end of turn and `idle_unload_minutes`
+- **Barge-in** waits for continuous detector speech at the raised 0.8 playback bar for
+  `barge_in_min_speech` seconds. Playback stays at full gain until then. A shorter overlap is discarded, including
+  its pre-roll, and creates no turn or transcription. A short word in silence follows the normal detector. A
+  confirmed spoken turn emits `agent-interrupted` for each displaced say: `utterance_id`, `heard_until` (Unicode
+  scalar chunk boundary, zero if never started), and `played`. The same result remains on each say handle:
+  `heard-up-to` if it sounded and `not-played` if it did not. Queued says retain FIFO while no turn opens.
+- **Settings** are a choice per slot, `stt` and `tts`, with the patience, the end of turn,
+  `barge_in_min_speech` (positive seconds, at most 60) and `idle_unload_minutes`
   (how long the models stay loaded with the call stopped; 10 by default). Of a slot the call reads only the language
   (`stt`) and the voice and speed (`tts`); everything else in it names the model as the page's source does, and goes to
   the source as the page wrote it. A rejected `setSettings` changes nothing. A change to what chooses models (any other
@@ -227,8 +235,10 @@ The call cancels the echo of its own playback, never relying on the operating sy
   thread, never in a callback. A device that changes under a stream starts the canceller over; a chosen one that goes
   away gives way to the default one (said once, as `lost`, with the next list); the default one going away stops the
   call with `audio-device-unavailable`.
-- **In the browser**, the browser's own: the page's microphone asks `getUserMedia` for `echoCancellation`, and no
-  canceller is linked into the wasm32 build, so audio is never processed twice.
+- **In the browser**, the browser's own: the page's microphone always asks `getUserMedia` for
+  `echoCancellation`; a track explicitly reporting it disabled is rejected before capture starts. The browser uses
+  its rendered speaker output as the AEC reference. The playback worklet reports rendered level only; it never
+  decides speech. No canceller is linked into the wasm32 build, so audio is never processed twice.
 - **Windows** is out of the beta: the canceller's C++ does not build there yet.
 
 ## What the call does

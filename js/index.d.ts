@@ -32,7 +32,7 @@ export interface VoiceCall {
   setModels(models: VoiceModels, config: object): void;
   /** Says `text` after whatever is being said; the handle tells how it goes and cancels it. */
   say(text: string, options?: VoiceSayOptions): VoiceSaying;
-  /** Mutes or unmutes the microphone; muting ends the open turn with what was said. */
+  /** Mutes or unmutes the microphone; muted input counts as silence and closes a turn normally. */
   mute(muted: boolean): void;
   /** Cancels what the person said that is not told yet. */
   cancelInput(): void;

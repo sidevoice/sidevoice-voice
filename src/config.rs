@@ -37,6 +37,9 @@ pub struct VoiceConfig {
     /// How loud speech must be to count.
     #[serde(default)]
     pub listening_bar: ListeningBar,
+    /// Continuous qualified speech required to interrupt sounding audio, in seconds.
+    #[serde(default)]
+    pub barge_in_min_speech: BargeInMinSpeech,
 }
 
 impl Default for VoiceConfig {
@@ -50,6 +53,7 @@ impl Default for VoiceConfig {
             audio_grace_ms: default_audio_grace_ms(),
             idle_unload_minutes: default_idle_unload_minutes(),
             listening_bar: ListeningBar::default(),
+            barge_in_min_speech: BargeInMinSpeech::default(),
         }
     }
 }
@@ -161,4 +165,38 @@ fn default_idle_unload_minutes() -> u32 {
 
 fn default_speed() -> f32 {
     1.0
+}
+
+/// A validated interruption duration, serialized as seconds. Native callers construct it with [`Self::new`].
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct BargeInMinSpeech(f32);
+
+impl BargeInMinSpeech {
+    /// Accepts finite seconds above zero and at most one minute.
+    pub fn new(seconds: f32) -> Result<Self, &'static str> {
+        if seconds.is_finite() && seconds > 0.0 && seconds <= 60.0 {
+            Ok(Self(seconds))
+        } else {
+            Err("barge_in_min_speech must be between 0 and 60 seconds")
+        }
+    }
+
+    /// The configured duration in seconds.
+    pub fn seconds(self) -> f32 {
+        self.0
+    }
+}
+
+impl Default for BargeInMinSpeech {
+    fn default() -> Self {
+        Self(1.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for BargeInMinSpeech {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let seconds = f32::deserialize(deserializer)?;
+        Self::new(seconds).map_err(serde::de::Error::custom)
+    }
 }

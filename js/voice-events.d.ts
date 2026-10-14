@@ -43,6 +43,7 @@ export type VoiceCallEvent =
   | { type: "state"; data: VoiceCallState }
   | { type: "level"; /** The microphone's smoothed level, 0 to 1. */ data: number }
   | { type: "playback-level"; /** The rendered speaker's smoothed level, 0 to 1. */ data: number }
+  | { type: "agent-interrupted"; data: { utterance_id: string; heard_until: number; played: boolean } }
   | { type: "error"; data: { code: string } }
   | { type: "take"; data: VoiceTake };
 

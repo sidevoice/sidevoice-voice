@@ -43,12 +43,14 @@ export interface VoiceSettings {
   /** How long the models stay in memory with the call stopped, in minutes (10 by default; 0: they leave as it stops).
    *  The next `start` loads them again. */
   idle_unload_minutes?: number;
+  /** Continuous raised-bar speech, in seconds, before sounding agent audio is cut (default 1.0). */
+  barge_in_min_speech?: number;
 }
 
 /** What a failed call rejects with, and what `onError` hears: rely on `code`. The desktop app adds its `key`. */
 export interface VoiceHostError {
   /** `microphone-denied`, `microphone-unavailable`, `speaker-unavailable`, `audio-device-unavailable`,
-   *  `settings-missing`, `stopped`, `end-of-turn-missing`, and the codes of the page's models and of its source's
+   *  `echo-cancellation-unavailable`, `settings-missing`, `stopped`, `end-of-turn-missing`, and the codes of the page's models and of its source's
    *  refusals of settings, as they give them. */
   code: string;
   message?: string;
@@ -97,7 +99,7 @@ export interface VoiceHost {
    *  and how it ended, and cancels it. Before `setSettings`, or with the call stopped, its outcome is `not-played`
    *  (`stopped`). */
   say(text: string, options?: VoiceSayOptions): VoiceSaying;
-  /** Mutes or unmutes the microphone; muting ends the open turn with what was said. Kept from the first call, even
+  /** Mutes or unmutes the microphone; muting feeds silence and closes an open turn normally. Kept from the first call, even
    *  before `setSettings`. */
   mute(muted: boolean): void;
   /** Cancels what the person said that is not told yet. */
@@ -111,6 +113,8 @@ export interface VoiceHost {
   /** The rendered speaker's level, 0 to 1, on detector windows (normally 32 ms); exact zero when output ends.
    *  It continues while the microphone is muted. */
   onPlaybackLevel(listener: (level: number) => void): () => void;
+  /** Each say displaced by a confirmed spoken turn, including queued says with `played: false` and `heard_until: 0`. */
+  onAgentInterrupted(listener: (cut: { utterance_id: string; heard_until: number; played: boolean }) => void): () => void;
   onError(listener: (error: VoiceHostError) => void): () => void;
   /** The take of a start that asked for one (`start({take: true})`), once per stretch of listening, as it ends: before
    *  `stop()` resolves, before the error that ended it, before a restart on other models listens again. Handed over:

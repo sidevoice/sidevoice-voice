@@ -3,7 +3,8 @@
 //! `SpeechTimeoutUserTurnStopStrategy`).
 //!
 //! - A window is speech when the detector's confidence is at least [`CONFIDENCE`] and the volume (`volume`) clears the
-//!   listening bar, raised while a reply plays. Speech starts after [`START_MS`] of such windows and stops after the
+//!   listening bar, raised while a reply sounds. In silence speech starts after [`START_MS`] of such windows; over
+//!   sounding audio it starts only after the configured continuous capture duration. It stops after the
 //!   segmentation's `stop_ms` without one (`activity`).
 //! - A turn opens where speech starts, with the second of audio before it (the pre-roll).
 //! - Where speech stops inside a turn, a pause begins. With `smart-turn` the turn's audio so far is offered to an
@@ -64,6 +65,8 @@ pub(crate) struct Segmentation {
     pub(crate) quiet_bar: f32,
     /// The volume speech needs while a reply plays, if higher.
     pub(crate) playing_bar: f32,
+    /// Continuous raised-bar speech required while output is sounding.
+    pub(crate) barge_in_min_ms: u32,
 }
 
 /// What one window did to the turn.
@@ -113,6 +116,10 @@ pub(crate) struct Segmenter {
     /// The speech that made speech start last, in samples: it began this long before the end of the window it started
     /// in.
     start_run: usize,
+    /// Whether the preceding window was gated by audible playback.
+    was_playing: bool,
+    /// Qualified capture samples in the current overlap candidate.
+    barge_run: usize,
     /// The last audio heard, as much as an end-of-turn model is given: since the last turn ended, at most.
     recent: VecDeque<f32>,
     open: Option<Open>,
@@ -126,6 +133,8 @@ impl Segmenter {
             volume: Volume::default(),
             activity: Activity::default(),
             start_run: 0,
+            was_playing: false,
+            barge_run: 0,
             recent: VecDeque::with_capacity(END_OF_TURN_AUDIO),
             open: None,
         }
@@ -170,6 +179,13 @@ impl Segmenter {
         confidence: f32,
         playing: bool,
     ) -> Option<Segment> {
+        // A candidate heard over playback cannot become ordinary silence speech when that playback ends.
+        if self.was_playing != playing && self.open.is_none() {
+            self.activity.reset();
+            self.recent.clear();
+            self.barge_run = 0;
+        }
+        self.was_playing = playing;
         self.level.take(pcm);
         let volume = self.volume.take(pcm);
         let bar = if playing {
@@ -178,20 +194,54 @@ impl Segmenter {
             self.numbers.quiet_bar
         };
         let speech = confidence >= CONFIDENCE && volume >= bar;
-        let change = self
-            .activity
-            .take(speech, pcm.len(), START_MS, self.numbers.stop_ms);
+        let gated = playing && self.open.is_none();
+        let change = if gated {
+            self.barge_run = if speech {
+                self.barge_run.saturating_add(pcm.len())
+            } else {
+                0
+            };
+            if self.barge_run >= self.numbers.barge_in_min_ms as usize * PER_MS as usize {
+                // The duration is counted from capture samples. Only now does VAD open a turn.
+                self.activity.take(true, pcm.len(), 0, self.numbers.stop_ms)
+            } else {
+                self.activity.reset();
+                None
+            }
+        } else {
+            self.barge_run = 0;
+            self.activity
+                .take(speech, pcm.len(), START_MS, self.numbers.stop_ms)
+        };
         if change == Some(Change::Started) {
-            self.start_run = activity::windows(START_MS, pcm.len()).max(1) as usize * pcm.len();
+            self.start_run = if gated {
+                self.barge_run
+            } else {
+                activity::windows(START_MS, pcm.len()).max(1) as usize * pcm.len()
+            };
+        }
+        // Only the qualified run is eligible for pre-roll while playback sounds. Failed overlap has no path to
+        // recognition or take marks; the microphone level still reports normally.
+        if playing && self.open.is_none() && !speech {
+            self.recent.clear();
         }
         self.recent.extend(pcm);
-        let excess = self.recent.len().saturating_sub(END_OF_TURN_AUDIO);
+        let limit = if gated {
+            END_OF_TURN_AUDIO
+                .max(self.numbers.barge_in_min_ms as usize * PER_MS as usize + pcm.len())
+        } else {
+            END_OF_TURN_AUDIO
+        };
+        let excess = self.recent.len().saturating_sub(limit);
         self.recent.drain(..excess);
         let Some(open) = &mut self.open else {
             if change != Some(Change::Started) {
                 return None;
             }
-            let from = self.recent.len().saturating_sub(PRE_ROLL + pcm.len());
+            let from = self
+                .recent
+                .len()
+                .saturating_sub(PRE_ROLL.max(self.start_run) + pcm.len());
             self.open = Some(Open {
                 pcm: self.recent.range(from..).copied().collect(),
                 heard: 0,
@@ -264,19 +314,13 @@ impl Segmenter {
         still.then(|| self.end(silence_ms))
     }
 
-    /// Ends the open turn now, as if its speech had stopped `silence_ms` ago; the speech going on is not heard again
-    /// until it starts anew.
-    pub(crate) fn close(&mut self, silence_ms: u64) -> Option<Segment> {
-        self.open.as_ref()?;
-        self.activity.reset();
-        Some(self.end(silence_ms))
-    }
-
     /// Drops the open turn and the audio before it; the speech going on is not heard again until it starts anew.
     pub(crate) fn cancel(&mut self) {
         self.open = None;
         self.recent.clear();
         self.activity.reset();
+        self.was_playing = false;
+        self.barge_run = 0;
     }
 
     fn end(&mut self, silence_ms: u64) -> Segment {
