@@ -695,7 +695,7 @@ fn a_handle_cancels_what_it_says_and_tells_how_it_ended() {
             _ => None,
         })
         .await;
-        // The person speaks: what is said now waits for the turn, and the cancel reaches it while it waits.
+        // The person speaks: a say delivered locally after the turn opens is settled immediately.
         let sink = speakers.lock().unwrap().sink.clone().unwrap();
         for frame in [silence(300), clip(QUILTER, 0.9)].concat().chunks(160) {
             sink.send(IoEvent::Captured(frame.to_vec()));
@@ -718,7 +718,7 @@ fn a_handle_cancels_what_it_says_and_tells_how_it_ended() {
             steps,
             [SayEvent::Done {
                 outcome: SayOutcome::NotPlayed {
-                    reason: crate::StopReason::Cancelled
+                    reason: crate::StopReason::BargeIn
                 }
             }]
         );

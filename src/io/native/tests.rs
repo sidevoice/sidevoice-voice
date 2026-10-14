@@ -275,9 +275,8 @@ fn recorded_speaker_echo_cannot_start_a_turn_but_a_person_over_it_can() {
                                 * gain
                         })
                         .sum::<f32>();
-                    let voice = if person && i >= 2 * 16_000 && i < 4 * 16_000 {
-                        (0.3 * (2.0 * std::f32::consts::PI * 1_000.0 * i as f32 / 16_000.0).sin())
-                            as f32
+                    let voice = if person && (2 * 16_000..4 * 16_000).contains(&i) {
+                        0.3 * (2.0 * std::f32::consts::PI * 1_000.0 * i as f32 / 16_000.0).sin()
                     } else {
                         0.0
                     };
