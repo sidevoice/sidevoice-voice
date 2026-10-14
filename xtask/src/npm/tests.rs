@@ -109,7 +109,7 @@ fn a_smoke_report_must_show_a_running_call() {
         "deviceGone": [null, "mic-a", ["input", null], null],
             "take": [[16_000, "Float32Array", 1_760, 110, 0]],
             "seam": SEAM,
-            "playbackLevels": [true, 0.0, true],
+            "playbackLevels": [true, 0, true],
         },
     });
     assert_eq!(check_smoke(&ran), Ok(()));

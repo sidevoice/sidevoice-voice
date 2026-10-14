@@ -201,7 +201,7 @@ fn check_smoke(report: &Value) -> Result<()> {
         // Float32Array, handed over before the stop resolved; no turn in it.
         "take": [[16_000, "Float32Array", 1_760, 110, 0]],
         "seam": SEAM,
-        "playbackLevels": [true, 0.0, true],
+        "playbackLevels": [true, 0, true],
     });
     if *host != want {
         return Err(format!("the voice seam answered {host}, not {want}"));
