@@ -445,10 +445,14 @@ impl Driver {
             Message::Io(_, IoEvent::Captured(pcm)) => self.captured(&pcm).await,
             Message::Io(_, IoEvent::Rendered(pcm)) => {
                 if self.running && !self.opening {
-                    self.rendered.extend(pcm);
-                    // Discard a stalled consumer's old envelope rather than replaying it later.
-                    while self.rendered.len() > RATE as usize {
-                        self.rendered.pop_front();
+                    // No leading silence may accumulate ahead of the next audible sample. Keep silence following
+                    // audio, so a short gap inside a reply still reaches the meter.
+                    if !self.rendered.is_empty() || pcm.iter().any(|sample| *sample != 0.0) {
+                        self.rendered.extend(pcm);
+                        // Drift and a stalled consumer cannot replay an old envelope seconds later.
+                        while self.rendered.len() > 4_096 {
+                            self.rendered.pop_front();
+                        }
                     }
                 }
             }

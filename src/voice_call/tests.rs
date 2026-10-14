@@ -193,6 +193,7 @@ fn rendered_output_uses_detector_windows_even_with_a_muted_microphone_and_reject
         .await;
         let old = speakers.lock().unwrap().sink.clone().unwrap();
         call.mute(true);
+        old.send(IoEvent::Rendered(vec![0.0; 16_000]));
         old.send(IoEvent::Rendered(vec![0.5; 512 * 3]));
         old.send(IoEvent::Captured(vec![0.0; 512 * 3]));
         let mut levels = Vec::new();
