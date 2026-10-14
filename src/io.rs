@@ -165,14 +165,11 @@ mod tests {
             sink.send(IoEvent::Rendered(vec![0.8; 160]));
         }
         sink.send(IoEvent::Rendered(vec![0.0; 160]));
-        assert!(matches!(
-            received.try_next().unwrap(),
-            Some(Message::Rendered(1))
-        ));
+        assert!(matches!(received.try_recv(), Ok(Message::Rendered(1))));
         let latest = mailbox.lock().unwrap().take(1).unwrap();
         assert!(latest.skipped);
         assert!(latest.samples.iter().all(|sample| *sample == 0.0));
-        assert!(received.try_next().is_err());
+        assert!(received.try_recv().is_err());
         mailbox.lock().unwrap().advance(2);
         sink.send(IoEvent::Rendered(vec![0.8; 160]));
         assert!(mailbox.lock().unwrap().take(2).is_none());

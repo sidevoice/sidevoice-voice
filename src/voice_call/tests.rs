@@ -871,7 +871,7 @@ fn fatal_live_configuration_ends_take_and_playback_before_error() {
         });
         let sequence = next(&mut events, |event| match event {
             VoiceEvent::Take(_) => Some("take"),
-            VoiceEvent::PlaybackLevel(level) if level == 0.0 => Some("zero"),
+            VoiceEvent::PlaybackLevel(0.0) => Some("zero"),
             VoiceEvent::Error(error) if error.code == "end-of-turn-missing" => Some("error"),
             _ => None,
         })
@@ -879,7 +879,7 @@ fn fatal_live_configuration_ends_take_and_playback_before_error() {
         assert_eq!(sequence, "take");
         for expected in ["zero", "error"] {
             let actual = next(&mut events, |event| match event {
-                VoiceEvent::PlaybackLevel(level) if level == 0.0 => Some("zero"),
+                VoiceEvent::PlaybackLevel(0.0) => Some("zero"),
                 VoiceEvent::Error(error) if error.code == "end-of-turn-missing" => Some("error"),
                 _ => None,
             })
