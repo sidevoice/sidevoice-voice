@@ -92,7 +92,8 @@ fn a_smoke_report_must_show_a_running_call() {
         "microphone": ["muted", "live"],
         "webAudio": {
             "asked": ["mic-a", "mic-b", null], "stopped": ["track-1", "track-2", "track-3"], "sinks": ["out-c"],
-            "lost": [["input", "mic-b"]], "failed": ["microphone-lost"], "muted": [false, false], "ready": 1, "worklets": 1,
+            "lost": [["input", "mic-b"]], "failed": ["microphone-lost"], "muted": [false, false], "ready": 1, "worklets": 2,
+            "workletSamples": [true, 3, true],
             "outputSelectable": true, "heard": ["muted", "ready", "unmuted", "muted", "audio-capture-failed"],
         },
         "host": {
@@ -108,6 +109,7 @@ fn a_smoke_report_must_show_a_running_call() {
         "deviceGone": [null, "mic-a", ["input", null], null],
             "take": [[16_000, "Float32Array", 1_760, 110, 0]],
             "seam": SEAM,
+            "playbackLevels": [true, 0, true],
         },
     });
     assert_eq!(check_smoke(&ran), Ok(()));
@@ -130,7 +132,8 @@ fn a_smoke_report_must_show_a_running_call() {
             "webAudio",
             json!({
                 "asked": ["mic-a", "mic-b", null], "stopped": ["track-1", "track-2", "track-3"], "sinks": ["out-c"],
-                "lost": [["input", "mic-b"]], "failed": ["microphone-lost"], "muted": [false, false], "ready": 1, "worklets": 1,
+                "lost": [["input", "mic-b"]], "failed": ["microphone-lost"], "muted": [false, false], "ready": 1, "worklets": 2,
+                "workletSamples": [true, 3, true],
                 "outputSelectable": true, "heard": ["muted", "ready", "unmuted", "muted"],
             }),
         ),

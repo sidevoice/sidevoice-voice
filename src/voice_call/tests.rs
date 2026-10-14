@@ -181,6 +181,63 @@ fn runtime() -> tokio::runtime::Runtime {
         .unwrap()
 }
 
+#[test]
+fn rendered_output_uses_detector_windows_even_with_a_muted_microphone_and_rejects_old_sessions() {
+    runtime().block_on(async {
+        let (call, mut events, speakers) = call(FakeModels::default());
+        call.start(StartOptions::default());
+        next(&mut events, |event| match event {
+            VoiceEvent::State(state) if state.listening == crate::Listening::Listening => Some(()),
+            _ => None,
+        })
+        .await;
+        let old = speakers.lock().unwrap().sink.clone().unwrap();
+        call.mute(true);
+        old.send(IoEvent::Rendered(vec![0.0; 16_000]));
+        old.send(IoEvent::Rendered(vec![0.5; 512 * 3]));
+        old.send(IoEvent::Captured(vec![0.0; 512 * 3]));
+        let mut levels = Vec::new();
+        for _ in 0..3 {
+            levels.push(
+                next(&mut events, |event| match event {
+                    VoiceEvent::PlaybackLevel(level) if level > 0.0 => Some(level),
+                    _ => None,
+                })
+                .await,
+            );
+        }
+        assert!(levels[0] < levels[1] && levels[1] < levels[2]);
+        old.send(IoEvent::PlaybackEnded);
+        let zero = next(&mut events, |event| match event {
+            VoiceEvent::PlaybackLevel(level) if level == 0.0 => Some(level),
+            _ => None,
+        })
+        .await;
+        assert_eq!(zero, 0.0);
+        call.stop();
+        next(&mut events, |event| match event {
+            VoiceEvent::State(state) if state.listening == crate::Listening::Idle => Some(()),
+            _ => None,
+        })
+        .await;
+        call.start(StartOptions::default());
+        next(&mut events, |event| match event {
+            VoiceEvent::State(state) if state.listening == crate::Listening::Muted => Some(()),
+            _ => None,
+        })
+        .await;
+        let current = speakers.lock().unwrap().sink.clone().unwrap();
+        old.send(IoEvent::Rendered(vec![1.0; 512]));
+        current.send(IoEvent::Captured(vec![0.0; 512]));
+        let level = next(&mut events, |event| match event {
+            VoiceEvent::PlaybackLevel(level) => Some(level),
+            _ => None,
+        })
+        .await;
+        assert_eq!(level, 0.0);
+    });
+}
+
 fn call(models: FakeModels) -> (VoiceCall, Events, Arc<Mutex<Speakers>>) {
     with_config(
         models,
@@ -787,5 +844,47 @@ fn a_take_ends_before_the_failure_that_ends_its_listening() {
         })
         .await;
         assert_eq!(code, "microphone-lost");
+    });
+}
+
+#[test]
+fn fatal_live_configuration_ends_take_and_playback_before_error() {
+    runtime().block_on(async {
+        let (call, mut events, speakers) = call(FakeModels::default());
+        call.start(StartOptions { take: true });
+        next(&mut events, |event| match event {
+            VoiceEvent::State(state) if state.listening == crate::Listening::Listening => Some(()),
+            _ => None,
+        })
+        .await;
+        let sink = speakers.lock().unwrap().sink.clone().unwrap();
+        sink.send(IoEvent::Rendered(vec![0.8; WINDOW]));
+        sink.send(IoEvent::Captured(vec![0.0; WINDOW]));
+        next(&mut events, |event| match event {
+            VoiceEvent::PlaybackLevel(level) if level > 0.0 => Some(()),
+            _ => None,
+        })
+        .await;
+        call.set_config(VoiceConfig {
+            end_of_turn: crate::EndOfTurn::SmartTurn,
+            ..config()
+        });
+        let sequence = next(&mut events, |event| match event {
+            VoiceEvent::Take(_) => Some("take"),
+            VoiceEvent::PlaybackLevel(0.0) => Some("zero"),
+            VoiceEvent::Error(error) if error.code == "end-of-turn-missing" => Some("error"),
+            _ => None,
+        })
+        .await;
+        assert_eq!(sequence, "take");
+        for expected in ["zero", "error"] {
+            let actual = next(&mut events, |event| match event {
+                VoiceEvent::PlaybackLevel(0.0) => Some("zero"),
+                VoiceEvent::Error(error) if error.code == "end-of-turn-missing" => Some("error"),
+                _ => None,
+            })
+            .await;
+            assert_eq!(actual, expected);
+        }
     });
 }

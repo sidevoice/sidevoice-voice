@@ -21,6 +21,8 @@ pub(crate) struct Pipeline {
     capture: Resampler,
     capture_frames: Framer,
     render: Resampler,
+    meter: Resampler,
+    render_rate: u32,
     render_frames: Framer,
     ahead: VecDeque<[f32; FRAME]>,
     echo: EchoCanceller,
@@ -39,6 +41,8 @@ impl Pipeline {
             capture: Resampler::new(capture_rate, RATE),
             capture_frames: Framer::default(),
             render: Resampler::new(render_rate, RATE),
+            meter: Resampler::new(render_rate, RATE),
+            render_rate,
             render_frames: Framer::default(),
             ahead: VecDeque::new(),
             echo: EchoCanceller::new()?,
@@ -47,12 +51,20 @@ impl Pipeline {
     }
 
     /// Takes what the speaker played: mono samples at its rate.
-    pub(crate) fn render(&mut self, played: &[f32]) {
+    pub(crate) fn render(&mut self, played: &[f32]) -> Vec<f32> {
         self.scratch.clear();
         self.render.process(played, &mut self.scratch);
         self.ahead.extend(self.render_frames.push(&self.scratch));
         let excess = self.ahead.len().saturating_sub(MAX_AHEAD);
         self.ahead.drain(..excess);
+        let mut metered = Vec::new();
+        self.meter.process(played, &mut metered);
+        metered
+    }
+
+    /// Clear only the playback meter's filter tail; the AEC reference stream continues across utterances.
+    pub(crate) fn reset_playback_meter(&mut self) {
+        self.meter = Resampler::new(self.render_rate, RATE);
     }
 
     /// Takes what the microphone heard (interleaved, at its rate) and returns every frame it completed, clean.

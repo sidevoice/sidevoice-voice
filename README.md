@@ -66,6 +66,7 @@ while let Some(event) = events.next().await {
         VoiceEvent::Turn(turn) => show_turn(turn),  // started, cancelled
         VoiceEvent::State(state) => show(state),   // listening, recognising, playback, microphone
         VoiceEvent::Level(level) => meter(level),  // the microphone, from 0 to 1
+        VoiceEvent::PlaybackLevel(level) => speaker_meter(level), // rendered output, from 0 to 1
         VoiceEvent::Error(error) => tell(error.code),
         VoiceEvent::Take(take) => keep(take),      // with `StartOptions { take: true }`, as the listening ends
     }
@@ -101,7 +102,7 @@ import init, { VoiceCall } from "@sidevoice/voice";
 await init();
 const models = { load: async () => ({ vad, transcriber, speaker /*, endOfTurn */ }) }; // the page's VoiceModels
 const call = VoiceCall.create(models, config); // the same configuration, as JSON
-call.onEvent(({ type, data }) => { /* "turn" (started, finished with the words, cancelled), "state", "level", "error", "take" */ });
+call.onEvent(({ type, data }) => { /* "turn", "state", "level", "playback-level", "error", "take" */ });
 call.start(); // loads the models, asks for the microphone, listens
 const saying = call.say("Hecho.", { language: "es" }); // a handle: saying.cancel(), saying.onEvent(step)
 const outcome = await saying.outcome; // { status: "heard" | "heard-up-to" | "not-played", ... }
@@ -177,7 +178,12 @@ What both promise, beyond the types:
   the new models and configuration together (a live call restarts once); `setSettings` rejects with the model
   source's `{code}` for settings it cannot fill.
 - **Turns** reach the listeners subscribed when they are emitted, in the order the call emitted them, with the state,
-  level and errors; nothing is buffered. Each turn has the call's own `turn_id`: `started` comes before exactly one
+  microphone and playback levels and errors; nothing is buffered. `playback-level` is a bare number from 0 to 1,
+  computed from audio rendered by the speaker after gain and fading, on the same detector windows as `level`
+  (normally 512 samples at 16 kHz, or 32 ms). It continues while the microphone is muted, is zero in silence,
+  and emits exact zero when playback ends or the call stops. `VoiceHost.onPlaybackLevel(listener)` subscribes to this
+  number; its unsubscribe removes only that listener, and subscriptions survive stop/start. Each turn has the call's
+  own `turn_id`: `started` comes before exactly one
   `finished` (the words) or `cancelled`. A turn merged into the next is `cancelled` with `merged`, after that next
   turn's `started`.
   The state says `speaking` while the person speaks in an open turn, and `listening` again when they pause in it (their
@@ -283,7 +289,8 @@ src/            the crate sidevoice-voice
   lib.rs          the front door: declares the packages, exports the public API
   call.rs         the state machine: Input and Effect, the three regions
   turns.rs        segmentation: detector windows into turns; turns/activity.rs, when speech starts and stops;
-                  turns/volume.rs, the volume the listening bar is on; turns/level.rs, the meter's level
+                  turns/volume.rs, the volume the listening bar is on
+  level.rs        the shared microphone and playback meter
   recognition.rs  the queue and the merge window; recognition/filter.rs, the acceptance filter
   speech.rs       a text in sentence chunks
   playback.rs     the playback queue, barge-in and the heard position
@@ -309,7 +316,8 @@ js/             the npm package's JavaScript, shipped as it is (ES modules, no d
   index.js        the entry point: the wasm build, and VoiceCall.create(models, config, options?) on the browser's IO
   voice-models.d.ts the model interfaces the page implements (VoiceModels, VoiceVad, VoiceTranscriber, VoiceSpeaker,
                   VoiceEndOfTurn)
-  web-audio-io.js the browser's microphone and speaker (createWebAudioIo); capture-worklet.js, its AudioWorklet
+  web-audio-io.js the browser's microphone and speaker (createWebAudioIo); capture-worklet.js and
+                  playback-worklet.js, their AudioWorklets
   voice-host.js   the voice seam (createVoiceHost); voice-host.d.ts, VoiceHost itself
   *.d.ts          their types
 npm/            the npm package's package.json (version stamped by xtask) and README

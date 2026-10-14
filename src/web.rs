@@ -7,6 +7,7 @@
 //! - `io` is an object with `start(sink)`, `play(utterance, chunk, samples, sampleRate)`, `stopPlayback()` and
 //!   `stop()`; it reports through `sink` (an [`IoSink`](crate::IoSink): `ready()` once the microphone and the
 //!   speaker work, which is when the call listens, `captured(samples)`, with 16 kHz mono samples,
+//!   `rendered(samples)` with 16 kHz post-gain speaker samples, `playbackEnded()` as the terminal playback marker,
 //!   `chunkStarted(utterance, chunk)`, `chunkPlayed(utterance, chunk)`, `failed(code)`). `start` may throw an error
 //!   with a `code`.
 //! - `config` is the configuration as JSON ([`VoiceConfig`]); a malformed one throws.
@@ -212,6 +213,17 @@ impl IoSink {
     /// Captured audio: 16 kHz mono samples, in order, after echo cancellation.
     pub fn captured(&self, samples: Vec<f32>) {
         self.send(IoEvent::Captured(samples));
+    }
+
+    /// Rendered speaker samples, mono at 16 kHz after gain and fading.
+    pub fn rendered(&self, samples: Vec<f32>) {
+        self.send(IoEvent::Rendered(samples));
+    }
+
+    /// The rendered output ended, including any fade.
+    #[wasm_bindgen(js_name = playbackEnded)]
+    pub fn playback_ended(&self) {
+        self.send(IoEvent::PlaybackEnded);
     }
 
     /// The first sample of a chunk reached the speaker.

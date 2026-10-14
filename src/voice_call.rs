@@ -15,7 +15,7 @@ mod tests;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use futures_channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures_util::future::{abortable, ready, select, AbortHandle, Either};
@@ -24,7 +24,8 @@ use futures_util::{stream, Stream, StreamExt};
 use crate::call::{Call, Effect, Input};
 use crate::config::{EndOfTurn, VoiceConfig};
 use crate::event::{VoiceError, VoiceEvent};
-use crate::io::{AudioIo, IoEvent, IoSink};
+use crate::io::{AudioIo, IoEvent, IoSink, RenderedMailbox};
+use crate::level::{instant, Level};
 use crate::maybe_send::MaybeSend;
 use crate::models::{Models, VadFrame, VoiceModels};
 use crate::residency::Residency;
@@ -77,7 +78,8 @@ pub(crate) enum Message {
     Mute(bool),
     CancelInput,
     Models(Arc<dyn VoiceModels>, Box<VoiceConfig>),
-    Io(IoEvent),
+    Io(u64, IoEvent),
+    Rendered(u64),
     EndOfTurn {
         turn: usize,
         pause: u32,
@@ -134,6 +136,10 @@ impl VoiceCall {
             opening: false,
             tasks: VecDeque::new(),
             captured: VecDeque::new(),
+            rendered: VecDeque::new(),
+            playback_level: Level::default(),
+            rendered_mailbox: Arc::new(Mutex::new(RenderedMailbox::default())),
+            generation: 0,
             taken: 0,
             taking: false,
             recording: None,
@@ -224,6 +230,12 @@ struct Driver {
     opening: bool,
     /// Capture not yet in a whole detector window.
     captured: VecDeque<f32>,
+    /// Rendered 16 kHz speaker samples waiting for capture's detector windows.
+    rendered: VecDeque<f32>,
+    playback_level: Level,
+    rendered_mailbox: Arc<Mutex<RenderedMailbox>>,
+    /// A new start rejects any queued report from an older microphone or speaker.
+    generation: u64,
     /// The detector's position: samples taken into windows since its last reset.
     taken: u64,
     /// Whether the start asked for a take, until the call is stopped.
@@ -350,6 +362,8 @@ impl Driver {
     /// the call started are dropped (the next start loads them again), and the call says it is idle.
     fn abandon(&mut self) {
         self.end_take();
+        self.reset_playback();
+        self.generation = self.generation.wrapping_add(1);
         self.running = false;
         self.opening = false;
         self.io.stop();
@@ -383,6 +397,7 @@ impl Driver {
                 self.configure(config);
                 if self.running && self.end_of_turn_missing() {
                     self.end_take();
+                    self.reset_playback();
                     self.error("end-of-turn-missing".into());
                     self.halt().await;
                 }
@@ -417,7 +432,27 @@ impl Driver {
                 self.input(Input::Mute(muted));
             }
             Message::CancelInput => self.input(Input::Cancel),
-            Message::Io(IoEvent::Ready) => {
+            Message::Io(generation, _) if generation != self.generation => {}
+            Message::Rendered(generation) => {
+                let frame = self
+                    .rendered_mailbox
+                    .lock()
+                    .expect("rendered mailbox")
+                    .take(generation);
+                if generation == self.generation && self.running && !self.opening {
+                    if let Some(frame) = frame {
+                        let stale = monotonic_ms().saturating_sub(frame.at_ms) > 500;
+                        if frame.skipped || stale {
+                            self.rendered.clear();
+                            self.playback_level.reset();
+                        }
+                        if !stale {
+                            self.accept_rendered(&frame.samples);
+                        }
+                    }
+                }
+            }
+            Message::Io(_, IoEvent::Ready) => {
                 if self.running && self.opening {
                     self.opening = false;
                     // Sample 0 of a take, when one is asked for.
@@ -425,18 +460,23 @@ impl Driver {
                     self.input(Input::Start { take: self.taking });
                 }
             }
-            Message::Io(IoEvent::Captured(pcm)) => self.captured(&pcm).await,
-            Message::Io(IoEvent::ChunkStarted { utterance, chunk }) => {
+            Message::Io(_, IoEvent::Captured(pcm)) => self.captured(&pcm).await,
+            Message::Io(_, IoEvent::Rendered(pcm)) => {
+                self.accept_rendered(&pcm);
+            }
+            Message::Io(_, IoEvent::PlaybackEnded) => self.reset_playback(),
+            Message::Io(_, IoEvent::ChunkStarted { utterance, chunk }) => {
                 self.input(Input::ChunkStarted { utterance, chunk });
             }
-            Message::Io(IoEvent::ChunkPlayed { utterance, chunk }) => {
+            Message::Io(_, IoEvent::ChunkPlayed { utterance, chunk }) => {
                 self.input(Input::ChunkPlayed { utterance, chunk });
             }
-            Message::Io(IoEvent::MicrophoneMuted(muted)) => {
+            Message::Io(_, IoEvent::MicrophoneMuted(muted)) => {
                 self.input(Input::MicrophoneMuted(muted));
             }
-            Message::Io(IoEvent::Failed(code)) => {
+            Message::Io(_, IoEvent::Failed(code)) => {
                 self.end_take();
+                self.reset_playback();
                 self.error(code);
                 self.halt().await;
             }
@@ -499,7 +539,17 @@ impl Driver {
             self.error("end-of-turn-missing".into());
             return;
         }
-        let sink = IoSink(self.messages.clone());
+        self.generation = self.generation.wrapping_add(1);
+        self.reset_playback();
+        self.rendered_mailbox
+            .lock()
+            .expect("rendered mailbox")
+            .advance(self.generation);
+        let sink = IoSink {
+            messages: self.messages.clone(),
+            generation: self.generation,
+            rendered: Arc::clone(&self.rendered_mailbox),
+        };
         if let Err(code) = self.io.start(sink) {
             self.error(code);
             return;
@@ -515,6 +565,8 @@ impl Driver {
             return;
         }
         self.end_take();
+        self.reset_playback();
+        self.generation = self.generation.wrapping_add(1);
         self.running = false;
         self.opening = false;
         // The microphone and the speaker close before the call says it is idle; what its tasks would answer is moot.
@@ -553,6 +605,7 @@ impl Driver {
                     let take = (end.saturating_sub(self.taken) as usize).min(self.captured.len());
                     self.taken = end;
                     let window: Vec<f32> = self.captured.drain(..take).collect();
+                    self.playback_window(take);
                     self.input(Input::Window {
                         pcm: window,
                         speech,
@@ -565,6 +618,40 @@ impl Driver {
                 self.captured.clear();
                 self.taken = 0;
                 self.error(code);
+            }
+        }
+    }
+
+    /// One speaker meter publication per detector window, using the same sample count as the microphone window.
+    fn playback_window(&mut self, length: usize) {
+        let mut window = Vec::with_capacity(length);
+        for _ in 0..length {
+            window.push(self.rendered.pop_front().unwrap_or(0.0));
+        }
+        if instant(&window) == 0.0 {
+            self.playback_level.reset();
+        } else {
+            self.playback_level.take(&window);
+        }
+        let _ = self
+            .events
+            .unbounded_send(VoiceEvent::PlaybackLevel(self.playback_level.value()));
+    }
+
+    fn reset_playback(&mut self) {
+        self.rendered.clear();
+        self.playback_level.reset();
+        let _ = self.events.unbounded_send(VoiceEvent::PlaybackLevel(0.0));
+    }
+
+    fn accept_rendered(&mut self, pcm: &[f32]) {
+        if self.running && !self.opening {
+            // A silent start must not queue seconds of zeros ahead of the first audible sample.
+            if !self.rendered.is_empty() || pcm.iter().any(|sample| *sample != 0.0) {
+                self.rendered.extend(pcm);
+                while self.rendered.len() > 4_096 {
+                    self.rendered.pop_front();
+                }
             }
         }
     }

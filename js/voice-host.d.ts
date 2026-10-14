@@ -108,6 +108,9 @@ export interface VoiceHost {
   onState(listener: (state: VoiceCallState) => void): () => void;
   /** The microphone's level, 0 to 1, once per detector window (about 30 a second). */
   onLevel(listener: (level: number) => void): () => void;
+  /** The rendered speaker's level, 0 to 1, on detector windows (normally 32 ms); exact zero when output ends.
+   *  It continues while the microphone is muted. */
+  onPlaybackLevel(listener: (level: number) => void): () => void;
   onError(listener: (error: VoiceHostError) => void): () => void;
   /** The take of a start that asked for one (`start({take: true})`), once per stretch of listening, as it ends: before
    *  `stop()` resolves, before the error that ended it, before a restart on other models listens again. Handed over:

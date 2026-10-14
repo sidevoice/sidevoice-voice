@@ -1,5 +1,5 @@
-//! How loud the microphone looks, for a meter: each window's RMS in dBFS, from −60 (0) to 0 (1), smoothed
-//! exponentially. It decides nothing (what counts as speech is the volume's, `volume`).
+//! Shared microphone and rendered speaker meter: each window's RMS in dBFS, from −60 (0) to 0 (1), smoothed
+//! exponentially. The meter decides nothing about speech.
 
 /// The weight of the newest window in the smoothed level.
 const SMOOTHING: f32 = 0.2;
@@ -19,6 +19,11 @@ impl Level {
     pub(crate) fn value(self) -> f32 {
         self.value
     }
+
+    /// Drops the smoothing tail at a definite end of playback.
+    pub(crate) fn reset(&mut self) {
+        self.value = 0.0;
+    }
 }
 
 /// The level of one window, unsmoothed.
@@ -33,3 +38,6 @@ pub(crate) fn instant(pcm: &[f32]) -> f32 {
     }
     ((20.0 * rms.log10()).clamp(-60.0, 0.0) + 60.0) / 60.0
 }
+
+#[cfg(test)]
+mod tests;

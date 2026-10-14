@@ -18,6 +18,8 @@ use crate::io::IoEvent;
 pub(crate) struct Counters {
     /// Samples the callback has taken.
     pub(crate) consumed: AtomicU64,
+    /// Reference samples successfully published before `consumed` was published.
+    pub(crate) referenced: AtomicU64,
     /// Every sample queued before this count is dropped (after the fade).
     pub(crate) flush_to: AtomicU64,
 }
@@ -29,6 +31,7 @@ pub(crate) struct Output {
     fade: usize,
     fading: Option<usize>,
     consumed: u64,
+    referenced: u64,
 }
 
 impl Output {
@@ -40,6 +43,7 @@ impl Output {
             fade: fade.max(1),
             fading: None,
             consumed: 0,
+            referenced: 0,
         }
     }
 
@@ -66,7 +70,9 @@ impl Output {
             }
             None => self.take(),
         };
-        let _ = self.reference.push(sample);
+        if self.reference.push(sample).is_ok() {
+            self.referenced += 1;
+        }
         sample
     }
 
@@ -83,6 +89,9 @@ impl Output {
 
     /// Publishes how many samples were taken.
     pub(crate) fn publish(&self, counters: &Counters) {
+        counters
+            .referenced
+            .store(self.referenced, Ordering::Release);
         counters.consumed.store(self.consumed, Ordering::Release);
     }
 }
@@ -181,10 +190,11 @@ impl Queue {
     }
 
     /// Stops: what waits is dropped, the schedule forgotten, and the callback drops what the ring holds.
-    pub(crate) fn stop(&mut self, counters: &Counters) {
+    pub(crate) fn stop(&mut self, counters: &Counters) -> u64 {
         self.pending.clear();
         self.schedule.clear();
         counters.flush_to.store(self.produced, Ordering::Release);
+        self.produced
     }
 
     /// Whether nothing waits and nothing queued is left to play.

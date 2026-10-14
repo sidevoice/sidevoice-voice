@@ -192,6 +192,9 @@ fn run(
     let mut heard = Vec::new();
     let mut played = Vec::new();
     let mut speaker_switch = false;
+    let mut ending: Option<u64> = None;
+    let mut had_chunks = false;
+    let mut drained_reference = 0_u64;
     while !stop.load(Ordering::Acquire) {
         for command in commands.try_iter() {
             match command {
@@ -199,8 +202,12 @@ fn run(
                     utterance,
                     chunk,
                     samples,
-                } => queue.play(utterance, chunk, samples),
-                Command::Stop => queue.stop(&speaker.counters),
+                } => {
+                    had_chunks = true;
+                    ending = None;
+                    queue.play(utterance, chunk, samples);
+                }
+                Command::Stop => ending = Some(queue.stop(&speaker.counters)),
             }
         }
         if devices.take_switch(Kind::Input) {
@@ -242,6 +249,10 @@ fn run(
             match reopened {
                 Ok((rebuilt, next)) => {
                     (speaker, pipeline, queue) = (next, rebuilt, Queue::default());
+                    drained_reference = 0;
+                    sink.send(IoEvent::PlaybackEnded);
+                    ending = None;
+                    had_chunks = false;
                     output_rate.store(speaker.rate, Ordering::Release);
                 }
                 Err(code) => return sink.send(IoEvent::Failed(code)),
@@ -249,11 +260,15 @@ fn run(
         }
         queue.feed(&mut speaker.playback);
         drain(&mut speaker.reference, &mut played, 1);
+        drained_reference += played.len() as u64;
         drain(&mut microphone.capture, &mut heard, microphone.channels);
         if changed.swap(false, Ordering::AcqRel) {
             pipeline.reinitialize();
         }
-        pipeline.render(&played);
+        let rendered = pipeline.render(&played);
+        if (had_chunks || ending.is_some()) && !rendered.is_empty() {
+            sink.send(IoEvent::Rendered(rendered));
+        }
         for frame in pipeline.capture(&heard) {
             sink.send(IoEvent::Captured(frame.to_vec()));
         }
@@ -261,8 +276,36 @@ fn run(
         for event in queue.schedule.due(consumed) {
             sink.send(event);
         }
+        // `consumed` is published after the callback's reference writes. A callback may run between the drain above
+        // and this load; wait until its published reference tail has crossed the worker before ending the meter.
+        if playback_complete(
+            ending,
+            had_chunks,
+            queue.is_idle(),
+            consumed,
+            speaker.counters.referenced.load(Ordering::Acquire),
+            drained_reference,
+        ) {
+            sink.send(IoEvent::PlaybackEnded);
+            pipeline.reset_playback_meter();
+            ending = None;
+            had_chunks = false;
+        }
         thread::sleep(TICK);
     }
+}
+
+/// Completion is behind the callback's published reference tail, even if it ran after this tick's drain.
+fn playback_complete(
+    ending: Option<u64>,
+    had_chunks: bool,
+    idle: bool,
+    consumed: u64,
+    referenced: u64,
+    drained_reference: u64,
+) -> bool {
+    (ending.is_some_and(|end| consumed >= end) || (had_chunks && idle && ending.is_none()))
+        && drained_reference >= referenced
 }
 
 /// A new microphone, and the echo canceller made again for its rate and the speaker's.

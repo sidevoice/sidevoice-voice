@@ -23,13 +23,14 @@ const SMOKE_JS: &str = include_str!("../npm/smoke.mjs");
 /// The slots the smoke test's models fill, recorded each time the call loads them.
 const SMOKE_SLOTS: [&str; 3] = ["vad", "transcriber", "speaker"];
 /// The calls of the voice seam, `VoiceHost` (js/voice-host.d.ts), sorted.
-const SEAM: [&str; 14] = [
+const SEAM: [&str; 15] = [
     "audioDevices",
     "cancelInput",
     "mute",
     "onAudioDevices",
     "onError",
     "onLevel",
+    "onPlaybackLevel",
     "onState",
     "onTake",
     "onTurn",
@@ -177,7 +178,8 @@ fn check_smoke(report: &Value) -> Result<()> {
     // processor throws: each reaches the sink, the processor's as a failure.
     let web_audio = json!({
         "asked": ["mic-a", "mic-b", null], "stopped": ["track-1", "track-2", "track-3"], "sinks": ["out-c"],
-        "lost": [["input", "mic-b"]], "failed": ["microphone-lost"], "muted": [false, false], "ready": 1, "worklets": 1,
+        "lost": [["input", "mic-b"]], "failed": ["microphone-lost"], "muted": [false, false], "ready": 1, "worklets": 2,
+        "workletSamples": [true, 3, true],
         "outputSelectable": true, "heard": ["muted", "ready", "unmuted", "muted", "audio-capture-failed"],
     });
     if report["webAudio"] != web_audio {
@@ -199,6 +201,7 @@ fn check_smoke(report: &Value) -> Result<()> {
         // Float32Array, handed over before the stop resolved; no turn in it.
         "take": [[16_000, "Float32Array", 1_760, 110, 0]],
         "seam": SEAM,
+        "playbackLevels": [true, 0, true],
     });
     if *host != want {
         return Err(format!("the voice seam answered {host}, not {want}"));

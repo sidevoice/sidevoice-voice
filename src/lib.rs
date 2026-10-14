@@ -17,6 +17,7 @@ mod config;
 mod echo;
 mod event;
 mod io;
+mod level;
 mod maybe_send;
 mod models;
 mod playback;

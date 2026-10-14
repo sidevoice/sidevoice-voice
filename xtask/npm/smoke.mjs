@@ -4,6 +4,7 @@
 // interfaces of js/voice-models.d.ts) and a plain-object microphone and speaker, and the default web microphone and
 // speaker on a fake browser. It prints what it saw; the checks are xtask's.
 import { readFileSync } from "node:fs";
+import { runInNewContext } from "node:vm";
 import { createVoiceHost, createWebAudioIo, initSync, VoiceCall } from "@sidevoice/voice";
 
 const wasm = new URL(process.argv[2], import.meta.resolve("@sidevoice/voice"));
@@ -11,11 +12,28 @@ initSync({ module: readFileSync(wasm) });
 
 // The page's models, as the call loads them: each load records the slots it filled.
 const loaded = [];
+const detector = () => {
+  let end = 0;
+  let pending = 0;
+  return {
+    async accept(samples) {
+      pending += samples.length;
+      const frames = [];
+      while (pending >= 512) {
+        pending -= 512;
+        end += 512;
+        frames.push({ end, speech: false, probability: 0 });
+      }
+      return frames;
+    },
+    async reset() { end = 0; pending = 0; },
+  };
+};
 const models = {
   async load() {
     loaded.push("vad", "transcriber", "speaker");
     return {
-      vad: { accept: async () => [], reset: async () => {} },
+      vad: detector(),
       transcriber: { transcribe: async () => "" },
       speaker: { speak: async () => ({ samples: new Float32Array(160), sampleRate: 16000 }) },
     };
@@ -118,6 +136,11 @@ Object.defineProperty(globalThis, "navigator", { configurable: true, value: { me
   addEventListener: (name, listener) => { if (name === "devicechange") deviceChange = listener; },
 } } });
 const voice = createVoiceHost(source, { io });
+const playbackLevels = [];
+const unsubscribePlayback = voice.onPlaybackLevel((level) => playbackLevels.push(level));
+voice.onPlaybackLevel(() => { throw new Error("isolated listener"); });
+const secondPlayback = [];
+voice.onPlaybackLevel((level) => secondPlayback.push(level));
 const states = [];
 const seen = [];
 const hostErrors = [];
@@ -141,6 +164,16 @@ await voice.setSettings({
 });
 host.handed = asked.at(-1).stt;
 host.started = await code(voice.start());
+speaker.rendered(new Float32Array(512).fill(0.5));
+speaker.captured(new Float32Array(512));
+await until(() => playbackLevels.some((level) => level > 0));
+speaker.playbackEnded();
+await until(() => playbackLevels.at(-1) === 0);
+unsubscribePlayback();
+speaker.rendered(new Float32Array(512).fill(0.5));
+speaker.captured(new Float32Array(512));
+await until(() => secondPlayback.length > playbackLevels.length);
+host.playbackLevels = [playbackLevels.some((level) => level > 0), playbackLevels.at(-1), secondPlayback.some((level) => level > 0)];
 // Another voice and speed are the call's own: the source is not asked again.
 const asks = asked.length;
 await voice.setSettings({
@@ -228,8 +261,9 @@ Object.defineProperty(globalThis, "navigator", { configurable: true, value: { me
 // Every capture worklet made, the last one first.
 const worklets = [];
 globalThis.AudioWorkletNode = class {
-  constructor() { worklets.unshift(this); this.port = {}; this.onprocessorerror = null; }
+  constructor() { worklets.unshift(this); this.port = { close() {} }; this.onprocessorerror = null; }
   connect(node) { return node; }
+  disconnect() {}
 };
 globalThis.AudioContext = class {
   constructor() { this.audioWorklet = { addModule: async () => {} }; this.destination = {}; this.currentTime = 0; }
@@ -241,7 +275,7 @@ globalThis.AudioContext = class {
 };
 const webIo = createWebAudioIo({ inputDevice: "mic-a", onDeviceLost: (kind, id) => webAudio.lost.push([kind, id]) });
 webIo.start({
-  ready: () => webAudio.ready++, captured() {}, chunkStarted() {}, chunkPlayed() {},
+  ready: () => webAudio.ready++, captured() {}, rendered() {}, playbackEnded() {}, chunkStarted() {}, chunkPlayed() {},
   microphoneMuted: (muted) => webAudio.muted.push(muted), failed: (code) => webAudio.failed.push(code),
 });
 await until(() => webAudio.ready > 0);
@@ -262,6 +296,7 @@ startsMuted = true;
 createWebAudioIo().start({
   ready: () => heard.push("ready"),
   captured() {},
+  rendered() {}, playbackEnded() {},
   chunkStarted() {},
   chunkPlayed() {},
   microphoneMuted: (muted) => heard.push(muted ? "muted" : "unmuted"),
@@ -270,8 +305,161 @@ createWebAudioIo().start({
 await until(() => heard.includes("ready"));
 lastStream.track.onunmute?.();
 lastStream.track.onmute?.();
-worklets[0].onprocessorerror?.(new Event("processorerror"));
+worklets[1].onprocessorerror?.(new Event("processorerror"));
 await until(() => heard.includes("audio-capture-failed"));
+// Exercise the shipped processor itself with samples, not just events injected at its sink.
+const workletSource = readFileSync(new URL("./playback-worklet.js", import.meta.resolve("@sidevoice/voice")), "utf8");
+const rendered = [];
+let Processor;
+runInNewContext(workletSource, {
+  sampleRate: 16000, Float32Array, Math,
+  AudioWorkletProcessor: class { constructor() { this.port = { postMessage: (frame) => rendered.push(frame) }; } },
+  registerProcessor: (_name, implementation) => { Processor = implementation; },
+});
+const processor = new Processor();
+let passes = true;
+for (let i = 0; i < 4; i++) {
+  const input = new Float32Array(128).fill(0.5);
+  const output = new Float32Array(128);
+  processor.process([[input]], [[output]]);
+  passes &&= output.every((sample) => sample === 0.5);
+}
+if (!passes || rendered.length < 2 || !rendered[0].samples.every((sample) => Math.abs(sample - 0.5) < 0.01)) {
+  throw new Error("playback worklet changed its audio or failed to report rendered frames");
+}
+const resampled = [];
+let ResamplingProcessor;
+runInNewContext(workletSource, {
+  sampleRate: 48000, Float32Array, Math,
+  AudioWorkletProcessor: class { constructor() { this.port = { postMessage: (frame) => resampled.push(frame) }; } },
+  registerProcessor: (_name, implementation) => { ResamplingProcessor = implementation; },
+});
+const resampler = new ResamplingProcessor();
+for (let i = 0; i < 48; i++) {
+  const input = new Float32Array(128).fill(i < 24 ? 0.5 : 0);
+  const output = new Float32Array(128);
+  resampler.process([[input]], [[output]]);
+  resampler.port.onmessage({ data: "ack" });
+  if (!output.every((sample) => sample === (i < 24 ? 0.5 : 0))) throw new Error("playback worklet changed 48 kHz output");
+}
+if (resampled.length !== 12 || resampled.some(({ samples }) => samples.length !== 160 || !samples.every(Number.isFinite))
+  || Math.abs(resampled[4].samples[0] - 0.5) > 0.02 || Math.abs(resampled.at(-1).samples[0]) > 0.02) {
+  throw new Error("playback worklet did not resample 48 kHz sound and silence into twelve finite frames");
+}
+// The page stalls: its four posted reports may be old, but its next acknowledgement must release the newest silence.
+const stalled = [];
+let StalledProcessor;
+runInNewContext(workletSource, {
+  sampleRate: 16000, Float32Array, Math,
+  AudioWorkletProcessor: class { constructor() { this.port = { postMessage: (frame) => stalled.push(frame) }; } },
+  registerProcessor: (_name, implementation) => { StalledProcessor = implementation; },
+});
+const stalledProcessor = new StalledProcessor();
+for (let i = 0; i < 160; i++) {
+  const input = new Float32Array(128).fill(i < 80 ? 0.8 : 0);
+  stalledProcessor.process([[input]], [[new Float32Array(128)]]);
+}
+if (stalled.length !== 4) throw new Error("playback worklet did not bound in-flight reports");
+stalledProcessor.port.onmessage({ data: "ack" });
+if (stalled.length !== 5 || !stalled[4].samples.every((sample) => Math.abs(sample) < 0.001)) {
+  throw new Error("playback worklet replayed old sound instead of the newest silence");
+}
+devicesSeen.workletSamples = [passes, rendered.length, true];
+// Connect the shipped processor to the shipped Web Audio I/O. Delay its messages around natural completion, a
+// cancellation fade, and an output switch: old sound must never reopen the new playback after its terminal zero.
+const reports = [];
+const playbackSources = [];
+let LiveProcessor;
+const workletWorld = {
+  sampleRate: 16000, currentFrame: 0, Float32Array, Math,
+  AudioWorkletProcessor: class { constructor() { this.port = { postMessage: (data) => reports.push(data) }; } },
+  registerProcessor: (_name, implementation) => { LiveProcessor = implementation; },
+};
+runInNewContext(workletSource, workletWorld);
+let liveProcessor;
+let liveMeter;
+let liveContext;
+let failPlaybackModule = false;
+globalThis.AudioWorkletNode = class {
+  constructor(_context, name) {
+    if (name === "sidevoice-playback") {
+      liveProcessor = new LiveProcessor();
+      liveMeter = this;
+      this.port = { postMessage: (data) => liveProcessor.port.onmessage({ data }), close() {}, onmessage: null };
+    } else this.port = { close() {}, onmessage: null };
+  }
+  connect(node) { return node; }
+  disconnect() {}
+};
+globalThis.AudioContext = class {
+  constructor() { liveContext = this; this.sampleRate = 16000; this.currentTime = 0; this.destination = {}; this.audioWorklet = { addModule: async (url) => { if (failPlaybackModule && url.includes("playback-worklet")) throw new Error("missing playback worklet"); } }; }
+  createMediaStreamSource() { return { connect(node) { return node; }, disconnect() {} }; }
+  createGain() { return { connect() {}, disconnect() {}, gain: { value: 1, setValueAtTime() {}, linearRampToValueAtTime() {} } }; }
+  createBuffer(_channels, length, rate) { return { duration: length / rate, copyToChannel() {} }; }
+  createBufferSource() { const source = { connect() {}, start() {}, stop() {}, onended: null }; playbackSources.push(source); return source; }
+  async setSinkId() {}
+  async resume() {}
+  async close() {}
+};
+const playedLevels = [];
+const playbackIo = createWebAudioIo();
+playbackIo.start({ ready() {}, captured() {}, rendered: (samples) => playedLevels.push(samples[0]),
+  playbackEnded: () => playedLevels.push(0), chunkStarted() {}, chunkPlayed() {}, microphoneMuted() {}, failed: (code) => { throw new Error(code); } });
+await until(() => liveMeter);
+const processOutput = (sample, blocks) => {
+  for (let i = 0; i < blocks; i++) {
+    const input = new Float32Array(128).fill(sample);
+    const output = new Float32Array(128);
+    liveProcessor.process([[input]], [[output]]);
+    if (!output.every((value) => Math.abs(value - sample) < 1e-6)) throw new Error("playback processor changed output");
+    workletWorld.currentFrame += 128;
+    liveContext.currentTime = workletWorld.currentFrame / 16000;
+  }
+};
+const deliver = () => { while (reports.length) liveMeter.port.onmessage({ data: reports.shift() }); };
+playbackIo.play("old", 0, new Float32Array(160).fill(0.8), 16000);
+processOutput(0.8, 2);
+const oldReport = reports.find((data) => data.samples);
+playbackSources.at(-1).onended();
+await new Promise((resolve) => setTimeout(resolve, 5));
+playbackIo.play("new", 0, new Float32Array(160), 16000);
+processOutput(0, 3);
+deliver();
+const firstZero = playedLevels.indexOf(0);
+if (firstZero < 0 || !playedLevels.slice(0, firstZero).some((value) => value > 0.5)) {
+  throw new Error("natural playback end did not follow rendered sound");
+}
+liveMeter.port.onmessage({ data: oldReport });
+if (playedLevels.slice(firstZero).some((value) => value > 0)) throw new Error("late old frame reopened the new silent playback");
+// The old gain stays connected through the fade; reports rendered during it are valid until its fence.
+playbackIo.stopPlayback();
+playbackIo.play("immediate silent replacement", 0, new Float32Array(160), 16000);
+processOutput(0.2, 4);
+await new Promise((resolve) => setTimeout(resolve, 70));
+deliver();
+const fadedZero = playedLevels.lastIndexOf(0);
+if (fadedZero < 0 || !playedLevels.slice(firstZero, fadedZero).some((value) => value > 0)) {
+  throw new Error("cancellation did not meter its audible fade before terminal zero");
+}
+processOutput(0, 3);
+deliver();
+liveMeter.port.onmessage({ data: oldReport });
+if (playedLevels.slice(fadedZero).some((value) => value > 0)) throw new Error("late fade frame reopened playback");
+// A live output switch is another telemetry boundary; an old frame cannot follow its reset.
+processOutput(0.8, 2);
+const beforeSwitch = reports.findLast((data) => data.samples);
+if (!beforeSwitch) throw new Error("no worklet report to test output replacement");
+await playbackIo.setOutputDevice("another-output");
+const switchZero = playedLevels.lastIndexOf(0);
+liveMeter.port.onmessage({ data: beforeSwitch });
+if (playedLevels.slice(switchZero).some((value) => value > 0)) throw new Error("output switch accepted old sound");
+playbackIo.stop();
+failPlaybackModule = true;
+let outputFailure;
+createWebAudioIo().start({ ready() {}, captured() {}, rendered() {}, playbackEnded() {}, chunkStarted() {}, chunkPlayed() {},
+  microphoneMuted() {}, failed: (code) => { outputFailure = code; } });
+await until(() => outputFailure);
+if (outputFailure !== "audio-output-failed") throw new Error("playback worklet load failure was mislabeled");
 console.log(
   JSON.stringify({
     wasm: wasm.pathname,
