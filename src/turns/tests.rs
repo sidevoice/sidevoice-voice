@@ -275,3 +275,20 @@ fn a_turn_keeps_a_minute_and_ends_when_its_audio_stops() {
         "{segments:?}"
     );
 }
+
+#[test]
+fn speech_that_stops_in_a_turn_is_a_pause_until_it_starts_again() {
+    assert!(!Segmenter::new(SILENCE).paused(), "no turn, no pause");
+    let mut segmenter = speaking(SILENCE);
+    assert!(!segmenter.paused());
+    // 160 ms without speech: not stopped yet, and speech goes on.
+    hear(&mut segmenter, &times(silence(), 5), false);
+    assert!(!segmenter.paused());
+    hear(&mut segmenter, &times(speech(LOUD), 2), false);
+    // 0.2 s without it: speech stopped, a pause; the turn goes on.
+    hear(&mut segmenter, &times(silence(), 6), false);
+    assert!(segmenter.paused() && segmenter.speaking());
+    // Speech that starts again ends the pause.
+    hear(&mut segmenter, &times(speech(LOUD), 12), false);
+    assert!(!segmenter.paused() && segmenter.speaking());
+}

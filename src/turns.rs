@@ -137,6 +137,11 @@ impl Segmenter {
         self.open.is_some()
     }
 
+    /// Whether the open turn is in a pause: speech stopped in it and has not started again.
+    pub(crate) fn paused(&self) -> bool {
+        self.open.as_ref().is_some_and(|open| open.paused.is_some())
+    }
+
     /// The smoothed level of the last window, from 0 to 1.
     pub(crate) fn level(&self) -> f32 {
         self.level.value()

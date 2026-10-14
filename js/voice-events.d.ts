@@ -21,6 +21,11 @@ export type VoiceTurnEvent =
 
 /** Where the call is. */
 export interface VoiceCallState {
+  /**
+   * The microphone: `idle` (not started), `muted` (by the person), `speaking` while the person speaks in an open turn,
+   * `listening` otherwise: no turn open, or a pause in the open one (the person's speech stopped, as the detector
+   * decides it), which goes on until its end is decided.
+   */
   listening: "idle" | "muted" | "listening" | "speaking";
   /** How many of the person's turns wait for, or are in, transcription. */
   recognising: number;

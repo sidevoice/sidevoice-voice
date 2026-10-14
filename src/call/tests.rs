@@ -907,3 +907,39 @@ fn a_cancel_cuts_what_sounds_drops_what_waits_and_may_come_before_its_say() {
         )]
     );
 }
+
+#[test]
+fn a_pause_in_a_turn_is_told_as_listening_and_the_turn_goes_on() {
+    let states = |effects: &[Effect]| -> Vec<(Listening, usize)> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Event(VoiceEvent::State(state)) => {
+                    Some((state.listening, state.recognising))
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let mut run = Run::new(config());
+    run.hear(&silence(300));
+    run.hear(&speech());
+    // A second of silence: a pause, not the end (2.5 s with the default patience).
+    run.hear(&silence(1_000));
+    let effects = run.take();
+    assert!(states(&effects).contains(&(Listening::Speaking, 0)));
+    assert_eq!(states(&effects).last(), Some(&(Listening::Listening, 0)));
+    assert!(Run::transcribe(&effects).is_none(), "the turn goes on");
+
+    // Speech again: the same turn, speaking.
+    run.hear(&speech());
+    let effects = run.take();
+    assert!(states(&effects).contains(&(Listening::Speaking, 0)));
+    assert!(Run::turns(&effects).is_empty(), "no other turn");
+
+    // Its end: listening, and the turn in transcription.
+    run.hear(&silence(3_000));
+    let effects = run.take();
+    assert!(Run::transcribe(&effects).is_some());
+    assert_eq!(states(&effects).last(), Some(&(Listening::Listening, 1)));
+}
