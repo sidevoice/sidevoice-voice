@@ -189,7 +189,10 @@ impl Segmenter {
         self.level.take(pcm);
         let volume = self.volume.take(pcm);
         let bar = if playing {
-            self.numbers.quiet_bar.max(self.numbers.playing_bar)
+            self.numbers
+                .quiet_bar
+                .max(self.numbers.playing_bar)
+                .max(0.8)
         } else {
             self.numbers.quiet_bar
         };
@@ -222,10 +225,11 @@ impl Segmenter {
         }
         // Only the qualified run is eligible for pre-roll while playback sounds. Failed overlap has no path to
         // recognition or take marks; the microphone level still reports normally.
-        if playing && self.open.is_none() && !speech {
+        if gated && !speech {
             self.recent.clear();
+        } else {
+            self.recent.extend(pcm);
         }
-        self.recent.extend(pcm);
         let limit = if gated {
             END_OF_TURN_AUDIO
                 .max(self.numbers.barge_in_min_ms as usize * PER_MS as usize + pcm.len())

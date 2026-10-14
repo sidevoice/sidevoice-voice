@@ -245,8 +245,9 @@ fn overlap_needs_the_first_full_threshold_window_and_discards_short_preroll() {
     let Some(Segment::Ended(ended)) = segmenter.poll(AUDIO_IDLE_MS) else {
         panic!("turn")
     };
-    assert!(
-        ended.pcm.len() <= 33 * WINDOW,
+    assert_eq!(
+        ended.pcm.len(),
+        32 * WINDOW,
         "short overlap leaked into pre-roll"
     );
 }
@@ -280,7 +281,7 @@ fn raised_bar_rejects_speech_just_below_point_eight_and_accepts_above_it() {
         );
         let events = hear(&mut segmenter, &times(speech(amplitude), 32), true);
         assert_eq!(
-            events.iter().any(|(_, event)| *event == Segment::Started),
+            events.iter().any(|(_, event)| event == &Segment::Started),
             accepted,
             "volume {} at the 0.8 bar: {events:?}",
             amplitude
