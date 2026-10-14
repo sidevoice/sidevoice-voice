@@ -12,7 +12,7 @@ use crate::call::{Call, Effect, Input};
 use crate::event::{TurnEvent, VoiceEvent};
 use crate::io::IoEvent;
 use crate::say::SayEvent;
-use crate::test_support::{clip, config, EnergyVad, QUILTER, WINDOW};
+use crate::test_support::{clip, config, EnergyVad, FLEURS_ES, QUILTER, WINDOW};
 
 fn output(fade: usize) -> (rtrb::Producer<f32>, Output, rtrb::Consumer<f32>, Counters) {
     let (playback, queued) = RingBuffer::new(1_000);
@@ -256,6 +256,9 @@ fn rendered_boundaries_precede_qualifying_capture_even_when_the_driver_is_delaye
 fn recorded_speaker_echo_cannot_start_a_turn_but_a_person_over_it_can() {
     fn scenario(person: bool) -> Vec<Effect> {
         let reply = clip(QUILTER, 0.7);
+        // A continuous voiced half-second from the recorded FLEURS person, repeated over the reply.
+        let person_clip = clip(FLEURS_ES, 0.9);
+        let voiced = &person_clip[144 * WINDOW..160 * WINDOW];
         let mut call = Call::new(config(), "c".into(), 0);
         let mut effects = call.handle(0, Input::Start { take: false });
         effects.extend(call.handle(
@@ -304,7 +307,7 @@ fn recorded_speaker_echo_cannot_start_a_turn_but_a_person_over_it_can() {
                         })
                         .sum::<f32>();
                     let voice = if person && (2 * 16_000..4 * 16_000).contains(&i) {
-                        0.3 * (2.0 * std::f32::consts::PI * 1_000.0 * i as f32 / 16_000.0).sin()
+                        voiced[(i - 2 * 16_000) % voiced.len()]
                     } else {
                         0.0
                     };
