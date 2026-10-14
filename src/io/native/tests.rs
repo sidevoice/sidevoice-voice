@@ -256,7 +256,7 @@ fn rendered_boundaries_precede_qualifying_capture_even_when_the_driver_is_delaye
 fn recorded_speaker_echo_cannot_start_a_turn_but_a_person_over_it_can() {
     fn scenario(person: bool) -> Vec<Effect> {
         let reply = clip(QUILTER, 0.7);
-        // A continuous voiced half-second from the recorded FLEURS person, repeated over the reply.
+        // A continuous voiced half-second from the recorded FLEURS person, repeated and amplified over the reply.
         let person_clip = clip(FLEURS_ES, 0.9);
         let voiced = &person_clip[144 * WINDOW..160 * WINDOW];
         let mut call = Call::new(config(), "c".into(), 0);
@@ -306,8 +306,8 @@ fn recorded_speaker_echo_cannot_start_a_turn_but_a_person_over_it_can() {
                                 * gain
                         })
                         .sum::<f32>();
-                    let voice = if person && (2 * 16_000..4 * 16_000).contains(&i) {
-                        voiced[(i - 2 * 16_000) % voiced.len()]
+                    let voice = if person && (16_000..5 * 16_000).contains(&i) {
+                        (voiced[(i - 16_000) % voiced.len()] * 3.0).clamp(-1.0, 1.0)
                     } else {
                         0.0
                     };
