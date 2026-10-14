@@ -250,8 +250,10 @@ export function createWebAudioIo(options = {}) {
       if (!(samples instanceof Float32Array) || !Number.isFinite(startFrame) || !Number.isFinite(endFrame)) return;
       // A suspended main thread may receive seconds-old output after the processor has moved on.
       if (outputFrame(context.currentTime) - endFrame > (context.sampleRate || 16000) / 4) return;
-      const epoch = active && startFrame >= active.startFrame ? active
-        : [...closing.values()].find((past) => startFrame >= past.startFrame && endFrame <= past.endFrame);
+      // A cancellation fade can overlap the next source. Through its end, those mixed frames still belong to the
+      // closing playback and must be delivered before its zero, never deferred into the new playback.
+      const epoch = [...closing.values()].find((past) => startFrame >= past.startFrame && endFrame <= past.endFrame)
+        ?? (active && startFrame >= active.startFrame ? active : null);
       if (!epoch || (epoch.endFrame !== undefined && endFrame > epoch.endFrame) || (epoch === active && !epoch.ready)) return;
       if (epoch === active && closing.size > 0) deferred = { id: epoch.id, samples };
       else sink.rendered(samples);

@@ -433,11 +433,16 @@ liveMeter.port.onmessage({ data: oldReport });
 if (playedLevels.slice(firstZero).some((value) => value > 0)) throw new Error("late old frame reopened the new silent playback");
 // The old gain stays connected through the fade; reports rendered during it are valid until its fence.
 playbackIo.stopPlayback();
+playbackIo.play("immediate silent replacement", 0, new Float32Array(160), 16000);
 processOutput(0.2, 4);
 await new Promise((resolve) => setTimeout(resolve, 70));
 deliver();
 const fadedZero = playedLevels.lastIndexOf(0);
-playbackIo.play("after fade", 0, new Float32Array(160), 16000);
+if (fadedZero < 0 || !playedLevels.slice(firstZero, fadedZero).some((value) => value > 0)) {
+  throw new Error("cancellation did not meter its audible fade before terminal zero");
+}
+processOutput(0, 3);
+deliver();
 liveMeter.port.onmessage({ data: oldReport });
 if (playedLevels.slice(fadedZero).some((value) => value > 0)) throw new Error("late fade frame reopened playback");
 // A live output switch is another telemetry boundary; an old frame cannot follow its reset.
