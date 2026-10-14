@@ -582,6 +582,7 @@ fn locally_late_accepted_reply_is_settled_during_speech_pause_and_recognition() 
 fn mute_and_playback_restart_reset_only_a_tentative_overlap_without_capture() {
     for mute in [true, false] {
         let mut run = Run::new(config());
+        run.input(Input::Start { take: true });
         run.reply("first", "First reply.");
         run.sound("first", 0);
         run.take();
@@ -617,6 +618,12 @@ fn mute_and_playback_restart_reset_only_a_tentative_overlap_without_capture() {
         let effects = run.take();
         let (_, samples) = Run::transcribe(&effects).expect("new speech transcribed");
         assert!(samples < 4 * 16_000, "old candidate PCM leaked: {samples}");
+        let marks = run.call.take_marks();
+        assert_eq!(marks.len(), 1);
+        assert!(
+            marks[0].speech_ms >= (32 + 31) * WINDOW_MS,
+            "old candidate moved the take mark"
+        );
     }
 }
 

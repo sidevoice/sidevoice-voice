@@ -140,88 +140,116 @@ fn chunks_start_with_their_first_sample_and_end_with_their_last() {
 }
 
 #[test]
-fn rendered_boundaries_precede_capture_even_when_the_driver_is_delayed() {
+fn rendered_boundaries_precede_qualifying_capture_even_when_the_driver_is_delayed() {
+    let text = "A sufficiently long first sentence. A sufficiently long second sentence.";
+    let heard = crate::speech::chunks(text)[0].chars.end;
     let mut schedule = Schedule::default();
-    schedule.place("u", 0, 0, 160);
+    schedule.place("u", 0, 0, 64 * WINDOW as u64);
+    schedule.place("u", 1, 64 * WINDOW as u64, 65 * WINDOW as u64);
+    let tone: Vec<f32> = (0..WINDOW)
+        .map(|sample| 0.3 * (2.0 * std::f32::consts::PI * 1_000.0 * sample as f32 / 16_000.0).sin())
+        .collect();
+    // The audio worker gets ahead of a busy control task. On the final tick chunk 0 completes,
+    // chunk 1 begins, and the capture supplies the last qualifying speech window.
     let mut queued = Vec::new();
-    send_capture_after_playback(&mut schedule, 1, [vec![0.1; 160]], |event| {
-        queued.push(event)
-    });
+    for tick in 1..=64 {
+        let consumed = if tick == 64 {
+            64 * WINDOW as u64 + 1
+        } else {
+            tick * WINDOW as u64
+        };
+        send_capture_after_playback(&mut schedule, consumed, [tone.clone()], |event| {
+            queued.push(event)
+        });
+    }
     assert!(matches!(
-        queued.as_slice(),
-        [IoEvent::ChunkStarted { .. }, IoEvent::Captured(_)]
+        queued.first(),
+        Some(IoEvent::ChunkStarted { chunk: 0, .. })
     ));
-    schedule.place("u", 1, 160, 320);
-    send_capture_after_playback(&mut schedule, 320, [vec![0.1; 160]], |event| {
-        queued.push(event)
-    });
     assert!(matches!(
-        queued.as_slice(),
+        &queued[queued.len() - 3..],
         [
-            IoEvent::ChunkStarted { chunk: 0, .. },
-            IoEvent::Captured(_),
             IoEvent::ChunkPlayed { chunk: 0, .. },
             IoEvent::ChunkStarted { chunk: 1, .. },
-            IoEvent::ChunkPlayed { chunk: 1, .. },
             IoEvent::Captured(_)
         ]
     ));
-    // A busy control thread sees the same FIFO, so a qualifying capture cannot overtake a completed chunk.
+
     let mut call = Call::new(config(), "c".into(), 0);
-    call.handle(0, Input::Start { take: false });
-    call.handle(
+    let mut effects = call.handle(0, Input::Start { take: false });
+    effects.extend(call.handle(
         0,
         Input::Say {
             id: "u".into(),
-            text: "A sufficiently long first sentence. A sufficiently long second sentence.".into(),
+            text: text.into(),
             language: None,
         },
-    );
-    call.handle(
-        0,
-        Input::Synthesized {
-            utterance: "u".into(),
-            chunk: 0,
-            result: Ok((vec![0.1; 160], 16_000)),
-        },
-    );
-    // The control task drains later, retaining boundary order.
-    let mut saw_played = false;
-    let mut saw_started = false;
+    ));
+    for chunk in 0..2 {
+        let samples = if chunk == 0 { 64 * WINDOW } else { WINDOW };
+        effects.extend(call.handle(
+            0,
+            Input::Synthesized {
+                utterance: "u".into(),
+                chunk,
+                result: Ok((vec![0.1; samples], 16_000)),
+            },
+        ));
+    }
     let mut captured = 0;
     for event in queued {
         match event {
             IoEvent::ChunkStarted { utterance, chunk } => {
-                saw_started |= call
-                    .handle(0, Input::ChunkStarted { utterance, chunk })
-                    .iter()
-                    .any(|effect| {
-                        matches!(
-                            effect,
-                            Effect::Say {
-                                event: SayEvent::Playing,
-                                ..
-                            }
-                        )
-                    });
+                effects.extend(call.handle(captured * 32, Input::ChunkStarted { utterance, chunk }))
             }
             IoEvent::ChunkPlayed { utterance, chunk } => {
-                if chunk == 0 {
-                    saw_played = true;
-                }
-                call.handle(0, Input::ChunkPlayed { utterance, chunk });
+                effects.extend(call.handle(captured * 32, Input::ChunkPlayed { utterance, chunk }))
             }
-            IoEvent::Captured(_) => {
-                if captured == 0 {
-                    assert!(saw_started);
-                } else {
-                    assert!(saw_played);
-                }
+            IoEvent::Captured(pcm) => {
                 captured += 1;
+                effects.extend(call.handle(
+                    captured * 32,
+                    Input::Window {
+                        pcm,
+                        speech: captured > 32,
+                        probability: Some(if captured > 32 { 0.9 } else { 0.02 }),
+                    },
+                ));
             }
             _ => unreachable!(),
         }
     }
+    assert_eq!(captured, 64);
+    assert_eq!(
+        effects
+            .iter()
+            .filter(|effect| matches!(
+                effect,
+                Effect::Event(VoiceEvent::Turn(TurnEvent::Started { .. }))
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        effects
+            .iter()
+            .filter(|effect| matches!(effect, Effect::StopPlayback))
+            .count(),
+        1
+    );
+    let cuts: Vec<_> = effects
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::Event(VoiceEvent::AgentInterrupted(cut)) => Some((cut.heard_until, cut.played)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        cuts,
+        [(heard, true)],
+        "the completed chunk was rendered before the cut"
+    );
+    assert!(effects.iter().any(|effect| matches!(effect, Effect::Say { event: SayEvent::Done { outcome: crate::say::SayOutcome::HeardUpTo { heard_chars, reason: crate::say::StopReason::BargeIn } }, .. } if *heard_chars == heard)));
 }
 
 #[test]
