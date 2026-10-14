@@ -241,6 +241,10 @@ export function createWebAudioIo(options = {}) {
         if (closing.size === 0) deferred = null;
         return;
       }
+      if (data?.type === "reset") {
+        if (active?.id === data.id) active.ready = true;
+        return;
+      }
       meter.port.postMessage("ack");
       const { samples, startFrame, endFrame } = data ?? {};
       if (!(samples instanceof Float32Array) || !Number.isFinite(startFrame) || !Number.isFinite(endFrame)) return;
@@ -248,7 +252,7 @@ export function createWebAudioIo(options = {}) {
       if (outputFrame(context.currentTime) - endFrame > (context.sampleRate || 16000) / 4) return;
       const epoch = active && startFrame >= active.startFrame ? active
         : [...closing.values()].find((past) => startFrame >= past.startFrame && endFrame <= past.endFrame);
-      if (!epoch || (epoch.endFrame !== undefined && endFrame > epoch.endFrame)) return;
+      if (!epoch || (epoch.endFrame !== undefined && endFrame > epoch.endFrame) || (epoch === active && !epoch.ready)) return;
       if (epoch === active && closing.size > 0) deferred = { id: epoch.id, samples };
       else sink.rendered(samples);
     };
@@ -307,7 +311,11 @@ export function createWebAudioIo(options = {}) {
           await context.setSinkId(next ?? "");
           // A changed output is a boundary for queued telemetry, even if playback continues on the new device.
           const boundary = outputFrame(context.currentTime);
-          if (active) active.startFrame = boundary;
+          if (active) {
+            active.startFrame = boundary;
+            active.ready = false;
+            meter.port.postMessage({ type: "reset", id: active.id, frame: boundary });
+          }
           for (const past of closing.values()) past.startFrame = Math.max(past.startFrame, boundary);
           deferred = null;
           sink?.playbackEnded();
@@ -335,7 +343,10 @@ export function createWebAudioIo(options = {}) {
       }
       if (!rendering) {
         playback++;
-        active = { id: playback, startFrame: outputFrame(Math.max(context.currentTime, queueEnd)) };
+        const startFrame = outputFrame(Math.max(context.currentTime, queueEnd));
+        active = { id: playback, startFrame, ready: false };
+        meter.port.postMessage({ type: "reset", id: active.id,
+          frame: Math.max(startFrame, ...[...closing.values()].map((past) => past.endFrame)) });
         rendering = true;
       }
       const played = playback;

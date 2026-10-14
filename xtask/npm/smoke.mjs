@@ -419,7 +419,7 @@ const processOutput = (sample, blocks) => {
 const deliver = () => { while (reports.length) liveMeter.port.onmessage({ data: reports.shift() }); };
 playbackIo.play("old", 0, new Float32Array(160).fill(0.8), 16000);
 processOutput(0.8, 2);
-const oldReport = reports[0];
+const oldReport = reports.find((data) => data.samples);
 playbackSources.at(-1).onended();
 await new Promise((resolve) => setTimeout(resolve, 5));
 playbackIo.play("new", 0, new Float32Array(160), 16000);
@@ -442,7 +442,8 @@ liveMeter.port.onmessage({ data: oldReport });
 if (playedLevels.slice(fadedZero).some((value) => value > 0)) throw new Error("late fade frame reopened playback");
 // A live output switch is another telemetry boundary; an old frame cannot follow its reset.
 processOutput(0.8, 2);
-const beforeSwitch = reports.at(-1);
+const beforeSwitch = reports.findLast((data) => data.samples);
+if (!beforeSwitch) throw new Error("no worklet report to test output replacement");
 await playbackIo.setOutputDevice("another-output");
 const switchZero = playedLevels.lastIndexOf(0);
 liveMeter.port.onmessage({ data: beforeSwitch });

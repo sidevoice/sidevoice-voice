@@ -32,6 +32,7 @@ class LowPass {
 class PlaybackProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
+    this.rate = sampleRate;
     this.step = sampleRate / TARGET_RATE;
     this.filters = this.step > 1 ? [0, 1].map(() => new LowPass(TARGET_RATE * 0.45, sampleRate)) : [];
     this.position = 0;
@@ -44,6 +45,7 @@ class PlaybackProcessor extends AudioWorkletProcessor {
     // A stalled page keeps the newest unposted frame, replacing obsolete telemetry.
     this.inFlight = 0;
     this.latest = null;
+    this.resetAt = null;
     this.port.onmessage = ({ data }) => {
       if (data === "ack") {
         this.inFlight = Math.max(0, this.inFlight - 1);
@@ -57,6 +59,9 @@ class PlaybackProcessor extends AudioWorkletProcessor {
         // An unposted frame is obsolete telemetry, so a fence discards it.
         this.latest = null;
         this.port.postMessage({ type: "fence", id: data.id });
+      } else if (data?.type === "reset") {
+        this.resetAt = Math.max(this.resetAt ?? 0, data.frame);
+        this.port.postMessage({ type: "reset", id: data.id });
       }
     };
   }
@@ -68,6 +73,15 @@ class PlaybackProcessor extends AudioWorkletProcessor {
     if (!length) return true;
     const blockStart = typeof currentFrame === "number" ? currentFrame : this.outputFrame;
     this.outputFrame = blockStart + length;
+    if (this.resetAt !== null && blockStart >= this.resetAt) {
+      this.filters = this.step > 1 ? [0, 1].map(() => new LowPass(TARGET_RATE * 0.45, this.rate)) : [];
+      this.position = 0;
+      this.previous = 0;
+      this.frame = new Float32Array(FRAME);
+      this.filled = 0;
+      this.latest = null;
+      this.resetAt = null;
+    }
     for (let channel = 0; channel < output.length; channel++) {
       output[channel].set(input[channel] ?? input[0] ?? new Float32Array(length));
     }
