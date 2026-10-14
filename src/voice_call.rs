@@ -503,13 +503,19 @@ impl Driver {
         self.captured.extend(pcm);
         match loaded.vad.accept(pcm).await {
             Ok(frames) => {
-                for VadFrame { end, speech, .. } in frames {
+                for VadFrame {
+                    end,
+                    speech,
+                    probability,
+                } in frames
+                {
                     let take = (end.saturating_sub(self.taken) as usize).min(self.captured.len());
                     self.taken = end;
                     let window: Vec<f32> = self.captured.drain(..take).collect();
                     self.input(Input::Window {
                         pcm: window,
                         speech,
+                        probability,
                     });
                 }
             }
