@@ -111,6 +111,9 @@ pub(crate) struct Segmenter {
     level: Level,
     volume: Volume,
     activity: Activity,
+    /// The speech that made speech start last, in samples: it began this long before the end of the window it started
+    /// in.
+    start_run: usize,
     /// The last audio heard, as much as an end-of-turn model is given: since the last turn ended, at most.
     recent: VecDeque<f32>,
     open: Option<Open>,
@@ -123,6 +126,7 @@ impl Segmenter {
             level: Level::default(),
             volume: Volume::default(),
             activity: Activity::default(),
+            start_run: 0,
             recent: VecDeque::with_capacity(END_OF_TURN_AUDIO),
             open: None,
         }
@@ -140,6 +144,17 @@ impl Segmenter {
     /// Whether the open turn is in a pause: speech stopped in it and has not started again.
     pub(crate) fn paused(&self) -> bool {
         self.open.as_ref().is_some_and(|open| open.paused.is_some())
+    }
+
+    /// How long the detector has heard no speech in the open turn, in samples: where its speech stopped, before the
+    /// end of the last window.
+    pub(crate) fn silence(&self) -> usize {
+        self.open.as_ref().map_or(0, |open| open.silent as usize)
+    }
+
+    /// The speech that made speech start last, in samples: where it began, before the end of the window it started in.
+    pub(crate) fn start_run(&self) -> usize {
+        self.start_run
     }
 
     /// The smoothed level of the last window, from 0 to 1.
@@ -167,6 +182,9 @@ impl Segmenter {
         let change = self
             .activity
             .take(speech, pcm.len(), START_MS, self.numbers.stop_ms);
+        if change == Some(Change::Started) {
+            self.start_run = activity::windows(START_MS, pcm.len()).max(1) as usize * pcm.len();
+        }
         self.recent.extend(pcm);
         let excess = self.recent.len().saturating_sub(END_OF_TURN_AUDIO);
         self.recent.drain(..excess);

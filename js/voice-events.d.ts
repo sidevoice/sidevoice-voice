@@ -42,7 +42,41 @@ export type VoiceCallEvent =
   | { type: "turn"; data: VoiceTurnEvent }
   | { type: "state"; data: VoiceCallState }
   | { type: "level"; /** The microphone's smoothed level, 0 to 1. */ data: number }
-  | { type: "error"; data: { code: string } };
+  | { type: "error"; data: { code: string } }
+  | { type: "take"; data: VoiceTake };
+
+/**
+ * What the microphone gave a call from the moment it listened to the moment that listening ended, as the call heard it,
+ * and where the person's turns fell in it (src/take.rs): kept only when its start asked for it (`start({take: true})`),
+ * held in memory, and handed over once as the listening ends (a stop, a failure, a restart on other models), before the
+ * error that ended it and before the state that says the call stopped. The call keeps no copy. Every time in it is in
+ * milliseconds from its first sample, at the call's own positions in the audio. It holds at most two minutes of audio.
+ */
+export interface VoiceTake {
+  /** 16000: the call's own rate. */
+  sampleRate: number;
+  /** Mono samples from -1 to 1, in order, after echo cancellation; silence while the person had the microphone
+   *  muted. */
+  samples: Float32Array;
+  /** Unix milliseconds of its first sample, and of its end. */
+  started_at: number;
+  ended_at: number;
+  /** The turns the call opened in it, in order. */
+  turns: VoiceTakeTurn[];
+}
+
+/** One of the person's turns within a take, under the `turn_id` its `VoiceTurnEvent`s carry. */
+export interface VoiceTakeTurn {
+  turn_id: string;
+  /** Where the call heard the speech the turn opened at. */
+  speech_ms: number;
+  /** Its pauses before its end: from where its speech stopped (as the detector decides it) to where it started
+   *  again. */
+  pauses: { from_ms: number; to_ms: number }[];
+  /** Where the call decided the turn had ended (its transcription starting); null when the take ended first, or the
+   *  turn was cancelled while open. */
+  end_ms: number | null;
+}
 
 /** How to say something. */
 export interface VoiceSayOptions {

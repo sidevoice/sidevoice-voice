@@ -60,7 +60,7 @@ impl Run {
             now: 0,
             effects: Vec::new(),
         };
-        run.input(Input::Start);
+        run.input(Input::Start { take: false });
         run
     }
 
@@ -763,7 +763,7 @@ fn a_microphone_whose_device_gives_no_audio_is_a_state_until_it_does_or_the_call
     assert!(states(&mut run)
         .iter()
         .all(|state| state.microphone == Microphone::Live));
-    run.input(Input::Start);
+    run.input(Input::Start { take: false });
     let told = states(&mut run);
     assert_eq!(
         told.last().map(|state| state.microphone),
@@ -794,7 +794,7 @@ fn a_microphone_whose_device_gives_no_audio_is_a_state_until_it_does_or_the_call
         told.last().map(|state| state.microphone),
         Some(Microphone::Live)
     );
-    run.input(Input::Start);
+    run.input(Input::Start { take: false });
     let told = states(&mut run);
     assert_eq!(
         told.last().map(|state| state.microphone),
@@ -837,7 +837,7 @@ fn something_asked_while_the_call_is_stopped_is_not_played() {
         )]
     );
     // Starting again does not bring it back.
-    run.input(Input::Start);
+    run.input(Input::Start { take: false });
     run.wait(2_000);
     assert!(Run::synthesize(&run.take()).is_empty());
 }
@@ -942,4 +942,60 @@ fn a_pause_in_a_turn_is_told_as_listening_and_the_turn_goes_on() {
     let effects = run.take();
     assert!(Run::transcribe(&effects).is_some());
     assert_eq!(states(&effects).last(), Some(&(Listening::Listening, 1)));
+}
+
+#[test]
+fn a_take_marks_where_each_turn_started_paused_and_ended_in_what_was_heard() {
+    let mut run = Run::new(config());
+    run.call = Call::new(config(), "c".into(), EPOCH);
+    run.input(Input::Start { take: true });
+    let clip_ms = (speech().len() / 16) as u64;
+    run.hear(&silence(320));
+    run.hear(&speech());
+    // A second of silence (a pause), the sentence again, and the end (2.7 s after its speech stops, by default).
+    run.hear(&silence(1_024));
+    run.hear(&speech());
+    run.hear(&silence(3_008));
+    // Another turn, still open as the take ends.
+    run.hear(&speech()[..16_000 * 2]);
+    let marks = run.call.take_marks();
+    assert!(run.call.take_marks().is_empty(), "handed over once");
+    assert_eq!(marks.len(), 2, "{marks:?}");
+
+    let first = &marks[0];
+    assert_eq!(first.turn_id, "c-turn-0");
+    // Where the clip's speech starts (the speech that started the turn), from the clip's start.
+    let lead = first.speech_ms - 320;
+    assert!(lead < 1_500, "{first:?}");
+    // The pause: from where the first clip's speech stopped to where the second's starts.
+    let gap = 320 + clip_ms;
+    let pause = first
+        .pauses
+        .iter()
+        .find(|pause| pause.from_ms < gap && gap - pause.from_ms < 1_000)
+        .unwrap_or_else(|| panic!("{first:?}"));
+    assert!(pause.to_ms.abs_diff(gap + 1_024 + lead) <= 64, "{first:?}");
+    // The end: the detector's 0.2 s stop and the patience's 2.5 s after it, from where the second clip's speech stopped.
+    let stopped = gap + 1_024 + (pause.from_ms - 320);
+    assert!(
+        first
+            .end_ms
+            .is_some_and(|end_ms| end_ms.abs_diff(stopped + 2_700) <= 64),
+        "{first:?}"
+    );
+    let end = gap + 1_024 + clip_ms;
+
+    let second = &marks[1];
+    assert_eq!(second.turn_id, "c-turn-1");
+    assert!(second.speech_ms >= end + 3_008, "{second:?}");
+    assert_eq!(second.end_ms, None, "the take ended first");
+}
+
+#[test]
+fn a_start_with_no_take_keeps_no_marks() {
+    let mut run = Run::new(config());
+    run.hear(&silence(300));
+    run.hear(&speech());
+    run.hear(&silence(3_000));
+    assert!(run.call.take_marks().is_empty());
 }

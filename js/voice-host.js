@@ -49,7 +49,9 @@ function devicesOf(listed, kind) {
 
 export function createVoiceHost(source, options = {}) {
   const { io: given, ...webAudio } = options;
-  const listeners = { turn: new Set(), state: new Set(), level: new Set(), error: new Set(), devices: new Set() };
+  const listeners = {
+    turn: new Set(), state: new Set(), level: new Set(), error: new Set(), devices: new Set(), take: new Set(),
+  };
   // The chosen microphone and output (null: the system's default), kept across calls like `muted`.
   let input = webAudio.inputDevice || null;
   let output = webAudio.outputDevice || null;
@@ -66,6 +68,10 @@ export function createVoiceHost(source, options = {}) {
   let listening = false;
   let stopping = 0;
   let waiting = [];
+  // Each stop sent, until the idle state that answers it: told then, in order.
+  const answers = [];
+  // Whether the start running asked for a take: its stop resolves only once the take was handed over.
+  let taking = false;
 
   const settle = (error) => {
     const settled = waiting;
@@ -80,8 +86,11 @@ export function createVoiceHost(source, options = {}) {
     if (kind === "state") {
       const idle = data.listening === "idle";
       if (stopping > 0) {
-        // Every stop is answered with an idle state, after all the call said before it.
-        if (idle) stopping--;
+        // Every stop is answered with an idle state, after all the call said before it (its take included).
+        if (idle) {
+          stopping--;
+          answers.shift()?.();
+        }
       } else {
         listening = !idle;
         if (idle) active = false;
@@ -172,13 +181,14 @@ export function createVoiceHost(source, options = {}) {
       }
       chosen = stages(settings);
     },
-    start() {
+    start(options = {}) {
       if (!call) return Promise.reject(fail("settings-missing", "set the voice settings first"));
       if (listening && stopping === 0) return Promise.resolve();
       const started = new Promise((resolve, reject) => waiting.push({ resolve, reject }));
       if (!active) {
         active = true;
-        call.start();
+        taking = options?.take === true;
+        call.start({ take: taking });
       }
       return started;
     },
@@ -189,7 +199,12 @@ export function createVoiceHost(source, options = {}) {
       stopping++;
       active = false;
       listening = false;
+      const kept = taking;
+      taking = false;
+      const answered = new Promise((resolve) => answers.push(resolve));
       call.stop();
+      // A take is handed to `onTake` as the listening it covers ends, before the idle state that answers the stop.
+      if (kept) await answered;
     },
     say(text, options = {}) {
       return call ? call.say(String(text), options) : notPlayed();
@@ -203,6 +218,7 @@ export function createVoiceHost(source, options = {}) {
     onState: on("state"),
     onLevel: on("level"),
     onError: on("error"),
+    onTake: on("take"),
     audioDevices: () => devices(),
     async setAudioDevices(choice = {}) {
       if ("input" in choice) {

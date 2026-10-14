@@ -59,7 +59,7 @@ own microphone and speaker (`NativeIo`, or any other `AudioIo`) and a configurat
 ```rust
 let config: VoiceConfig = serde_json::from_value(json!({"language": "es", "voice": "ef_dora", "patience": "normal"}))?;
 let (call, mut events) = VoiceCall::new(Arc::new(my_models), Box::new(NativeIo::new()), config);
-call.start(); // loads the models, opens the microphone and the speaker, listens
+call.start(StartOptions::default()); // loads the models, opens the microphone and the speaker, listens
 while let Some(event) = events.next().await {
     match event {
         VoiceEvent::Turn(TurnEvent::Finished { turn_id, text, .. }) => send_words(turn_id, text),
@@ -67,6 +67,7 @@ while let Some(event) = events.next().await {
         VoiceEvent::State(state) => show(state),   // listening, recognising, playback, microphone
         VoiceEvent::Level(level) => meter(level),  // the microphone, from 0 to 1
         VoiceEvent::Error(error) => tell(error.code),
+        VoiceEvent::Take(take) => keep(take),      // with `StartOptions { take: true }`, as the listening ends
     }
 }
 // Something to say: a handle, which tells how it goes and can be cancelled.
@@ -100,7 +101,7 @@ import init, { VoiceCall } from "@sidevoice/voice";
 await init();
 const models = { load: async () => ({ vad, transcriber, speaker /*, endOfTurn */ }) }; // the page's VoiceModels
 const call = VoiceCall.create(models, config); // the same configuration, as JSON
-call.onEvent(({ type, data }) => { /* "turn" (started, finished with the words, cancelled), "state", "level", "error" */ });
+call.onEvent(({ type, data }) => { /* "turn" (started, finished with the words, cancelled), "state", "level", "error", "take" */ });
 call.start(); // loads the models, asks for the microphone, listens
 const saying = call.say("Hecho.", { language: "es" }); // a handle: saying.cancel(), saying.onEvent(step)
 const outcome = await saying.outcome; // { status: "heard" | "heard-up-to" | "not-played", ... }
@@ -144,7 +145,7 @@ Their failures are errors with stable codes: `microphone-denied`, `microphone-un
 A page drives a call through one interface, `VoiceHost`, defined once in this package
 ([`js/voice-host.d.ts`](js/voice-host.d.ts)) with the types it carries (`VoiceSettings`, `VoiceHostError`, and from
 [`js/voice-events.d.ts`](js/voice-events.d.ts) `VoiceTurnEvent`, `VoiceCallState`, `VoiceSaying`, `VoiceSayEvent`,
-`VoiceSayOutcome`). The call behind it knows nothing of the room: the page translates both ways. It has two
+`VoiceSayOutcome`, `VoiceTake`). The call behind it knows nothing of the room: the page translates both ways. It has two
 implementations:
 
 - **`createVoiceHost(source, options?)`** here (`js/voice-host.js`): the call in the page, on the page's models and the
@@ -179,6 +180,14 @@ What both promise, beyond the types:
   level and errors; nothing is buffered. Each turn has the call's own `turn_id`: `started` comes before exactly one
   `finished` (the words) or `cancelled`. A turn merged into the next is `cancelled` with `merged`, after that next
   turn's `started`.
+  The state says `speaking` while the person speaks in an open turn, and `listening` again when they pause in it (their
+  speech stopped, as the detector decides it) or it ends; its end shows as `recognising` rises.
+- **A take** (`VoiceTake`) is what the microphone gave from the moment the call listened until that listening ended,
+  as the call heard it (16 kHz mono, after echo cancellation; silence while muted), with where each turn's speech
+  started, paused and was ended, in milliseconds from its first sample at the call's own positions in the audio. It is
+  kept only for a `start({take: true})`, at most two minutes of it, in memory, and handed to `onTake` once as that
+  listening ends: before `stop()` resolves, before the error that ended it, before a restart on other models listens
+  again. The call keeps no copy, and never records otherwise.
 - **`say(text, options?)`** answers a handle at once: its `id`, `cancel()`, `onEvent(listener)` for its steps in order
   (`playing`, `progress` as each chunk starts and ends, then `done`), and `outcome`, a promise of how it ended: `heard`,
   `heard-up-to` with `heard_chars`, or `not-played`, the reason being `cancelled`, `barge-in`, `stopped` or `failed`

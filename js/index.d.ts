@@ -21,8 +21,9 @@ export type {
 export interface VoiceCall {
   /** Hears every event from now on: turns, state, level, errors. */
   onEvent(listener: (event: VoiceCallEvent) => void): void;
-  /** Loads the models, opens the microphone and the speaker, and listens once both work. */
-  start(): void;
+  /** Loads the models, opens the microphone and the speaker, and listens once both work. With `take`, keeps what the
+   *  microphone gives from then until that listening ends, told then as a `take` event. Started already: nothing. */
+  start(options?: { take?: boolean }): void;
   /** Stops listening and speaking; the models stay loaded. */
   stop(): void;
   /** A new configuration, as JSON, in effect at once. */
@@ -46,6 +47,8 @@ export type {
   VoiceSayOptions,
   VoiceSayOutcome,
   VoiceStopReason,
+  VoiceTake,
+  VoiceTakeTurn,
   VoiceTurnEvent,
 } from "./voice-events.js";
 

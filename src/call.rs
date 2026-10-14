@@ -2,8 +2,8 @@
 //! milliseconds, answering with [`Effect`]s. It holds no socket, no clock and no thread: whoever drives it runs the
 //! models and the speaker, and feeds back what they did.
 //!
-//! - **Listening** (`turns`): `Idle → Listening ⇄ Speaking`: `Speaking` while the person speaks in an open turn, back to
-//!   `Listening` when they pause in it and when it ends. A turn's audio goes to recognition.
+//! - **Listening** (`turns`): `Idle → Listening ⇄ Speaking`: `Speaking` while the person speaks in an open turn, back
+//!   to `Listening` when they pause in it and when it ends. A turn's audio goes to recognition.
 //! - **Recognition** (`recognition`): turns are transcribed one at a time, filtered, held for the merge window and
 //!   reported finished (with the words), cancelled, or joined into the next one.
 //! - **Playback** (`playback`): `Idle → Synthesizing → Playing → Idle`, one thing said after another. A turn that opens
@@ -22,13 +22,14 @@ use crate::event::{
 use crate::playback::{Action, Playback};
 use crate::recognition::{accepted, Job, Outcome, Recognition};
 use crate::say::{SayEvent, SayOutcome, StopReason};
+use crate::take::{TakePause, TakeTurn};
 use crate::turns::{duration_ms, Segment, Segmentation, Segmenter, SILENCE_STOP_MS};
 
 /// What happens to the call.
 #[derive(Debug)]
 pub(crate) enum Input {
-    /// Start listening.
-    Start,
+    /// Start listening; with `take`, keep where the turns fall in what is heard from now ([`Call::take_marks`]).
+    Start { take: bool },
     /// Stop: the open turn and the turns not yet transcribed are cancelled, and what is being said stops.
     Stop,
     /// A new configuration.
@@ -131,6 +132,8 @@ struct Turn {
     audio_ms: u64,
     silence_ms: u64,
     recognised_ms: Option<u64>,
+    /// Its marks in the take being kept, if one is: their index in it.
+    mark: Option<usize>,
 }
 
 /// One call.
@@ -156,6 +159,12 @@ pub(crate) struct Call {
     quiet_until: u64,
     /// Ids cancelled before the call heard of them: said later, they never play.
     cancelled: VecDeque<String>,
+    /// Samples heard in detector windows since the call started: where the next window falls in a take.
+    heard: usize,
+    /// The marks of the turns in the take being kept, while one is.
+    marks: Option<Vec<TakeTurn>>,
+    /// Where the open turn's speech stopped, while it is in a pause, for the take being kept.
+    pause_from: Option<usize>,
     state: Option<CallState>,
 }
 
@@ -177,6 +186,9 @@ impl Call {
             quiet_until: 0,
             cancelled: VecDeque::new(),
             state: None,
+            heard: 0,
+            marks: None,
+            pause_from: None,
         }
     }
 
@@ -184,7 +196,11 @@ impl Call {
     pub(crate) fn handle(&mut self, now: u64, input: Input) -> Vec<Effect> {
         let mut out = Vec::new();
         match input {
-            Input::Start => self.started = true,
+            Input::Start { take } => {
+                self.started = true;
+                self.heard = 0;
+                self.marks = take.then(Vec::new);
+            }
             Input::Stop => self.stop(now, &mut out),
             Input::Config(config) => {
                 self.segmenter.set_numbers(segmentation(&config));
@@ -259,6 +275,12 @@ impl Call {
         out
     }
 
+    /// The marks of the take being kept since the call started, which it stops keeping: where each turn's speech
+    /// started, paused and was ended, in what was heard. Empty when the start asked for no take.
+    pub(crate) fn take_marks(&mut self) -> Vec<TakeTurn> {
+        self.marks.take().unwrap_or_default()
+    }
+
     /// The earliest time [`Call::poll`] has something to do, if any.
     pub(crate) fn deadline(&self) -> Option<u64> {
         let speaking = self.segmenter.speaking();
@@ -287,23 +309,42 @@ impl Call {
         out
     }
 
+    /// One detector window: counted in what was heard whatever becomes of it, so that a take's positions follow its
+    /// audio, muted windows included.
     fn window(&mut self, now: u64, pcm: &[f32], confidence: f32, out: &mut Vec<Effect>) {
+        self.heard += pcm.len();
         if !self.started || self.muted {
             return;
         }
         let playing = self.playback.sounding();
-        if let Some(segment) = self.segmenter.window(now, pcm, confidence, playing) {
+        let paused = self.segmenter.paused();
+        let segment = self.segmenter.window(now, pcm, confidence, playing);
+        self.mark_pause(paused);
+        if let Some(segment) = segment {
             self.segment(now, segment, out);
         }
         out.push(Effect::Event(VoiceEvent::Level(self.segmenter.level())));
     }
 
+    /// What a segment does to the turns, where what was heard so far ends (a window's, the end of that window).
     fn segment(&mut self, now: u64, segment: Segment, out: &mut Vec<Effect>) {
         match segment {
             Segment::Started => {
                 let number = self.next_turn;
                 self.next_turn += 1;
                 let id = format!("{}-turn-{number}", self.call_id);
+                // Its speech, in the take being kept: where the speech that started it began.
+                let speech = self.heard.saturating_sub(self.segmenter.start_run());
+                self.pause_from = None;
+                let mark = self.marks.as_mut().map(|marks| {
+                    marks.push(TakeTurn {
+                        turn_id: id.clone(),
+                        speech_ms: duration_ms(speech),
+                        pauses: Vec::new(),
+                        end_ms: None,
+                    });
+                    marks.len() - 1
+                });
                 self.turns.insert(
                     number,
                     Turn {
@@ -313,6 +354,7 @@ impl Call {
                         audio_ms: 0,
                         silence_ms: 0,
                         recognised_ms: None,
+                        mark,
                     },
                 );
                 self.open = Some(number);
@@ -338,6 +380,11 @@ impl Call {
                     turn.audio_ms = duration_ms(ended.pcm.len());
                     turn.silence_ms = ended.silence_ms;
                 }
+                // Decided here: what was heard so far.
+                let heard = duration_ms(self.heard);
+                if let Some(mark) = self.mark(number) {
+                    mark.end_ms = Some(heard);
+                }
                 match self.recognition.push(Job {
                     turn: number,
                     pcm: ended.pcm,
@@ -348,6 +395,35 @@ impl Call {
                         self.close_turn(now, number, None, false, out);
                     }
                 }
+            }
+        }
+    }
+
+    /// The marks of turn `number` in the take being kept, if one is.
+    fn mark(&mut self, number: usize) -> Option<&mut TakeTurn> {
+        let index = self.turns.get(&number)?.mark?;
+        self.marks.as_mut()?.get_mut(index)
+    }
+
+    /// The open turn's pauses in the take being kept, after a window (`was`: whether it was in a pause before it):
+    /// where its speech stopped, once the detector says it did, and where it began again, once it has started again.
+    /// A pause the turn ends in is not one of them.
+    fn mark_pause(&mut self, was: bool) {
+        if self.marks.is_none() {
+            return;
+        }
+        let paused = self.segmenter.paused();
+        if !was && paused {
+            self.pause_from = Some(self.heard.saturating_sub(self.segmenter.silence()));
+        } else if was && !paused && self.segmenter.speaking() {
+            let to = self.heard.saturating_sub(self.segmenter.start_run());
+            let from = self.pause_from.take();
+            if let (Some(from), Some(mark)) = (from, self.open.and_then(|number| self.mark(number)))
+            {
+                mark.pauses.push(TakePause {
+                    from_ms: duration_ms(from),
+                    to_ms: duration_ms(to),
+                });
             }
         }
     }
@@ -424,6 +500,8 @@ impl Call {
         self.act(actions, out);
         self.started = false;
         self.microphone_muted = false;
+        self.marks = None;
+        self.pause_from = None;
         // A stop is always answered with the state, even an unchanged one: the host knows it took effect.
         self.state = None;
     }

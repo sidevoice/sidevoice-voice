@@ -106,6 +106,7 @@ fn a_smoke_report_must_show_a_running_call() {
         "devices": [["mic-a"], ["Speakers B"], null, true],
         "chosen": ["mic-a", "out-b", [["input", "mic-a"], ["output", "out-b"]]],
         "deviceGone": [null, "mic-a", ["input", null], null],
+            "take": [[16_000, "Float32Array", 1_760, 110, 0]],
             "seam": SEAM,
         },
     });
@@ -154,6 +155,8 @@ fn a_smoke_report_must_show_a_running_call() {
         ("said", json!(["function", "not-played"])),
         ("afterRestart", json!("idle")),
         ("smartLive", json!(["idle", ["end-of-turn-missing"]])),
+        // No take before the stop resolved.
+        ("take", json!([])),
     ] {
         let mut report = ran.clone();
         report["host"][key] = value;

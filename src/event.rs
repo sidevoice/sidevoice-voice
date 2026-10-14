@@ -1,7 +1,10 @@
 //! What a call tells its host ([`VoiceEvent`]): the person's turns, where the call is, how loud the microphone is, and
-//! what failed. What becomes of something the call was asked to say comes through its own handle (`say`).
+//! what failed, and the take of a start that asked for one. What becomes of something the call was asked to say comes
+//! through its own handle (`say`).
 
 use serde::Serialize;
+
+use crate::take::Take;
 
 /// Something the host must know.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -15,6 +18,10 @@ pub enum VoiceEvent {
     Level(f32),
     /// Something failed that a person may be told, as a stable code.
     Error(VoiceError),
+    /// What the microphone gave since the call listened, with where the turns fell in it: once each stretch of
+    /// listening of a start that asked for a take ends (a stop, a failure, a restart on other models), before the error
+    /// that ended it and before the state that says the call stopped.
+    Take(Take),
 }
 
 /// One step of a turn of the person's speech, under the call's own id for the turn.

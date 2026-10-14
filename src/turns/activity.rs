@@ -73,7 +73,7 @@ impl Activity {
 }
 
 /// How many windows of `samples` make `ms`, rounded half to even.
-fn windows(ms: u32, samples: usize) -> u32 {
+pub(super) fn windows(ms: u32, samples: usize) -> u32 {
     let window_s = samples.max(1) as f64 / f64::from(RATE);
     (f64::from(ms) / 1000.0 / window_s).round_ties_even() as u32
 }

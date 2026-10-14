@@ -2,10 +2,12 @@
 //! models ([`VoiceModels`]) as the call starts and drops them once it has been stopped for its idle minutes, opens
 //! the microphone and the speaker, feeds the capture to the detector and its windows to the state machine, runs each
 //! transcription, synthesis and end-of-turn question as a task of its own (so a long one never holds the detector
-//! back), and does what the state machine answers. The owner's calls reach it on a channel only [`VoiceCall`] holds,
-//! and what the microphone, the speaker and the model tasks report on one of its own; the host hears it through
-//! [`Events`]. When the owner's channel closes (the [`VoiceCall`] was dropped) the task stops the call, drops the
-//! models and the microphone and speaker, and ends: what its tasks report after that goes nowhere.
+//! back), and does what the state machine answers. A start that asks for a take has the capture kept from the moment
+//! the call listens, handed over with the state machine's marks as that listening ends. The owner's calls reach it on
+//! a channel only [`VoiceCall`] holds, and what the microphone, the speaker and the model tasks report on one of its
+//! own; the host hears it through [`Events`]. When the owner's channel closes (the [`VoiceCall`] was dropped) the task
+//! stops the call, drops the models and the microphone and speaker, and ends: what its tasks report after that goes
+//! nowhere.
 
 #[cfg(all(test, native))]
 mod tests;
@@ -28,6 +30,7 @@ use crate::models::{Models, VadFrame, VoiceModels};
 use crate::residency::Residency;
 use crate::runtime::{monotonic_ms, sleep, spawn, unix_ms};
 use crate::say::{SayEvent, SayOptions, Saying};
+use crate::take::Recording;
 use crate::turns::RATE;
 
 /// How long a stop, or the owner gone, waits behind a message the task is handling (a model that does not answer)
@@ -49,9 +52,17 @@ enum Settled {
 /// What a call tells its host, in order.
 pub type Events = UnboundedReceiver<VoiceEvent>;
 
+/// How a call starts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StartOptions {
+    /// Keep the take: what the microphone gives from the moment the call listens until that listening ends, with where
+    /// the person's turns fall in it, handed over then ([`VoiceEvent::Take`]). Never kept otherwise.
+    pub take: bool,
+}
+
 /// What reaches the call's task.
 pub(crate) enum Message {
-    Start,
+    Start(StartOptions),
     Stop,
     Config(Box<VoiceConfig>),
     /// Say `text`, telling `events` what becomes of it.
@@ -124,6 +135,9 @@ impl VoiceCall {
             tasks: VecDeque::new(),
             captured: VecDeque::new(),
             taken: 0,
+            taking: false,
+            recording: None,
+            muted: false,
             messages: internal.clone(),
             events,
             sayers: HashMap::new(),
@@ -138,9 +152,12 @@ impl VoiceCall {
         (call, received)
     }
 
-    /// Loads the models if they are not, opens the microphone and the speaker, and starts listening.
-    pub fn start(&self) {
-        self.send(Message::Start);
+    /// Loads the models if they are not, opens the microphone and the speaker, and starts listening. With
+    /// `options.take`, it keeps what the microphone gives from the moment it listens until that listening ends, and
+    /// hands it over then as [`VoiceEvent::Take`] (a restart on other models ends one stretch and starts the next).
+    /// Started already, it changes nothing.
+    pub fn start(&self, options: StartOptions) {
+        self.send(Message::Start(options));
     }
 
     /// Stops listening and speaking: the person's turn not yet reported is cancelled, and what is being said or
@@ -209,6 +226,12 @@ struct Driver {
     captured: VecDeque<f32>,
     /// The detector's position: samples taken into windows since its last reset.
     taken: u64,
+    /// Whether the start asked for a take, until the call is stopped.
+    taking: bool,
+    /// The take being kept: from the moment the call listened, while it does.
+    recording: Option<Recording>,
+    /// Whether the person muted the microphone: a take keeps silence meanwhile.
+    muted: bool,
     /// The model tasks under way (the latest of them: older ones have ended).
     tasks: VecDeque<AbortHandle>,
     /// The task's own channel, for what the microphone, the speaker and the model tasks report.
@@ -326,6 +349,7 @@ impl Driver {
     /// Stops at once, without waiting on any model: the microphone and the speaker close, the models and every task
     /// the call started are dropped (the next start loads them again), and the call says it is idle.
     fn abandon(&mut self) {
+        self.end_take();
         self.running = false;
         self.opening = false;
         self.io.stop();
@@ -340,7 +364,12 @@ impl Driver {
 
     async fn receive(&mut self, message: Message) {
         match message {
-            Message::Start => self.start().await,
+            Message::Start(options) => {
+                if !self.running {
+                    self.taking = options.take;
+                }
+                self.start().await;
+            }
             Message::Stop => {
                 if self.running {
                     self.halt().await;
@@ -348,10 +377,12 @@ impl Driver {
                     // Nothing to close: the call still says it is idle, after all it said before.
                     self.input(Input::Stop);
                 }
+                self.taking = false;
             }
             Message::Config(config) => {
                 self.configure(config);
                 if self.running && self.end_of_turn_missing() {
+                    self.end_take();
                     self.error("end-of-turn-missing".into());
                     self.halt().await;
                 }
@@ -381,12 +412,17 @@ impl Driver {
                 });
             }
             Message::CancelSay(id) => self.input(Input::CancelSay(id)),
-            Message::Mute(muted) => self.input(Input::Mute(muted)),
+            Message::Mute(muted) => {
+                self.muted = muted;
+                self.input(Input::Mute(muted));
+            }
             Message::CancelInput => self.input(Input::Cancel),
             Message::Io(IoEvent::Ready) => {
                 if self.running && self.opening {
                     self.opening = false;
-                    self.input(Input::Start);
+                    // Sample 0 of a take, when one is asked for.
+                    self.recording = self.taking.then(|| Recording::new(unix_ms()));
+                    self.input(Input::Start { take: self.taking });
                 }
             }
             Message::Io(IoEvent::Captured(pcm)) => self.captured(&pcm).await,
@@ -400,6 +436,7 @@ impl Driver {
                 self.input(Input::MicrophoneMuted(muted));
             }
             Message::Io(IoEvent::Failed(code)) => {
+                self.end_take();
                 self.error(code);
                 self.halt().await;
             }
@@ -477,6 +514,7 @@ impl Driver {
         if !self.running {
             return;
         }
+        self.end_take();
         self.running = false;
         self.opening = false;
         // The microphone and the speaker close before the call says it is idle; what its tasks would answer is moot.
@@ -501,6 +539,9 @@ impl Driver {
             return;
         }
         self.captured.extend(pcm);
+        if let Some(recording) = &mut self.recording {
+            recording.extend(pcm, self.muted);
+        }
         match loaded.vad.accept(pcm).await {
             Ok(frames) => {
                 for VadFrame {
@@ -525,6 +566,15 @@ impl Driver {
                 self.taken = 0;
                 self.error(code);
             }
+        }
+    }
+
+    /// Hands over the take being kept, if one is, with the marks the call kept for it: the stretch of listening it
+    /// covers has ended.
+    fn end_take(&mut self) {
+        if let Some(recording) = self.recording.take() {
+            let take = recording.finish(self.call.take_marks());
+            let _ = self.events.unbounded_send(VoiceEvent::Take(take));
         }
     }
 

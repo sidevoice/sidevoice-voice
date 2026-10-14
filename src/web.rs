@@ -12,22 +12,24 @@
 //! - `config` is the configuration as JSON ([`VoiceConfig`]); a malformed one throws.
 //!
 //! Every event reaches the callbacks given to `onEvent`, as `{ type, data }`, the JSON of
-//! [`VoiceEvent`](crate::VoiceEvent). `say(text, options)` answers a `Saying` handle.
+//! [`VoiceEvent`](crate::VoiceEvent), but a take's samples, which are a `Float32Array` (`{type: "take", data: {sampleRate,
+//! samples, started_at, ended_at, turns}}`). `start({take})` asks for one. `say(text, options)` answers a `Saying` handle.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use futures_util::StreamExt;
-use js_sys::{Array, Float32Array, Function, Promise, Reflect, JSON};
+use js_sys::{Array, Float32Array, Function, Object, Promise, Reflect, JSON};
 use wasm_bindgen::prelude::*;
 
 use crate::io::{AudioIo, IoEvent, IoSink};
 use crate::models::JsVoiceModels;
 use crate::runtime::spawn;
 use crate::say::{SayCancel, SayEvent, SayOptions, Saying};
-use crate::voice_call::VoiceCall;
-use crate::VoiceConfig;
+use crate::take::Take;
+use crate::voice_call::{StartOptions, VoiceCall};
+use crate::{VoiceConfig, VoiceEvent};
 
 /// One voice call, for JavaScript.
 #[wasm_bindgen(js_name = VoiceCall)]
@@ -51,8 +53,13 @@ impl WebVoiceCall {
         let heard = Rc::clone(&listeners);
         spawn(async move {
             while let Some(event) = events.next().await {
-                let json = serde_json::to_string(&event).expect("events serialize");
-                let value = JSON::parse(&json).expect("JSON");
+                let value = match event {
+                    VoiceEvent::Take(take) => take_event(take),
+                    event => {
+                        let json = serde_json::to_string(&event).expect("events serialize");
+                        JSON::parse(&json).expect("JSON")
+                    }
+                };
                 for listener in heard.borrow().iter() {
                     let _ = listener.call1(&JsValue::NULL, &value);
                 }
@@ -67,9 +74,16 @@ impl WebVoiceCall {
         self.listeners.borrow_mut().push(listener);
     }
 
-    /// Loads the models, opens the microphone and the speaker, and starts listening.
-    pub fn start(&self) {
-        self.call.start();
+    /// Loads the models, opens the microphone and the speaker, and starts listening. `options`: `{ take? }`, `true` to
+    /// keep the take, told as a `take` event once the listening ends.
+    pub fn start(&self, options: JsValue) {
+        let take = !options.is_undefined()
+            && !options.is_null()
+            && Reflect::get(&options, &"take".into())
+                .ok()
+                .and_then(|take| take.as_bool())
+                .unwrap_or(false);
+        self.call.start(StartOptions { take });
     }
 
     /// Stops listening and speaking; the models stay loaded.
@@ -269,6 +283,34 @@ impl JsIo {
                 .unwrap_or_else(|| "io-failed".into())
         })
     }
+}
+
+/// A take as the page gets it, `{type: "take", data}`: its samples a `Float32Array` (a copy, the take's own dropped
+/// here), the rest its JSON.
+fn take_event(take: Take) -> JsValue {
+    let Take {
+        sample_rate,
+        samples,
+        started_at,
+        ended_at,
+        turns,
+    } = take;
+    let data = Object::new();
+    let turns = serde_json::to_string(&turns).expect("turns serialize");
+    let fields: [(&str, JsValue); 5] = [
+        ("sampleRate", sample_rate.into()),
+        ("samples", Float32Array::from(&samples[..]).into()),
+        ("started_at", JsValue::from_f64(started_at as f64)),
+        ("ended_at", JsValue::from_f64(ended_at as f64)),
+        ("turns", JSON::parse(&turns).expect("JSON")),
+    ];
+    for (key, value) in fields {
+        let _ = Reflect::set(&data, &key.into(), &value);
+    }
+    let event = Object::new();
+    let _ = Reflect::set(&event, &"type".into(), &"take".into());
+    let _ = Reflect::set(&event, &"data".into(), &data);
+    event.into()
 }
 
 fn read_config(config: &JsValue) -> Result<VoiceConfig, JsError> {
