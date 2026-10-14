@@ -7,9 +7,12 @@ use rtrb::RingBuffer;
 
 use super::output::{Counters, Output, Queue, Schedule};
 use super::pipeline::Pipeline;
-use super::{drain, playback_complete};
+use super::{drain, playback_complete, send_capture_after_playback};
+use crate::call::{Call, Effect, Input};
+use crate::event::{TurnEvent, VoiceEvent};
 use crate::io::IoEvent;
-use crate::test_support::{clip, QUILTER};
+use crate::say::SayEvent;
+use crate::test_support::{clip, config, EnergyVad, QUILTER, WINDOW};
 
 fn output(fade: usize) -> (rtrb::Producer<f32>, Output, rtrb::Consumer<f32>, Counters) {
     let (playback, queued) = RingBuffer::new(1_000);
@@ -134,6 +137,196 @@ fn chunks_start_with_their_first_sample_and_end_with_their_last() {
     );
     schedule.clear();
     assert!(schedule.due(1_000).is_empty());
+}
+
+#[test]
+fn rendered_boundaries_precede_capture_even_when_the_driver_is_delayed() {
+    let mut schedule = Schedule::default();
+    schedule.place("u", 0, 0, 160);
+    let mut queued = Vec::new();
+    send_capture_after_playback(&mut schedule, 1, [vec![0.1; 160]], |event| {
+        queued.push(event)
+    });
+    assert!(matches!(
+        queued.as_slice(),
+        [IoEvent::ChunkStarted { .. }, IoEvent::Captured(_)]
+    ));
+    schedule.place("u", 1, 160, 320);
+    send_capture_after_playback(&mut schedule, 320, [vec![0.1; 160]], |event| {
+        queued.push(event)
+    });
+    assert!(matches!(
+        queued.as_slice(),
+        [
+            IoEvent::ChunkStarted { chunk: 0, .. },
+            IoEvent::Captured(_),
+            IoEvent::ChunkPlayed { chunk: 0, .. },
+            IoEvent::ChunkStarted { chunk: 1, .. },
+            IoEvent::ChunkPlayed { chunk: 1, .. },
+            IoEvent::Captured(_)
+        ]
+    ));
+    // A busy control thread sees the same FIFO, so a qualifying capture cannot overtake a completed chunk.
+    let mut call = Call::new(config(), "c".into(), 0);
+    call.handle(0, Input::Start { take: false });
+    call.handle(
+        0,
+        Input::Say {
+            id: "u".into(),
+            text: "A sufficiently long first sentence. A sufficiently long second sentence.".into(),
+            language: None,
+        },
+    );
+    call.handle(
+        0,
+        Input::Synthesized {
+            utterance: "u".into(),
+            chunk: 0,
+            result: Ok((vec![0.1; 160], 16_000)),
+        },
+    );
+    // The control task drains later, retaining boundary order.
+    let mut saw_played = false;
+    let mut saw_started = false;
+    let mut captured = 0;
+    for event in queued {
+        match event {
+            IoEvent::ChunkStarted { utterance, chunk } => {
+                saw_started |= call
+                    .handle(0, Input::ChunkStarted { utterance, chunk })
+                    .iter()
+                    .any(|effect| {
+                        matches!(
+                            effect,
+                            Effect::Say {
+                                event: SayEvent::Playing,
+                                ..
+                            }
+                        )
+                    });
+            }
+            IoEvent::ChunkPlayed { utterance, chunk } => {
+                if chunk == 0 {
+                    saw_played = true;
+                }
+                call.handle(0, Input::ChunkPlayed { utterance, chunk });
+            }
+            IoEvent::Captured(_) => {
+                if captured == 0 {
+                    assert!(saw_started);
+                } else {
+                    assert!(saw_played);
+                }
+                captured += 1;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[test]
+fn recorded_speaker_echo_cannot_start_a_turn_but_a_person_over_it_can() {
+    fn scenario(person: bool) -> Vec<Effect> {
+        let reply = clip(QUILTER, 0.7);
+        let mut call = Call::new(config(), "c".into(), 0);
+        let mut effects = call.handle(0, Input::Start { take: false });
+        effects.extend(call.handle(
+            0,
+            Input::Say {
+                id: "reply".into(),
+                text: "A recorded reply playing on the local speaker.".into(),
+                language: None,
+            },
+        ));
+        effects.extend(call.handle(
+            0,
+            Input::Synthesized {
+                utterance: "reply".into(),
+                chunk: 0,
+                result: Ok((vec![0.1; reply.len()], 16_000)),
+            },
+        ));
+        effects.extend(call.handle(
+            0,
+            Input::ChunkStarted {
+                utterance: "reply".into(),
+                chunk: 0,
+            },
+        ));
+        let mut pipeline = Pipeline::new(16_000, 1, 16_000).unwrap();
+        let mut vad = EnergyVad::new();
+        let mut clean = Vec::new();
+        let mut now = 0;
+        let end = reply.len() + 2_000 * 16;
+        for at in (0..end).step_by(160) {
+            let render: Vec<f32> = (at..at + 160)
+                .map(|i| reply.get(i).copied().unwrap_or(0.0))
+                .collect();
+            pipeline.render(&render);
+            let mic: Vec<f32> = (at..at + 160)
+                .map(|i| {
+                    let echo = [(60 * 16, 0.5), (75 * 16, 0.2), (95 * 16, 0.1)]
+                        .into_iter()
+                        .map(|(delay, gain)| {
+                            i.checked_sub(delay)
+                                .and_then(|j| reply.get(j))
+                                .copied()
+                                .unwrap_or(0.0)
+                                * gain
+                        })
+                        .sum::<f32>();
+                    let voice = if person && i >= 2 * 16_000 && i < 4 * 16_000 {
+                        (0.3 * (2.0 * std::f32::consts::PI * 1_000.0 * i as f32 / 16_000.0).sin())
+                            as f32
+                    } else {
+                        0.0
+                    };
+                    echo + voice
+                })
+                .collect();
+            for frame in pipeline.capture(&mic) {
+                clean.extend(frame);
+            }
+            while clean.len() >= WINDOW {
+                let pcm: Vec<f32> = clean.drain(..WINDOW).collect();
+                now += 32;
+                effects.extend(call.handle(
+                    now,
+                    Input::Window {
+                        speech: vad.window(&pcm),
+                        probability: Some(EnergyVad::probability(&pcm)),
+                        pcm,
+                    },
+                ));
+            }
+            if at < reply.len() && at + 160 >= reply.len() {
+                effects.extend(call.handle(
+                    now,
+                    Input::ChunkPlayed {
+                        utterance: "reply".into(),
+                        chunk: 0,
+                    },
+                ));
+            }
+        }
+        effects
+    }
+    let alone = scenario(false);
+    assert!(!alone.iter().any(|effect| matches!(
+        effect,
+        Effect::Event(VoiceEvent::Turn(_))
+            | Effect::Transcribe { .. }
+            | Effect::StopPlayback
+            | Effect::Event(VoiceEvent::AgentInterrupted(_))
+    )));
+    let person = scenario(true);
+    assert!(person.iter().any(|effect| matches!(
+        effect,
+        Effect::Event(VoiceEvent::Turn(TurnEvent::Started { .. }))
+    )));
+    assert!(person
+        .iter()
+        .any(|effect| matches!(effect, Effect::StopPlayback)));
 }
 
 /// `samples` at 16 kHz, held at 48 kHz (each sample three times): enough for a speaker's and a microphone's rate.

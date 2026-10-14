@@ -511,6 +511,116 @@ fn accepted_before_sounding_is_never_played_after_a_spoken_turn_even_if_it_has_n
 }
 
 #[test]
+fn locally_late_accepted_reply_is_settled_during_speech_pause_and_recognition() {
+    for words in [Some("new words"), None] {
+        let mut run = Run::new(config());
+        run.hear(&speech());
+        assert_eq!(Run::turns(&run.take())[0].phase, TurnPhase::Started);
+        for (id, quiet_ms) in [("during-speech", 0), ("during-pause", 1_000)] {
+            if quiet_ms > 0 {
+                run.hear(&silence(quiet_ms));
+            }
+            run.reply(
+                id,
+                "A reply accepted before the local driver learned of the turn.",
+            );
+            let effects = run.take();
+            assert_eq!(
+                Run::outcomes(&effects),
+                [(
+                    id.into(),
+                    SayOutcome::NotPlayed {
+                        reason: StopReason::BargeIn
+                    }
+                )]
+            );
+            assert!(effects.iter().any(|effect| matches!(effect, Effect::Event(VoiceEvent::AgentInterrupted(cut)) if cut.utterance_id == id && !cut.played && cut.heard_until == 0)));
+            assert!(Run::synthesize(&effects).is_empty());
+        }
+        run.hear(&silence(3_000));
+        let (turn, _) = Run::transcribe(&run.take()).expect("normal close");
+        run.reply(
+            "during-recognition",
+            "This also arrived after speech ended.",
+        );
+        assert_eq!(
+            Run::outcomes(&run.take()),
+            [(
+                "during-recognition".into(),
+                SayOutcome::NotPlayed {
+                    reason: StopReason::BargeIn
+                }
+            )]
+        );
+        if let Some(words) = words {
+            run.transcribed(turn, words);
+            run.reply(
+                "during-merge",
+                "This arrived before the final result was emitted.",
+            );
+            assert_eq!(
+                Run::outcomes(&run.take()),
+                [(
+                    "during-merge".into(),
+                    SayOutcome::NotPlayed {
+                        reason: StopReason::BargeIn
+                    }
+                )]
+            );
+            run.wait(500);
+            assert_eq!(Run::turns(&run.take())[0].text.as_deref(), Some(words));
+        } else {
+            run.input(Input::Cancel);
+            assert_eq!(Run::turns(&run.take())[0].phase, TurnPhase::Cancelled);
+        }
+        run.wait(2_000);
+        assert!(Run::synthesize(&run.take()).is_empty());
+    }
+}
+
+#[test]
+fn mute_and_playback_restart_reset_only_a_tentative_overlap_without_capture() {
+    for mute in [true, false] {
+        let mut run = Run::new(config());
+        run.reply("first", "First reply.");
+        run.sound("first", 0);
+        run.take();
+        for window in continuous_loud_speech(32).chunks(WINDOW) {
+            run.now += WINDOW_MS;
+            run.input(Input::Window {
+                pcm: window.to_vec(),
+                speech: false,
+                probability: Some(0.02),
+            });
+        }
+        run.take();
+        run.hear(&continuous_loud_speech(31));
+        assert!(Run::turns(&run.take()).is_empty());
+        if mute {
+            run.input(Input::Mute(true));
+            run.wait(10_000);
+            run.input(Input::Mute(false));
+        } else {
+            run.played("first", 0);
+            run.reply("second", "Second reply.");
+            run.sound("second", 0);
+        }
+        run.take();
+        run.hear(&continuous_loud_speech(1));
+        assert!(
+            Run::turns(&run.take()).is_empty(),
+            "old candidate survived boundary"
+        );
+        run.hear(&continuous_loud_speech(31));
+        assert_eq!(Run::turns(&run.take())[0].phase, TurnPhase::Started);
+        run.hear(&silence(3_000));
+        let effects = run.take();
+        let (_, samples) = Run::transcribe(&effects).expect("new speech transcribed");
+        assert!(samples < 4 * 16_000, "old candidate PCM leaked: {samples}");
+    }
+}
+
+#[test]
 fn the_listening_bar_rises_while_a_reply_plays() {
     let mut run = Run::new(config());
     run.reply(
@@ -659,14 +769,21 @@ fn smart_turn_ends_a_finished_sentence_as_soon_as_speech_stopped() {
 }
 
 #[test]
-fn a_reply_waits_for_the_turn_and_the_grace_after_it() {
+fn a_reply_during_the_turn_is_refused_and_a_later_reply_waits_for_grace() {
     let mut run = Run::new(config());
     run.hear(&speech());
     run.reply("u1", "Here is my answer to what you said.");
-    assert!(
-        Run::synthesize(&run.take()).is_empty(),
-        "the person is speaking"
+    let effects = run.take();
+    assert_eq!(
+        Run::outcomes(&effects),
+        [(
+            "u1".into(),
+            SayOutcome::NotPlayed {
+                reason: StopReason::BargeIn
+            }
+        )]
     );
+    assert!(Run::synthesize(&effects).is_empty());
     run.hear(&silence(3_000));
     let (turn, _) = Run::transcribe(&run.take()).expect("transcribed");
     assert!(
@@ -677,11 +794,13 @@ fn a_reply_waits_for_the_turn_and_the_grace_after_it() {
     run.wait(500);
     let effects = run.take();
     assert_eq!(Run::turns(&effects)[0].phase, TurnPhase::Finished);
+    run.reply("u2", "Here is a current reply after the turn closed.");
+    assert!(Run::synthesize(&run.take()).is_empty(), "the grace");
     assert!(Run::synthesize(&effects).is_empty(), "the grace");
     run.wait(999);
     assert!(Run::synthesize(&run.take()).is_empty());
     run.wait(1);
-    assert_eq!(Run::synthesize(&run.take()).len(), 1);
+    assert_eq!(Run::synthesize(&run.take())[0].0, "u2");
 }
 
 #[test]
@@ -845,6 +964,81 @@ fn muting_ends_the_turn_and_cancelling_drops_it() {
 }
 
 #[test]
+fn mute_finishes_with_premute_words_and_an_empty_result_uses_normal_closure() {
+    for words in ["captured words", ""] {
+        let mut run = Run::new(config());
+        run.input(Input::Start { take: true });
+        run.hear(&speech()[..16_000 * 2]);
+        run.take();
+        run.input(Input::Mute(true));
+        run.hear(&speech()); // Input is silenced while muted, including for the take.
+        run.hear(&silence(3_000));
+        let effects = run.take();
+        let (turn, _) = Run::transcribe(&effects).expect("normal mute endpoint");
+        let pcm = effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::Transcribe { pcm, .. } => Some(pcm),
+                _ => None,
+            })
+            .expect("captured audio");
+        assert!(
+            pcm.iter().any(|&sample| sample.abs() > 0.01),
+            "pre-mute speech retained"
+        );
+        assert!(
+            pcm.iter().rev().take(16_000).all(|&sample| sample == 0.0),
+            "muted input became transcript audio"
+        );
+        run.transcribed(turn, words);
+        run.wait(500);
+        let turns = Run::turns(&run.take());
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].phase,
+            if words.is_empty() {
+                TurnPhase::Cancelled
+            } else {
+                TurnPhase::Finished
+            }
+        );
+        assert_eq!(
+            turns[0].text.as_deref(),
+            (!words.is_empty()).then_some(words)
+        );
+        let marks = run.call.take_marks();
+        assert_eq!(marks.len(), 1);
+        assert!(marks[0].end_ms.is_some_and(|end| end > marks[0].speech_ms));
+    }
+}
+
+#[test]
+fn muted_smart_turn_uses_the_normal_pause_decision_and_preserves_words() {
+    let mut run = Run::new(VoiceConfig {
+        end_of_turn: EndOfTurn::SmartTurn,
+        ..config()
+    });
+    run.hear(&speech());
+    run.take();
+    run.input(Input::Mute(true));
+    let (_, effects) = run.quiet_until(|effects| Run::asked(effects).is_some());
+    let (turn, pause, _) = Run::asked(&effects).expect("ordinary smart-turn pause");
+    run.input(Input::EndOfTurn {
+        turn,
+        pause,
+        result: Ok(0.9),
+    });
+    let effects = run.take();
+    let (_, samples) = Run::transcribe(&effects).expect("normal transcription");
+    assert!(samples > speech().len());
+    run.transcribed(turn, "premute words");
+    run.wait(500);
+    let turns = Run::turns(&run.take());
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].text.as_deref(), Some("premute words"));
+}
+
+#[test]
 fn a_microphone_whose_device_gives_no_audio_is_a_state_until_it_does_or_the_call_stops() {
     let states = |run: &mut Run| -> Vec<CallState> {
         run.take()
@@ -950,10 +1144,18 @@ fn an_expired_grace_is_no_deadline_while_a_turn_holds_the_reply_back() {
     let (turn, _) = Run::transcribe(&run.take()).expect("transcribed");
     run.transcribed(turn, "a question");
     run.wait(500);
-    // A second turn opens and a reply waits for it, well past the first turn's grace.
+    // A second turn opens and a late local reply is refused, well past the first turn's grace.
     run.hear(&speech());
     run.reply("u1", "An answer to the first turn.");
-    run.take();
+    assert_eq!(
+        Run::outcomes(&run.take()),
+        [(
+            "u1".into(),
+            SayOutcome::NotPlayed {
+                reason: StopReason::BargeIn
+            }
+        )]
+    );
     assert!(run.now > 2_000);
     assert!(
         run.call
@@ -1006,6 +1208,52 @@ fn a_cancel_cuts_what_sounds_drops_what_waits_and_may_come_before_its_say() {
             }
         )]
     );
+}
+
+#[test]
+fn skipping_sounding_reply_keeps_two_successors_in_fifo_without_a_turn() {
+    let mut run = Run::new(config());
+    run.reply(
+        "first",
+        "The first sentence is long enough to stand alone. The second sentence follows.",
+    );
+    run.reply("second", "A second reply follows the skipped one.");
+    run.reply("third", "A third reply remains in the queue.");
+    run.sound("first", 0);
+    run.played("first", 0);
+    run.sound("first", 1);
+    run.take();
+    run.input(Input::CancelSay("first".into()));
+    let effects = run.take();
+    assert!(effects.contains(&Effect::StopPlayback));
+    assert!(
+        matches!(Run::outcomes(&effects)[..], [(ref id, SayOutcome::HeardUpTo { heard_chars, reason: StopReason::Cancelled })] if id == "first" && heard_chars > 0)
+    );
+    assert!(Run::synthesize(&effects)
+        .iter()
+        .any(|(id, _, _)| id == "second"));
+    assert!(Run::turns(&effects).is_empty());
+    assert!(!effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::Event(VoiceEvent::AgentInterrupted(_)))));
+    run.sound("second", 0);
+    run.played("second", 0);
+    let effects = run.take();
+    assert_eq!(
+        Run::outcomes(&effects),
+        [("second".into(), SayOutcome::Heard)]
+    );
+    assert!(Run::synthesize(&effects)
+        .iter()
+        .any(|(id, _, _)| id == "third"));
+    run.sound("third", 0);
+    run.played("third", 0);
+    let effects = run.take();
+    assert_eq!(
+        Run::outcomes(&effects),
+        [("third".into(), SayOutcome::Heard)]
+    );
+    assert!(Run::turns(&effects).is_empty());
 }
 
 #[test]

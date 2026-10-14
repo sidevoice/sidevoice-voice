@@ -327,6 +327,18 @@ impl Segmenter {
         self.barge_run = 0;
     }
 
+    /// Forget a tentative speech run when the input or output changes without a detector window.
+    /// An already-open turn keeps its audio and can still finish normally.
+    pub(crate) fn reset_candidate(&mut self) {
+        if self.open.is_none() {
+            self.activity.reset();
+            self.recent.clear();
+            self.barge_run = 0;
+            self.was_playing = false;
+            self.start_run = 0;
+        }
+    }
+
     fn end(&mut self, silence_ms: u64) -> Segment {
         let open = self.open.take().expect("an open turn");
         self.recent.clear();

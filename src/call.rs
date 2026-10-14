@@ -218,6 +218,7 @@ impl Call {
             Input::Transcribed { turn, result } => self.transcribed(now, turn, result, &mut out),
             Input::Say { id, text, language } => self.say(id, &text, language, &mut out),
             Input::CancelSay(id) => {
+                let was_sounding = self.playback.sounding();
                 let mut actions = Vec::new();
                 if !self.playback.cancel(&id, &mut actions) {
                     // Not here (yet): a cancel may overtake its own `say`, which then never plays.
@@ -227,29 +228,39 @@ impl Call {
                     }
                 }
                 self.act(actions, &mut out);
+                self.playback_boundary(was_sounding);
             }
             Input::Synthesized {
                 utterance,
                 chunk,
                 result,
             } => {
+                let was_sounding = self.playback.sounding();
                 let mut actions = Vec::new();
                 self.playback
                     .synthesized(&utterance, chunk, result, &mut actions);
                 self.act(actions, &mut out);
+                self.playback_boundary(was_sounding);
             }
             Input::ChunkStarted { utterance, chunk } => {
+                let was_sounding = self.playback.sounding();
                 let mut actions = Vec::new();
                 self.playback.chunk_started(&utterance, chunk, &mut actions);
                 self.act(actions, &mut out);
+                self.playback_boundary(was_sounding);
             }
             Input::ChunkPlayed { utterance, chunk } => {
+                let was_sounding = self.playback.sounding();
                 let mut actions = Vec::new();
                 self.playback.chunk_played(&utterance, chunk, &mut actions);
                 self.act(actions, &mut out);
+                self.playback_boundary(was_sounding);
             }
             Input::Mute(muted) => {
                 self.muted = muted;
+                if muted {
+                    self.segmenter.reset_candidate();
+                }
             }
             Input::MicrophoneMuted(muted) => self.microphone_muted = muted,
             Input::Cancel => self.cancel_input(now, &mut out),
@@ -524,21 +535,36 @@ impl Call {
                 self.cancelled.remove(index);
                 Some(StopReason::Cancelled)
             } else {
-                (!self.started).then_some(StopReason::Stopped)
+                if !self.started {
+                    Some(StopReason::Stopped)
+                } else if !self.quiet(self.segmenter.speaking()) {
+                    Some(StopReason::BargeIn)
+                } else {
+                    None
+                }
             };
         if let Some(reason) = refused {
-            out.push(Effect::Say {
-                id,
-                event: SayEvent::Done {
-                    outcome: SayOutcome::NotPlayed { reason },
-                },
-            });
+            self.act(
+                vec![Action::Say {
+                    utterance: id,
+                    event: SayEvent::Done {
+                        outcome: SayOutcome::NotPlayed { reason },
+                    },
+                }],
+                out,
+            );
             return;
         }
         let language = language.or_else(|| self.config.language.clone());
         let mut actions = Vec::new();
         self.playback.push(id, text, language, &mut actions);
         self.act(actions, out);
+    }
+
+    fn playback_boundary(&mut self, was_sounding: bool) {
+        if was_sounding != self.playback.sounding() {
+            self.segmenter.reset_candidate();
+        }
     }
 
     /// Whether nothing of the person's holds the playback back: the call listens and no turn is open, being

@@ -271,6 +271,19 @@ fn overlap_resets_on_low_volume_and_when_output_stops() {
 }
 
 #[test]
+fn a_below_volume_window_resets_a_nearly_qualified_overlap() {
+    let mut segmenter = Segmenter::new(SMART);
+    hear(&mut segmenter, &times(Heard(tone(LOUD), 0.02), 32), true);
+    assert!(hear(&mut segmenter, &times(speech(LOUD), 31), true).is_empty());
+    // Confidence remains high: the level alone falls below the raised bar.
+    assert!(hear(&mut segmenter, &times(speech(MURMUR), 13), true).is_empty());
+    assert!(hear(&mut segmenter, &times(speech(LOUD), 1), true).is_empty());
+    assert!(hear(&mut segmenter, &times(speech(LOUD), 64), true)
+        .iter()
+        .any(|(_, event)| event == &Segment::Started));
+}
+
+#[test]
 fn raised_bar_rejects_speech_just_below_point_eight_and_accepts_above_it() {
     for (amplitude, accepted) in [(0.044, false), (0.046, true)] {
         let mut segmenter = Segmenter::new(SMART);

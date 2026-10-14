@@ -67,6 +67,7 @@ while let Some(event) = events.next().await {
         VoiceEvent::State(state) => show(state),   // listening, recognising, playback, microphone
         VoiceEvent::Level(level) => meter(level),  // the microphone, from 0 to 1
         VoiceEvent::PlaybackLevel(level) => speaker_meter(level), // rendered output, from 0 to 1
+        VoiceEvent::AgentInterrupted(cut) => interrupted(cut.utterance_id, cut.heard_until, cut.played),
         VoiceEvent::Error(error) => tell(error.code),
         VoiceEvent::Take(take) => keep(take),      // with `StartOptions { take: true }`, as the listening ends
     }
@@ -102,7 +103,7 @@ import init, { VoiceCall } from "@sidevoice/voice";
 await init();
 const models = { load: async () => ({ vad, transcriber, speaker /*, endOfTurn */ }) }; // the page's VoiceModels
 const call = VoiceCall.create(models, config); // the same configuration, as JSON
-call.onEvent(({ type, data }) => { /* "turn", "state", "level", "playback-level", "error", "take" */ });
+call.onEvent(({ type, data }) => { /* "turn", "state", "level", "playback-level", "agent-interrupted", "error", "take" */ });
 call.start(); // loads the models, asks for the microphone, listens
 const saying = call.say("Hecho.", { language: "es" }); // a handle: saying.cancel(), saying.onEvent(step)
 const outcome = await saying.outcome; // { status: "heard" | "heard-up-to" | "not-played", ... }

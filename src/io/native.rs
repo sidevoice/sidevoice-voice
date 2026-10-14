@@ -28,7 +28,7 @@ use rtrb::{Consumer, Producer, RingBuffer};
 
 use self::devices::{by_id, Kind};
 pub use self::devices::{AudioDevice, AudioDevices, LostDevices, NativeDevices};
-use self::output::{Counters, Output, Queue};
+use self::output::{Counters, Output, Queue, Schedule};
 use self::pipeline::Pipeline;
 use crate::audio::Resampler;
 use crate::io::{AudioIo, IoEvent, IoSink};
@@ -269,13 +269,16 @@ fn run(
         if (had_chunks || ending.is_some()) && !rendered.is_empty() {
             sink.send(IoEvent::Rendered(rendered));
         }
-        for frame in pipeline.capture(&heard) {
-            sink.send(IoEvent::Captured(frame.to_vec()));
-        }
+        let frames: Vec<Vec<f32>> = pipeline
+            .capture(&heard)
+            .map(|frame| frame.to_vec())
+            .collect();
         let consumed = speaker.counters.consumed.load(Ordering::Acquire);
-        for event in queue.schedule.due(consumed) {
-            sink.send(event);
-        }
+        // The callback publishes its consumed count after writing the reference. Report every playback boundary
+        // visible at this snapshot before the capture from this tick can qualify a turn and freeze its extent.
+        send_capture_after_playback(&mut queue.schedule, consumed, frames, |event| {
+            sink.send(event)
+        });
         // `consumed` is published after the callback's reference writes. A callback may run between the drain above
         // and this load; wait until its published reference tail has crossed the worker before ending the meter.
         if playback_complete(
@@ -292,6 +295,20 @@ fn run(
             had_chunks = false;
         }
         thread::sleep(TICK);
+    }
+}
+
+fn send_capture_after_playback(
+    schedule: &mut Schedule,
+    consumed: u64,
+    frames: impl IntoIterator<Item = Vec<f32>>,
+    mut send: impl FnMut(IoEvent),
+) {
+    for event in schedule.due(consumed) {
+        send(event);
+    }
+    for frame in frames {
+        send(IoEvent::Captured(frame));
     }
 }
 
