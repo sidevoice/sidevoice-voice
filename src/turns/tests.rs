@@ -1,71 +1,265 @@
-use super::{Segment, Segmentation, Segmenter, AUDIO_IDLE_MS, MAX_TURN, PRE_ROLL};
+//! Segmentation on synthetic windows: a 1 kHz tone at a chosen amplitude (whose loudness BS.1770 knows: 20·log10(a)
+//! − 3 LUFS), silence, and the detector's confidence for each, 32 ms apart.
+
+use super::{
+    instant, loudness, Segment, Segmentation, Segmenter, AUDIO_IDLE_MS, MAX_TURN, PRE_ROLL,
+    PRE_SPEECH,
+};
 
 #[cfg(web)]
 use wasm_bindgen_test::wasm_bindgen_test as test;
 
-const NUMBERS: Segmentation = Segmentation {
-    end_of_turn_silence_ms: 2_500,
-    pause_ms: None,
+/// Samples in one detector window.
+const WINDOW: usize = 512;
+
+/// `smart-turn` at normal patience: speech stops after 0.9 s, a pause ends the turn 3 s after that.
+const SMART: Segmentation = Segmentation {
+    stop_ms: 900,
+    end_ms: 3_000,
+    ask: true,
     quiet_bar: 0.5,
     playing_bar: 0.8,
 };
 
-/// A 32 ms window at −9 dBFS (a level of 0.85 once smoothed), or silent.
-fn window(loud: bool) -> Vec<f32> {
-    let amplitude = if loud { 0.25 * 2f32.sqrt() } else { 0.0 };
-    (0..512)
-        .map(|i| if i % 2 == 0 { amplitude } else { -amplitude })
+/// `silence` at normal patience: speech stops after 0.2 s, a pause ends the turn 2.5 s after that.
+const SILENCE: Segmentation = Segmentation {
+    stop_ms: 200,
+    end_ms: 2_500,
+    ask: false,
+    ..SMART
+};
+
+/// Speech at a normal level: −23 LUFS, a volume of 0.87.
+const LOUD: f32 = 0.1;
+/// Soft speech: −43 LUFS (a volume of 0.67), its RMS at −43 dBFS.
+const SOFT: f32 = 0.01;
+/// A murmur under the bar: −69 LUFS, a volume of 0.41.
+const MURMUR: f32 = 0.000_5;
+
+/// One window of a 1 kHz tone at `amplitude` (whole periods, so windows join seamlessly).
+fn tone(amplitude: f32) -> Vec<f32> {
+    (0..WINDOW)
+        .map(|i| {
+            let phase = 2.0 * std::f64::consts::PI * 1_000.0 * i as f64 / 16_000.0;
+            (f64::from(amplitude) * phase.sin()) as f32
+        })
         .collect()
 }
 
-#[test]
-fn a_turn_opens_with_its_pre_roll_and_ends_after_the_silence() {
-    let mut segmenter = Segmenter::new(NUMBERS);
-    for _ in 0..40 {
-        assert_eq!(segmenter.window(0, &window(true), false, false), None);
-    }
-    assert_eq!(
-        segmenter.window(0, &window(true), true, false),
-        Some(Segment::Started)
+/// A window, and the detector's confidence that it is speech.
+#[derive(Clone)]
+struct Heard(Vec<f32>, f32);
+
+fn speech(amplitude: f32) -> Heard {
+    Heard(tone(amplitude), 0.9)
+}
+
+fn silence() -> Heard {
+    Heard(vec![0.0; WINDOW], 0.02)
+}
+
+/// `count` windows of `heard`.
+fn times(heard: Heard, count: usize) -> Vec<Heard> {
+    vec![heard; count]
+}
+
+/// What segmentation did, window by window: the index of the window in `windows` and what it did.
+fn hear(segmenter: &mut Segmenter, windows: &[Heard], playing: bool) -> Vec<(usize, Segment)> {
+    windows
+        .iter()
+        .enumerate()
+        .filter_map(|(at, Heard(pcm, confidence))| {
+            segmenter
+                .window(0, pcm, *confidence, playing)
+                .map(|segment| (at, segment))
+        })
+        .collect()
+}
+
+/// A segmenter that has heard a second of room tone at a normal level (its volume settled) and has a turn open.
+fn speaking(numbers: Segmentation) -> Segmenter {
+    let mut segmenter = Segmenter::new(numbers);
+    let mut warm = times(Heard(tone(LOUD), 0.02), 32);
+    warm.extend(times(speech(LOUD), 12));
+    let segments = hear(&mut segmenter, &warm, false);
+    assert!(
+        matches!(segments[..], [(43, Segment::Started)]),
+        "{segments:?}"
     );
-    assert!(segmenter.speaking());
-    let silent = 2_500 * 16 / 512 + 1;
-    for _ in 0..silent - 1 {
-        assert_eq!(segmenter.window(0, &window(false), false, false), None);
-    }
-    let Some(Segment::Ended(ended)) = segmenter.window(0, &window(false), false, false) else {
-        panic!("ended")
-    };
-    assert_eq!(ended.pcm.len(), PRE_ROLL + 512 + silent * 512);
-    assert!(ended.silence_ms >= 2_500);
+    segmenter
 }
 
 #[test]
-fn speech_under_the_bar_opens_nothing_and_the_bar_rises_while_playing() {
-    let mut segmenter = Segmenter::new(NUMBERS);
-    let quiet: Vec<f32> = window(true).iter().map(|s| s * 0.05).collect();
-    for _ in 0..50 {
-        assert_eq!(segmenter.window(0, &quiet, true, false), None);
+fn the_volume_is_bs_1770_loudness_as_pipecat_measures_it() {
+    // The figures pipecat-ai 1.10.0's `loudness` (0.2.0) gives the same 400 ms of tone.
+    for (amplitude, lufs) in [
+        (0.1, -22.95),
+        (0.014_1, -39.95),
+        (0.01, -42.95),
+        (0.003, -53.45),
+    ] {
+        let block: Vec<f32> = (0..16).flat_map(|_| tone(amplitude)).take(6_400).collect();
+        assert!(
+            (loudness(&block) - lufs).abs() < 1e-9,
+            "{amplitude}: {}",
+            loudness(&block)
+        );
     }
-    let mut segmenter = Segmenter::new(Segmentation {
-        playing_bar: 0.9,
-        ..NUMBERS
-    });
-    for _ in 0..50 {
-        assert_eq!(segmenter.window(0, &window(true), true, true), None);
-    }
-    assert_eq!(
-        segmenter.window(0, &window(true), true, false),
-        Some(Segment::Started)
+    assert_eq!(loudness(&[0.0; 6_400]), f64::NEG_INFINITY);
+}
+
+#[test]
+fn speech_starts_after_400_ms_of_it_and_a_click_or_a_murmur_opens_nothing() {
+    let mut segmenter = Segmenter::new(SMART);
+    let mut windows = times(Heard(tone(LOUD), 0.02), 32);
+    windows.extend(times(speech(LOUD), 11));
+    windows.push(Heard(tone(LOUD), 0.3));
+    windows.extend(times(speech(LOUD), 11));
+    windows.extend(times(silence(), 40));
+    windows.extend(times(speech(MURMUR), 40));
+    assert!(hear(&mut segmenter, &windows, false).is_empty());
+    assert!(!segmenter.speaking());
+    let segments = hear(&mut segmenter, &times(speech(LOUD), 40), false);
+    assert!(
+        matches!(segments[..], [(_, Segment::Started)]),
+        "{segments:?}"
     );
+}
+
+#[test]
+fn soft_speech_under_minus_30_dbfs_mid_sentence_does_not_pause_the_turn() {
+    let mut segmenter = speaking(SMART);
+    assert!(instant(&tone(SOFT)) < 0.5, "under −30 dBFS");
+    let mut windows = times(speech(LOUD), 30);
+    windows.extend(times(speech(SOFT), 120));
+    windows.extend(times(speech(LOUD), 30));
+    assert!(hear(&mut segmenter, &windows, false).is_empty());
+    assert!(segmenter.speaking());
+    let segments = hear(&mut segmenter, &times(silence(), 28), false);
+    assert!(
+        matches!(segments[..], [(27, Segment::Paused { pause: 1, .. })]),
+        "{segments:?}"
+    );
+}
+
+#[test]
+fn the_model_is_asked_at_each_stop_and_a_pause_it_left_open_goes_on_with_speech() {
+    let mut segmenter = speaking(SMART);
+    // A pause of 1.2 s: speech stops at its 28th window (0.9 s), and the model is asked then.
+    let mut windows = times(speech(LOUD), 60);
+    windows.extend(times(silence(), 38));
+    let segments = hear(&mut segmenter, &windows, false);
+    assert!(
+        matches!(segments[..], [(87, Segment::Paused { pause: 1, .. })]),
+        "{segments:?}"
+    );
+    // It said the turn goes on (it ends nothing); the person goes on, and the answer about that pause is moot.
+    assert!(hear(&mut segmenter, &times(speech(LOUD), 40), false).is_empty());
+    assert_eq!(segmenter.end_paused(1), None);
+    // The next stop asks again, about the turn so far, and the model ends it there.
+    let segments = hear(&mut segmenter, &times(silence(), 28), false);
+    assert!(
+        matches!(segments[..], [(27, Segment::Paused { pause: 2, .. })]),
+        "{segments:?}"
+    );
+    let Some(Segment::Ended(ended)) = segmenter.end_paused(2) else {
+        panic!("ended by the model")
+    };
+    assert_eq!(ended.silence_ms, 896);
+    assert!(!segmenter.speaking());
+}
+
+#[test]
+fn a_pause_ends_the_turn_3_s_after_speech_stopped_whatever_the_model_says() {
+    let mut segmenter = speaking(SMART);
+    hear(&mut segmenter, &times(speech(LOUD), 60), false);
+    // A click in the pause (shorter than speech takes to start) neither ends it nor starts it over.
+    let mut windows = times(silence(), 50);
+    windows.extend(times(speech(LOUD), 5));
+    windows.extend(times(silence(), 100));
+    let segments = hear(&mut segmenter, &windows, false);
+    let [(27, Segment::Paused { pause: 1, .. }), (121, Segment::Ended(ended))] = &segments[..]
+    else {
+        panic!("{segments:?}")
+    };
+    // 0.9 s for speech to stop, and 3 s after it (in whole windows).
+    assert_eq!(ended.silence_ms, 122 * 32);
+    assert_eq!(segmenter.end_paused(1), None);
+}
+
+#[test]
+fn with_silence_a_pause_ends_the_turn_2_5_s_after_speech_stopped_and_asks_nothing() {
+    let mut segmenter = speaking(SILENCE);
+    hear(&mut segmenter, &times(speech(LOUD), 60), false);
+    // A breath of 300 ms: speech stops (200 ms) and starts again; the turn goes on.
+    let mut windows = times(silence(), 9);
+    windows.extend(times(speech(LOUD), 30));
+    assert!(hear(&mut segmenter, &windows, false).is_empty());
+    let segments = hear(&mut segmenter, &times(silence(), 100), false);
+    let [(84, Segment::Ended(ended))] = &segments[..] else {
+        panic!("{segments:?}")
+    };
+    assert_eq!(ended.silence_ms, 85 * 32);
+}
+
+#[test]
+fn the_bar_rises_while_a_reply_plays() {
+    let mut segmenter = Segmenter::new(SMART);
+    let mut windows = times(Heard(tone(SOFT), 0.02), 32);
+    windows.extend(times(speech(SOFT), 40));
+    assert!(
+        hear(&mut segmenter, &windows, true).is_empty(),
+        "soft speech over a reply"
+    );
+    let segments = hear(&mut segmenter, &times(speech(SOFT), 12), false);
+    assert!(
+        matches!(segments[..], [(11, Segment::Started)]),
+        "{segments:?}"
+    );
+
+    let mut segmenter = Segmenter::new(SMART);
+    let mut windows = times(Heard(tone(LOUD), 0.02), 32);
+    windows.extend(times(speech(LOUD), 12));
+    let segments = hear(&mut segmenter, &windows, true);
+    assert!(
+        matches!(segments[..], [(43, Segment::Started)]),
+        "{segments:?}"
+    );
+}
+
+#[test]
+fn a_turn_opens_with_its_pre_roll_and_the_model_hears_it_from_before_its_speech() {
+    let mut segmenter = speaking(SMART);
+    let mut windows = times(speech(LOUD), 60);
+    windows.extend(times(silence(), 28));
+    let segments = hear(&mut segmenter, &windows, false);
+    let [(_, Segment::Paused { pcm, .. })] = &segments[..] else {
+        panic!("{segments:?}")
+    };
+    // 0.9 s before the window speech started with, and all after it.
+    assert_eq!(pcm.len(), PRE_SPEECH + 88 * WINDOW);
+    let Some(Segment::Ended(ended)) = segmenter.end_paused(1) else {
+        panic!("ended")
+    };
+    // The second before that window, the window, and all after it.
+    assert_eq!(ended.pcm.len(), PRE_ROLL + WINDOW + 88 * WINDOW);
+
+    // A long turn: the model hears its last 8 s.
+    let mut segmenter = speaking(SMART);
+    let mut windows = times(speech(LOUD), 400);
+    windows.extend(times(silence(), 28));
+    let segments = hear(&mut segmenter, &windows, false);
+    let [(_, Segment::Paused { pcm, .. })] = &segments[..] else {
+        panic!("{segments:?}")
+    };
+    assert_eq!(pcm.len(), 8 * 16_000);
 }
 
 #[test]
 fn a_turn_keeps_a_minute_and_ends_when_its_audio_stops() {
-    let mut segmenter = Segmenter::new(NUMBERS);
-    while segmenter.window(10, &window(true), true, false).is_none() {}
-    for _ in 0..(MAX_TURN / 512 + 10) {
-        segmenter.window(10, &window(true), true, false);
+    let mut segmenter = speaking(SMART);
+    for _ in 0..(MAX_TURN / WINDOW + 10) {
+        segmenter.window(10, &tone(LOUD), 0.9, false);
     }
     assert_eq!(segmenter.deadline(), Some(10 + AUDIO_IDLE_MS));
     assert_eq!(segmenter.poll(10 + AUDIO_IDLE_MS - 1), None);
@@ -74,82 +268,27 @@ fn a_turn_keeps_a_minute_and_ends_when_its_audio_stops() {
     };
     assert_eq!(ended.pcm.len(), MAX_TURN);
     assert_eq!(segmenter.deadline(), None);
-}
-
-#[test]
-fn with_smart_turn_each_pause_is_offered_once_and_ends_the_turn_if_it_is_still_on() {
-    let mut segmenter = Segmenter::new(Segmentation {
-        pause_ms: Some(900),
-        end_of_turn_silence_ms: 3_000,
-        ..NUMBERS
-    });
-    while segmenter.window(0, &window(true), true, false).is_none() {}
-    let mut offered = Vec::new();
-    for _ in 0..40 {
-        if let Some(Segment::Paused { pcm, pause }) =
-            segmenter.window(0, &window(false), false, false)
-        {
-            offered.push((pause, pcm.len()));
-        }
-    }
-    assert_eq!(offered.len(), 1, "once per pause");
-    assert_eq!(offered[0].0, 1);
-    // Speech again (loud long enough for the smoothed level): the first pause is over, so an answer about it ends
-    // nothing.
-    for _ in 0..10 {
-        segmenter.window(0, &window(true), true, false);
-    }
-    assert_eq!(segmenter.end_paused(1), None);
-    for _ in 0..30 {
-        if let Some(Segment::Paused { pause, .. }) =
-            segmenter.window(0, &window(false), false, false)
-        {
-            assert_eq!(pause, 2);
-        }
-    }
-    let Some(Segment::Ended(ended)) = segmenter.end_paused(2) else {
-        panic!("ended by the model")
-    };
+    // Speech that went on through it has to start again to open a turn.
+    let segments = hear(&mut segmenter, &times(speech(LOUD), 12), false);
     assert!(
-        ended.silence_ms >= 900 && ended.silence_ms < 3_000,
-        "{}",
-        ended.silence_ms
+        matches!(segments[..], [(11, Segment::Started)]),
+        "{segments:?}"
     );
 }
 
 #[test]
-fn a_silence_in_a_turn_is_a_pause_once_longer_than_a_gap_between_words() {
-    let mut segmenter = Segmenter::new(NUMBERS);
-    assert!(!segmenter.paused(), "no turn, no pause");
-    while segmenter.window(0, &window(true), true, false).is_none() {}
+fn speech_that_stops_in_a_turn_is_a_pause_until_it_starts_again() {
+    assert!(!Segmenter::new(SILENCE).paused(), "no turn, no pause");
+    let mut segmenter = speaking(SILENCE);
     assert!(!segmenter.paused());
-    // 480 ms of silence: still a gap between words.
-    for _ in 0..15 {
-        assert_eq!(segmenter.window(0, &window(false), false, false), None);
-    }
+    // 160 ms without speech: not stopped yet, and speech goes on.
+    hear(&mut segmenter, &times(silence(), 5), false);
     assert!(!segmenter.paused());
-    // Speech again after 320 ms (and the windows the smoothed level takes to clear the bar): no pause to tell.
-    let mut segmenter = Segmenter::new(NUMBERS);
-    while segmenter.window(0, &window(true), true, false).is_none() {}
-    for _ in 0..10 {
-        segmenter.window(0, &window(false), false, false);
-    }
-    for _ in 0..10 {
-        assert_eq!(segmenter.window(0, &window(true), true, false), None);
-    }
-    for _ in 0..15 {
-        segmenter.window(0, &window(false), false, false);
-    }
-    // 512 ms: a pause, and the turn goes on.
-    segmenter.window(0, &window(false), false, false);
+    hear(&mut segmenter, &times(speech(LOUD), 2), false);
+    // 0.2 s without it: speech stopped, a pause; the turn goes on.
+    hear(&mut segmenter, &times(silence(), 6), false);
     assert!(segmenter.paused() && segmenter.speaking());
-    // Speech again, once loud enough for the smoothed level: the pause is over, and says how long it was.
-    let resumed: Vec<Segment> = (0..10)
-        .filter_map(|_| segmenter.window(0, &window(true), true, false))
-        .collect();
+    // Speech that starts again ends the pause.
+    hear(&mut segmenter, &times(speech(LOUD), 12), false);
     assert!(!segmenter.paused() && segmenter.speaking());
-    let [Segment::Resumed { silent }] = resumed.as_slice() else {
-        panic!("resumed once: {resumed:?}")
-    };
-    assert!(*silent >= 16 * 512 && *silent < 20 * 512, "{silent}");
 }

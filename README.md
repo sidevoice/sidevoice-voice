@@ -47,7 +47,7 @@ model fills each slot. Natively they are Rust traits (`src/models.rs`; implement
 
 | Interface | What it does |
 |---|---|
-| `Vad` | A voice activity detector's stream over 16 kHz mono audio: `accept(pcm)` answers one `VadFrame {end, speech, probability?}` per window; speech starts and ends where `speech` changes. `reset()` starts over. |
+| `Vad` | A voice activity detector's stream over 16 kHz mono audio: `accept(pcm)` answers one `VadFrame {end, speech, probability?}` per window; speech starts and ends where `speech` changes. `reset()` starts over. The call decides on each window's `probability`; a frame without one counts as its `speech`. |
 | `Transcriber` | `transcribe(pcm, sample_rate, language?)` → the text. |
 | `Speaker` | `speak(text, voice?, language?, speed)` → mono samples and their rate. |
 | `EndOfTurnModel` | Optional: `end_of_turn(pcm, sample_rate)` → the probability that the turn is over, for `smart-turn`. |
@@ -135,8 +135,10 @@ Their failures are errors with stable codes: `microphone-denied`, `microphone-un
   own playback already cancelled, and the speaker plays the chunks of what is said in order and says when each
   starts and ends (that is the clock of the heard position). It says when both are ready (`IoEvent::Ready`), and
   only then does the call listen.
-- **Which models, and their tuning, are the app's.** The detector's numbers core used and this module was written
-  against: a probability of 0.6, speech confirmed after 400 ms, ended after 200 ms.
+- **Which models are the app's; when speech starts and stops is the call's.** The call times speech itself on each
+  window's probability (Silero's, say), so the detector's own options only shape `speech`, which counts where a
+  detector gives no probability: there, a window's `speech` should be its own decision (the shortest confirmation and
+  silence a detector allows), or the detector's timing adds to the call's.
 
 ## The voice seam a page drives
 
@@ -178,8 +180,8 @@ What both promise, beyond the types:
   level and errors; nothing is buffered. Each turn has the call's own `turn_id`: `started` comes before exactly one
   `finished` (the words) or `cancelled`. A turn merged into the next is `cancelled` with `merged`, after that next
   turn's `started`.
-  The state says `speaking` while the person speaks in an open turn, and `listening` again when they pause in it (a
-  silence longer than the gaps between words) or it ends; its end shows as `recognising` rises.
+  The state says `speaking` while the person speaks in an open turn, and `listening` again when they pause in it (their
+  speech stopped, as the detector decides it) or it ends; its end shows as `recognising` rises.
 - **A take** (`VoiceTake`) is what the microphone gave from the moment the call listened until that listening ended,
   as the call heard it (16 kHz mono, after echo cancellation; silence while muted), with where each turn's speech
   started, paused and was ended, in milliseconds from its first sample at the call's own positions in the audio. It is
@@ -228,12 +230,17 @@ The call cancels the echo of its own playback, never relying on the operating sy
 The call is a pure state machine (`src/call.rs`) with three regions in parallel, driven by events and a monotonic
 time; a task around it (`src/voice_call.rs`) feeds it and does what it answers.
 
-- **Listening.** Each window of the app's detector opens a turn when it is speech and loud enough: the window's level (RMS
-  in dBFS, from −60 to 0, smoothed) must clear the listening bar, 0.5, raised to 0.8 while something plays and no turn
-  is open. A turn starts with the second of audio before it, ends after the patience's silence (2, 2.5 or 3.5 s on
-  top of the detector's own end), when its audio stops arriving for 5 s, or when the microphone is muted, and keeps
-  at most a minute. With `smart-turn`, a pause of 0.6, 0.9 or 1.3 s (by patience) is offered to the end-of-turn model
-  once; a probability of 0.5 or more ends the turn there, and a pause of 2.5, 3 or 4 s ends it anyway.
+- **Listening** is Pipecat's, as the Python core ran it (Silero, `VADParams`, smart-turn v3 and the two stop
+  strategies of `pipecat-ai` 1.10.0). A window of the app's detector is speech when its probability is at least 0.6
+  and the volume clears the listening bar: the loudness of the last 400 ms (ITU-R BS.1770), from −110 LUFS (0) to −10
+  LUFS (1), smoothed, at least 0.5 (−60 LUFS), and 0.8 (−30 LUFS) while something plays. Speech starts after 400 ms of
+  such windows and stops after a stretch without any: 0.6, 0.9 or 1.3 s by patience with `smart-turn`, 0.2 s with
+  `silence`; a breath or a click shorter than that changes nothing. A turn opens where speech starts, with the second
+  of audio before it. Where speech stops a pause begins: with `smart-turn` the end-of-turn model is asked, at every
+  stop, about the turn so far (from 0.9 s before its speech started, its last 8 s); more than 0.5 ends the turn there,
+  and the pause ends it anyway 2.5, 3 or 4 s after the stop. With `silence` the pause ends it 2, 2.5 or 3.5 s after the
+  stop. Speech that starts again ends the pause. A turn also ends when its audio stops arriving for 5 s or the
+  microphone is muted, and keeps at most a minute.
 - **Recognition.** Turns are transcribed in order, one at a time, at most eight waiting. A transcript is dropped
   when it is empty, or written in no Latin letter for a language that is; the turn is then
   `cancelled`. Otherwise it waits the merge window (none, 0.5 or 1.5 s by patience): a turn that follows within it
@@ -275,7 +282,8 @@ is still to be checked per browser (sidevoice-core#89).
 src/            the crate sidevoice-voice
   lib.rs          the front door: declares the packages, exports the public API
   call.rs         the state machine: Input and Effect, the three regions
-  turns.rs        segmentation: detector windows into turns; turns/level.rs, the listening bar's level
+  turns.rs        segmentation: detector windows into turns; turns/activity.rs, when speech starts and stops;
+                  turns/volume.rs, the volume the listening bar is on; turns/level.rs, the meter's level
   recognition.rs  the queue and the merge window; recognition/filter.rs, the acceptance filter
   speech.rs       a text in sentence chunks
   playback.rs     the playback queue, barge-in and the heard position

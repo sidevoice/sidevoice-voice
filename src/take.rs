@@ -40,7 +40,7 @@ pub struct TakeTurn {
     pub turn_id: String,
     /// Where the call heard the speech the turn opened at.
     pub speech_ms: u64,
-    /// Where its speech paused (a silence longer than the gaps between words) and where it came back, before its end.
+    /// Its pauses before its end: from where its speech stopped (as the detector decides it) to where it started again.
     pub pauses: Vec<TakePause>,
     /// Where the call decided the turn had ended (its transcription starting); `None` when the take ended first, or
     /// the turn was cancelled while open.

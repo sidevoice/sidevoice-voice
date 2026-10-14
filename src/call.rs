@@ -23,7 +23,7 @@ use crate::playback::{Action, Playback};
 use crate::recognition::{accepted, Job, Outcome, Recognition};
 use crate::say::{SayEvent, SayOutcome, StopReason};
 use crate::take::{TakePause, TakeTurn};
-use crate::turns::{duration_ms, Segment, Segmentation, Segmenter};
+use crate::turns::{duration_ms, Segment, Segmentation, Segmenter, SILENCE_STOP_MS};
 
 /// What happens to the call.
 #[derive(Debug)]
@@ -34,8 +34,14 @@ pub(crate) enum Input {
     Stop,
     /// A new configuration.
     Config(Box<VoiceConfig>),
-    /// One detector window: 16 kHz mono samples after echo cancellation, and whether the detector holds it for speech.
-    Window { pcm: Vec<f32>, speech: bool },
+    /// One detector window: 16 kHz mono samples after echo cancellation, whether the detector holds it for speech, and
+    /// its probability that the window is speech. The probability decides; a detector that gives none is taken at its
+    /// word, window by window.
+    Window {
+        pcm: Vec<f32>,
+        speech: bool,
+        probability: Option<f32>,
+    },
     /// A turn's transcript, or the stable code of why there is none.
     Transcribed {
         turn: usize,
@@ -77,7 +83,7 @@ pub(crate) enum Input {
 /// How many cancels of ids not heard of yet are kept.
 const CANCELS_KEPT: usize = 64;
 
-/// The end-of-turn probability from which a paused turn is over.
+/// The end-of-turn probability above which a paused turn is over.
 const END_OF_TURN_LIKELY: f32 = 0.5;
 
 /// What the driver must do.
@@ -157,6 +163,8 @@ pub(crate) struct Call {
     heard: usize,
     /// The marks of the turns in the take being kept, while one is.
     marks: Option<Vec<TakeTurn>>,
+    /// Where the open turn's speech stopped, while it is in a pause, for the take being kept.
+    pause_from: Option<usize>,
     state: Option<CallState>,
 }
 
@@ -180,6 +188,7 @@ impl Call {
             state: None,
             heard: 0,
             marks: None,
+            pause_from: None,
         }
     }
 
@@ -197,7 +206,14 @@ impl Call {
                 self.segmenter.set_numbers(segmentation(&config));
                 self.config = *config;
             }
-            Input::Window { pcm, speech } => self.window(now, &pcm, speech, &mut out),
+            Input::Window {
+                pcm,
+                speech,
+                probability,
+            } => {
+                let confidence = probability.unwrap_or(if speech { 1.0 } else { 0.0 });
+                self.window(now, &pcm, confidence, &mut out);
+            }
             Input::Transcribed { turn, result } => self.transcribed(now, turn, result, &mut out),
             Input::Say { id, text, language } => self.say(id, &text, language, &mut out),
             Input::CancelSay(id) => {
@@ -235,7 +251,7 @@ impl Call {
                 self.muted = muted;
                 if muted {
                     if let Some(segment) = self.segmenter.close(0) {
-                        self.segment(now, self.heard, segment, &mut out);
+                        self.segment(now, segment, &mut out);
                     }
                 }
             }
@@ -246,9 +262,9 @@ impl Call {
                 pause,
                 result,
             } => match result {
-                Ok(probability) if probability >= END_OF_TURN_LIKELY && self.open == Some(turn) => {
+                Ok(probability) if probability > END_OF_TURN_LIKELY && self.open == Some(turn) => {
                     if let Some(segment) = self.segmenter.end_paused(pause) {
-                        self.segment(now, self.heard, segment, &mut out);
+                        self.segment(now, segment, &mut out);
                     }
                 }
                 Ok(_) => {}
@@ -287,7 +303,7 @@ impl Call {
     pub(crate) fn poll(&mut self, now: u64) -> Vec<Effect> {
         let mut out = Vec::new();
         if let Some(segment) = self.segmenter.poll(now) {
-            self.segment(now, self.heard, segment, &mut out);
+            self.segment(now, segment, &mut out);
         }
         self.settle(now, &mut out);
         out
@@ -295,32 +311,35 @@ impl Call {
 
     /// One detector window: counted in what was heard whatever becomes of it, so that a take's positions follow its
     /// audio, muted windows included.
-    fn window(&mut self, now: u64, pcm: &[f32], speech: bool, out: &mut Vec<Effect>) {
-        let at = self.heard;
+    fn window(&mut self, now: u64, pcm: &[f32], confidence: f32, out: &mut Vec<Effect>) {
         self.heard += pcm.len();
         if !self.started || self.muted {
             return;
         }
         let playing = self.playback.sounding();
-        if let Some(segment) = self.segmenter.window(now, pcm, speech, playing) {
-            self.segment(now, at, segment, out);
+        let paused = self.segmenter.paused();
+        let segment = self.segmenter.window(now, pcm, confidence, playing);
+        self.mark_pause(paused);
+        if let Some(segment) = segment {
+            self.segment(now, segment, out);
         }
         out.push(Effect::Event(VoiceEvent::Level(self.segmenter.level())));
     }
 
-    /// What a segment does to the turns, `at` the sample of what was heard where it falls: the window it came from, or
-    /// what was heard so far.
-    fn segment(&mut self, now: u64, at: usize, segment: Segment, out: &mut Vec<Effect>) {
+    /// What a segment does to the turns, where what was heard so far ends (a window's, the end of that window).
+    fn segment(&mut self, now: u64, segment: Segment, out: &mut Vec<Effect>) {
         match segment {
             Segment::Started => {
                 let number = self.next_turn;
                 self.next_turn += 1;
                 let id = format!("{}-turn-{number}", self.call_id);
-                // Its speech, where the window that opened it falls, in the take being kept.
+                // Its speech, in the take being kept: where the speech that started it began.
+                let speech = self.heard.saturating_sub(self.segmenter.start_run());
+                self.pause_from = None;
                 let mark = self.marks.as_mut().map(|marks| {
                     marks.push(TakeTurn {
                         turn_id: id.clone(),
-                        speech_ms: duration_ms(at),
+                        speech_ms: duration_ms(speech),
                         pauses: Vec::new(),
                         end_ms: None,
                     });
@@ -350,14 +369,6 @@ impl Call {
             Segment::Paused { pcm, pause } => {
                 if let Some(turn) = self.open {
                     out.push(Effect::EndOfTurn { turn, pause, pcm });
-                }
-            }
-            Segment::Resumed { silent } => {
-                if let Some(mark) = self.open.and_then(|number| self.mark(number)) {
-                    mark.pauses.push(TakePause {
-                        from_ms: duration_ms(at.saturating_sub(silent)),
-                        to_ms: duration_ms(at),
-                    });
                 }
             }
             Segment::Ended(ended) => {
@@ -392,6 +403,29 @@ impl Call {
     fn mark(&mut self, number: usize) -> Option<&mut TakeTurn> {
         let index = self.turns.get(&number)?.mark?;
         self.marks.as_mut()?.get_mut(index)
+    }
+
+    /// The open turn's pauses in the take being kept, after a window (`was`: whether it was in a pause before it):
+    /// where its speech stopped, once the detector says it did, and where it began again, once it has started again.
+    /// A pause the turn ends in is not one of them.
+    fn mark_pause(&mut self, was: bool) {
+        if self.marks.is_none() {
+            return;
+        }
+        let paused = self.segmenter.paused();
+        if !was && paused {
+            self.pause_from = Some(self.heard.saturating_sub(self.segmenter.silence()));
+        } else if was && !paused && self.segmenter.speaking() {
+            let to = self.heard.saturating_sub(self.segmenter.start_run());
+            let from = self.pause_from.take();
+            if let (Some(from), Some(mark)) = (from, self.open.and_then(|number| self.mark(number)))
+            {
+                mark.pauses.push(TakePause {
+                    from_ms: duration_ms(from),
+                    to_ms: duration_ms(to),
+                });
+            }
+        }
     }
 
     fn transcribe(&mut self, job: Option<Job>, out: &mut Vec<Effect>) {
@@ -459,12 +493,15 @@ impl Call {
 
     fn stop(&mut self, now: u64, out: &mut Vec<Effect>) {
         self.cancel_input(now, out);
+        // The next start hears a new stream: nothing of this one's volume or speech carries over.
+        self.segmenter = Segmenter::new(segmentation(&self.config));
         let mut actions = Vec::new();
         self.playback.interrupt(StopReason::Stopped, &mut actions);
         self.act(actions, out);
         self.started = false;
         self.microphone_muted = false;
         self.marks = None;
+        self.pause_from = None;
         // A stop is always answered with the state, even an unchanged one: the host knows it took effect.
         self.state = None;
     }
@@ -628,17 +665,23 @@ impl Call {
     }
 }
 
-/// The numbers segmentation takes from a configuration.
+/// The numbers segmentation takes from a configuration: with `smart-turn`, the patience's stop and longest pause;
+/// with `silence`, a short stop and the patience's silence after it.
 fn segmentation(config: &VoiceConfig) -> Segmentation {
-    let (pause, longest) = config.patience.smart_turn_ms();
+    let patience = config.patience;
     let smart = config.end_of_turn == EndOfTurn::SmartTurn;
     Segmentation {
-        end_of_turn_silence_ms: if smart {
-            longest
+        stop_ms: if smart {
+            patience.smart_turn_stop_ms()
         } else {
-            config.patience.end_of_turn_silence_ms()
+            SILENCE_STOP_MS
         },
-        pause_ms: smart.then_some(pause),
+        end_ms: if smart {
+            patience.smart_turn_longest_ms()
+        } else {
+            patience.silence_ms()
+        },
+        ask: smart,
         quiet_bar: config.listening_bar.quiet,
         playing_bar: config.listening_bar.playing,
     }

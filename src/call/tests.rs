@@ -2,7 +2,7 @@
 //! tests play the models and the speaker by hand.
 
 use super::{Call, Effect, Input};
-use crate::config::{Patience, VoiceConfig};
+use crate::config::{EndOfTurn, Patience, VoiceConfig};
 use crate::event::{CallState, Listening, Microphone, TurnEvent, TurnTimings, VoiceEvent};
 use crate::say::{SayEvent, SayOutcome, StopReason};
 use crate::test_support::{clip, config, silence, EnergyVad, FLEURS_ES, QUILTER, WINDOW};
@@ -78,8 +78,21 @@ impl Run {
             self.input(Input::Window {
                 pcm: window.to_vec(),
                 speech,
+                probability: Some(EnergyVad::probability(window)),
             });
         }
+    }
+
+    /// Hears silence one window at a time until the effects so far satisfy `found`: how many windows it took, and
+    /// those effects.
+    fn quiet_until(&mut self, found: impl Fn(&[Effect]) -> bool) -> (usize, Vec<Effect>) {
+        for windows in 1..=500 {
+            self.hear(&silence(WINDOW_MS as usize));
+            if found(&self.effects) {
+                return (windows, self.take());
+            }
+        }
+        panic!("not within 16 s of silence: {:?}", self.effects);
     }
 
     /// Lets time pass with no audio (a muted or lost microphone), running what falls due.
@@ -221,6 +234,14 @@ impl Run {
     fn transcribe(effects: &[Effect]) -> Option<(usize, usize)> {
         effects.iter().find_map(|effect| match effect {
             Effect::Transcribe { turn, pcm, .. } => Some((*turn, pcm.len())),
+            _ => None,
+        })
+    }
+
+    /// The end-of-turn question among `effects`: the turn, its pause and the audio's length.
+    fn asked(effects: &[Effect]) -> Option<(usize, u32, usize)> {
+        effects.iter().find_map(|effect| match effect {
+            Effect::EndOfTurn { turn, pause, pcm } => Some((*turn, *pause, pcm.len())),
             _ => None,
         })
     }
@@ -442,8 +463,9 @@ fn the_listening_bar_rises_while_a_reply_plays() {
     );
     run.sound("u1", 0);
     run.take();
-    // Speech at a normal level, as the echo canceller leaves the room's voice: not loud enough to barge in.
-    run.hear(&clip(QUILTER, 0.25));
+    // Speech at −36 dBFS, as the echo canceller leaves a voice from across the room: under −30 LUFS, not loud enough to
+    // barge in.
+    run.hear(&clip(QUILTER, 0.1));
     let effects = run.take();
     assert!(Run::turns(&effects).is_empty());
     assert!(!effects.contains(&Effect::StopPlayback));
@@ -452,8 +474,93 @@ fn the_listening_bar_rises_while_a_reply_plays() {
     run.played("u1", 0);
     run.take();
     run.hear(&silence(1_000));
-    run.hear(&clip(QUILTER, 0.25));
+    run.hear(&clip(QUILTER, 0.1));
     assert_eq!(Run::turns(&run.take())[0].phase, TurnPhase::Started);
+}
+
+#[test]
+fn a_sentence_that_trails_off_under_minus_30_dbfs_is_one_turn() {
+    // Its second half at −36 dBFS (RMS): under −30 dBFS, yet over −60 LUFS, so still speech.
+    let loud = clip(QUILTER, 0.9);
+    let soft = clip(QUILTER, 0.1);
+    let half = loud.len() / 2;
+    let sentence = [&loud[..half], &soft[half..]].concat();
+    let mut run = Run::new(config());
+    run.hear(&silence(500));
+    run.hear(&sentence);
+    let effects = run.take();
+    let turns = Run::turns(&effects);
+    assert_eq!(turns.len(), 1, "{turns:?}");
+    assert_eq!(turns[0].phase, TurnPhase::Started);
+    assert!(Run::transcribe(&effects).is_none(), "still open");
+    run.hear(&silence(3_000));
+    let effects = run.take();
+    assert!(Run::turns(&effects).is_empty());
+    let (_, samples) = Run::transcribe(&effects).expect("one transcription");
+    assert!(samples > sentence.len());
+}
+
+#[test]
+fn smart_turn_is_asked_at_each_pause_and_a_pause_it_leaves_open_ends_3_s_after_speech_stopped() {
+    let mut run = Run::new(VoiceConfig {
+        end_of_turn: EndOfTurn::SmartTurn,
+        ..config()
+    });
+    run.hear(&speech());
+    run.take();
+    // A pause mid-sentence: the model is asked once speech has stopped (0.9 s without it), about the turn so far.
+    let (_, effects) = run.quiet_until(|effects| Run::asked(effects).is_some());
+    let (turn, pause, heard) = Run::asked(&effects).expect("asked at the pause");
+    assert_eq!((turn, pause), (0, 1));
+    assert!(heard > speech().len() && heard <= 8 * 16_000, "{heard}");
+    // It says the turn goes on, and the person goes on.
+    run.input(Input::EndOfTurn {
+        turn,
+        pause,
+        result: Ok(0.3),
+    });
+    run.hear(&speech());
+    assert!(Run::transcribe(&run.take()).is_none());
+    // The next pause is asked about too, and an even chance is not the end.
+    let (_, effects) = run.quiet_until(|effects| Run::asked(effects).is_some());
+    let (turn, pause, _) = Run::asked(&effects).expect("asked again");
+    assert_eq!((turn, pause), (0, 2));
+    run.input(Input::EndOfTurn {
+        turn,
+        pause,
+        result: Ok(0.5),
+    });
+    assert!(Run::transcribe(&run.take()).is_none());
+    // 3 s after speech stopped (in whole windows), the pause ends the turn whatever was said.
+    let (windows, effects) = run.quiet_until(|effects| Run::transcribe(effects).is_some());
+    assert_eq!(windows, 94);
+    assert!(Run::asked(&effects).is_none());
+}
+
+#[test]
+fn smart_turn_ends_a_finished_sentence_as_soon_as_speech_stopped() {
+    let mut run = Run::new(VoiceConfig {
+        end_of_turn: EndOfTurn::SmartTurn,
+        ..config()
+    });
+    run.hear(&speech());
+    let (_, effects) = run.quiet_until(|effects| Run::asked(effects).is_some());
+    let (turn, pause, _) = Run::asked(&effects).expect("asked at the pause");
+    run.input(Input::EndOfTurn {
+        turn,
+        pause,
+        result: Ok(0.9),
+    });
+    assert!(Run::transcribe(&run.take()).is_some());
+    run.transcribed(turn, "Mister Quilter is the apostle of the middle classes.");
+    run.wait(500);
+    let finished = Run::turns(&run.take());
+    let timings = finished[0].timings.expect("finished");
+    // Speech stopped 0.9 s before: 28 windows of the detector (the clip's last one short).
+    assert!(
+        (864..=896).contains(&timings.endpoint_silence_ms),
+        "{timings:?}"
+    );
 }
 
 #[test]
@@ -845,7 +952,7 @@ fn a_take_marks_where_each_turn_started_paused_and_ended_in_what_was_heard() {
     let clip_ms = (speech().len() / 16) as u64;
     run.hear(&silence(320));
     run.hear(&speech());
-    // A second of silence (a pause), the sentence again, and the end (2.5 s with the default patience).
+    // A second of silence (a pause), the sentence again, and the end (2.7 s after its speech stops, by default).
     run.hear(&silence(1_024));
     run.hear(&speech());
     run.hear(&silence(3_008));
@@ -857,10 +964,10 @@ fn a_take_marks_where_each_turn_started_paused_and_ended_in_what_was_heard() {
 
     let first = &marks[0];
     assert_eq!(first.turn_id, "c-turn-0");
-    // Where the clip's speech is confirmed, from its start.
+    // Where the clip's speech starts (the speech that started the turn), from the clip's start.
     let lead = first.speech_ms - 320;
     assert!(lead < 1_500, "{first:?}");
-    // The pause: from where the first clip's speech stopped to where the second's is confirmed.
+    // The pause: from where the first clip's speech stopped to where the second's starts.
     let gap = 320 + clip_ms;
     let pause = first
         .pauses
@@ -868,12 +975,12 @@ fn a_take_marks_where_each_turn_started_paused_and_ended_in_what_was_heard() {
         .find(|pause| pause.from_ms < gap && gap - pause.from_ms < 1_000)
         .unwrap_or_else(|| panic!("{first:?}"));
     assert!(pause.to_ms.abs_diff(gap + 1_024 + lead) <= 64, "{first:?}");
-    // The end: the patience's 2.5 s after the second clip's speech stopped.
+    // The end: the detector's 0.2 s stop and the patience's 2.5 s after it, from where the second clip's speech stopped.
     let stopped = gap + 1_024 + (pause.from_ms - 320);
     assert!(
         first
             .end_ms
-            .is_some_and(|end_ms| end_ms.abs_diff(stopped + 2_500) <= 64),
+            .is_some_and(|end_ms| end_ms.abs_diff(stopped + 2_700) <= 64),
         "{first:?}"
     );
     let end = gap + 1_024 + clip_ms;

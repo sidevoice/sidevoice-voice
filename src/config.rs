@@ -67,7 +67,12 @@ pub enum EndOfTurn {
 }
 
 /// How patient the call is with pauses: one word for a person to choose, which sets the numbers
-/// ([`Patience::end_of_turn_silence_ms`], [`Patience::smart_turn_ms`], [`Patience::merge_window_ms`]).
+/// ([`Patience::smart_turn_stop_ms`], [`Patience::smart_turn_longest_ms`], [`Patience::silence_ms`],
+/// [`Patience::merge_window_ms`]).
+///
+/// `normal` is the numbers Pipecat ended turns with in the Python core (its Silero detector's `stop_secs` of 0.9 s,
+/// smart-turn's `stop_secs` of 3 s, the speech timeout of 2.5 s). `fast` and `calm` are that core's own variants of
+/// them, about a third shorter and longer: 0.6, 2.5 and 2 s; 1.3, 4 and 3.5 s.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Patience {
@@ -81,24 +86,36 @@ pub enum Patience {
 }
 
 impl Patience {
-    /// How long silence must last, after the detector's own end of speech, to end a turn.
+    /// With `smart-turn`: how long the detector must hear no speech before it says speech stopped, which is when the
+    /// end-of-turn model is asked.
     #[must_use]
-    pub fn end_of_turn_silence_ms(self) -> u32 {
+    pub fn smart_turn_stop_ms(self) -> u32 {
+        match self {
+            Self::Fast => 600,
+            Self::Normal => 900,
+            Self::Calm => 1_300,
+        }
+    }
+
+    /// With `smart-turn`: how long a pause lasts, after the detector said speech stopped, before it ends the turn
+    /// whatever the end-of-turn model said.
+    #[must_use]
+    pub fn smart_turn_longest_ms(self) -> u32 {
+        match self {
+            Self::Fast => 2_500,
+            Self::Normal => 3_000,
+            Self::Calm => 4_000,
+        }
+    }
+
+    /// With `silence`: how long a pause lasts, after the detector said speech stopped (200 ms without it), before it
+    /// ends the turn.
+    #[must_use]
+    pub fn silence_ms(self) -> u32 {
         match self {
             Self::Fast => 2_000,
             Self::Normal => 2_500,
             Self::Calm => 3_500,
-        }
-    }
-
-    /// With `smart-turn`: how long a pause lasts, after the detector's own end of speech, before the end-of-turn model is
-    /// asked, and how long one ends the turn whatever the model says.
-    #[must_use]
-    pub fn smart_turn_ms(self) -> (u32, u32) {
-        match self {
-            Self::Fast => (600, 2_500),
-            Self::Normal => (900, 3_000),
-            Self::Calm => (1_300, 4_000),
         }
     }
 
@@ -113,14 +130,15 @@ impl Patience {
     }
 }
 
-/// How loud speech must be to count, as a level from 0 to 1: the window's RMS in dBFS, from −60 (0) to 0 (1),
-/// smoothed.
+/// How loud speech must be to count, as a volume from 0 to 1 the way Pipecat's detector measures it: the loudness of
+/// the last 400 ms (ITU-R BS.1770), from −110 LUFS (0) to −10 LUFS (1), smoothed. A window the detector holds for
+/// speech under the bar is silence.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ListeningBar {
-    /// The bar while nothing plays.
+    /// The bar while nothing plays: −60 LUFS by default.
     pub quiet: f32,
-    /// The bar while something plays and no turn is open: what starts a barge-in.
+    /// The bar while something plays, when it is higher: what a barge-in must clear, −30 LUFS by default.
     pub playing: f32,
 }
 
