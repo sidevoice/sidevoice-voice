@@ -1,7 +1,8 @@
 //! Segmentation: the detector's windows of 16 kHz audio become turns. A turn opens when a window is speech and loud
 //! enough for the listening bar, with the second of audio before it (the pre-roll, which holds the speech the
 //! detector needed to confirm); it ends after the patience's silence, when the audio stops arriving, or when it is
-//! cancelled. A turn holds at most a minute of audio: what comes after is not kept.
+//! cancelled. A turn holds at most a minute of audio: what comes after is not kept. Within a turn, a silence longer
+//! than the gaps between words is a pause: the person has stopped speaking, and the turn goes on.
 
 mod level;
 
@@ -24,6 +25,9 @@ const PRE_ROLL: usize = RATE as usize;
 const MAX_TURN: usize = RATE as usize * 60;
 /// How long an open turn waits for audio that stopped arriving (a muted or lost microphone) before it ends.
 pub(crate) const AUDIO_IDLE_MS: u64 = 5_000;
+/// The silence within a turn, in samples, from which it is a pause and no longer a gap between words: 500 ms, an
+/// estimate to tune on real speech.
+const PAUSE: u64 = RATE as u64 / 2;
 
 /// The numbers segmentation runs on.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -99,6 +103,11 @@ impl Segmenter {
     /// Whether a turn is open.
     pub(crate) fn speaking(&self) -> bool {
         self.open.is_some()
+    }
+
+    /// Whether the open turn is in a pause: its speech stopped longer ago than a gap between words.
+    pub(crate) fn paused(&self) -> bool {
+        self.open.as_ref().is_some_and(|open| open.silent >= PAUSE)
     }
 
     /// The smoothed level of the last window, from 0 to 1.

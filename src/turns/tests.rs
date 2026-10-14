@@ -116,3 +116,24 @@ fn with_smart_turn_each_pause_is_offered_once_and_ends_the_turn_if_it_is_still_o
         ended.silence_ms
     );
 }
+
+#[test]
+fn a_silence_in_a_turn_is_a_pause_once_longer_than_a_gap_between_words() {
+    let mut segmenter = Segmenter::new(NUMBERS);
+    assert!(!segmenter.paused(), "no turn, no pause");
+    while segmenter.window(0, &window(true), true, false).is_none() {}
+    assert!(!segmenter.paused());
+    // 480 ms of silence: a gap between words.
+    for _ in 0..15 {
+        assert_eq!(segmenter.window(0, &window(false), false, false), None);
+    }
+    assert!(!segmenter.paused());
+    // 512 ms: a pause, and the turn goes on.
+    segmenter.window(0, &window(false), false, false);
+    assert!(segmenter.paused() && segmenter.speaking());
+    // Speech again, once loud enough for the smoothed level: the pause is over.
+    for _ in 0..10 {
+        segmenter.window(0, &window(true), true, false);
+    }
+    assert!(!segmenter.paused() && segmenter.speaking());
+}

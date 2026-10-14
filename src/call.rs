@@ -2,8 +2,8 @@
 //! milliseconds, answering with [`Effect`]s. It holds no socket, no clock and no thread: whoever drives it runs the
 //! models and the speaker, and feeds back what they did.
 //!
-//! - **Listening** (`turns`): `Idle → Listening ⇄ Speaking`, and back to `Listening` when a turn ends. A turn's audio
-//!   goes to recognition.
+//! - **Listening** (`turns`): `Idle → Listening ⇄ Speaking`: `Speaking` while the person speaks in an open turn, back to
+//!   `Listening` when they pause in it and when it ends. A turn's audio goes to recognition.
 //! - **Recognition** (`recognition`): turns are transcribed one at a time, filtered, held for the merge window and
 //!   reported finished (with the words), cancelled, or joined into the next one.
 //! - **Playback** (`playback`): `Idle → Synthesizing → Playing → Idle`, one thing said after another. A turn that opens
@@ -471,7 +471,7 @@ impl Call {
                 Listening::Idle
             } else if self.muted {
                 Listening::Muted
-            } else if speaking {
+            } else if speaking && !self.segmenter.paused() {
                 Listening::Speaking
             } else {
                 Listening::Listening
