@@ -24,7 +24,7 @@ await init();
 const models = { load: async () => ({ vad, transcriber, speaker }) };
 const call = VoiceCall.create(models, { language: "es", voice: "ef_dora", patience: "normal" });
 call.onEvent(({ type, data }) => {
-  // "turn" (started, finished with the words, cancelled), "state", "level", "error" ({ code })
+  // "turn", "state", "level", "playback-level", "error" ({ code })
 });
 call.start(); // loads the models, asks for the microphone, listens
 const saying = call.say("Hecho.", { language: "es" }); // a handle: saying.cancel(), saying.onEvent(step)
@@ -36,6 +36,10 @@ into 16 kHz mono in an AudioWorklet; the speaker is Web Audio. `VoiceCall.create
 plays on another output where the browser allows it (a non-default output may escape the browser's echo canceller),
 and `{ io }` brings a microphone and speaker of the page's own (`createWebAudioIo` is the default one). Failures are
 `error` events with a stable `code` (`microphone-denied`, `microphone-unavailable`, ...), for the page to translate.
+`playback-level` carries one number from 0 to 1: the smoothed RMS of the rendered speaker audio, on the same
+detector windows as microphone `level` (normally 32 ms). It continues while the microphone is muted and reaches
+exact zero at the end of playback and on stop. The higher-level `createVoiceHost` exposes it through
+`onPlaybackLevel(listener)`, which returns an unsubscribe function.
 
 Source, documentation and issues: https://github.com/sidevoice/sidevoice-voice
 

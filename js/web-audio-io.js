@@ -53,6 +53,8 @@ export function createWebAudioIo(options = {}) {
   let microphone = null;
   let capture = null;
   let output = null;
+  let meter = null;
+  let rendering = false;
   let sources = new Set();
   let queueEnd = 0;
   // Each callback checks the generation it was made in, so that nothing reports after what dropped it: `session`
@@ -73,12 +75,22 @@ export function createWebAudioIo(options = {}) {
       track.stop();
     }
     stream = null;
+    microphone?.disconnect();
+    capture?.disconnect();
+    capture?.port?.close();
+    capture && (capture.port.onmessage = null);
     microphone = null;
     capture = null;
     for (const source of sources) {
       source.onended = null;
     }
     sources = new Set();
+    output?.disconnect();
+    meter?.disconnect();
+    meter?.port?.close();
+    meter && (meter.port.onmessage = null);
+    meter = null;
+    rendering = false;
     context?.close().catch(() => {});
     context = null;
     output = null;
@@ -101,7 +113,7 @@ export function createWebAudioIo(options = {}) {
   // A gain node to the destination, through which every chunk plays; replaced after each fade-out.
   function newOutput() {
     output = context.createGain();
-    output.connect(context.destination);
+    output.connect(meter);
   }
 
   /** The microphone `id` (null: the default), with the call's capture constraints. Rejects with a stable `code`. */
@@ -174,6 +186,7 @@ export function createWebAudioIo(options = {}) {
     useStream(media, current);
     try {
       await context.audioWorklet.addModule(new URL("./capture-worklet.js", import.meta.url).href);
+      await context.audioWorklet.addModule(new URL("./playback-worklet.js", import.meta.url).href);
     } catch {
       return current() && fail("audio-capture-failed");
     }
@@ -187,6 +200,14 @@ export function createWebAudioIo(options = {}) {
     capture.onprocessorerror = () => current() && fail("audio-capture-failed");
     // Connected through to the destination so that every browser runs it; it outputs silence.
     microphone.connect(capture).connect(context.destination);
+    meter = new AudioWorkletNode(context, "sidevoice-playback", { outputChannelCount: [1] });
+    meter.port.onmessage = ({ data }) => {
+      meter.port.postMessage("ack");
+      if (current() && rendering) sink.rendered(data);
+    };
+    meter.onprocessorerror = () => current() && fail("audio-output-failed");
+    meter.connect(context.destination);
+    newOutput();
     try {
       if (outputDevice && outputSelectable()) {
         await context.setSinkId(outputDevice);
@@ -252,14 +273,14 @@ export function createWebAudioIo(options = {}) {
         throw Object.assign(new Error("no AudioContext"), { code: "audio-output-failed" });
       }
       sink = newSink;
-      newOutput();
       open(session);
     },
 
     play(utterance, chunk, samples, sampleRate) {
-      if (!context) {
+      if (!context || !output) {
         return;
       }
+      rendering = true;
       const played = playback;
       const current = () => played === playback;
       let buffer;
@@ -280,6 +301,10 @@ export function createWebAudioIo(options = {}) {
         sources.delete(source);
         if (current()) {
           sink.chunkPlayed(utterance, chunk);
+          if (sources.size === 0) {
+            rendering = false;
+            sink.playbackEnded();
+          }
         }
       };
       source.start(startAt);
@@ -299,10 +324,11 @@ export function createWebAudioIo(options = {}) {
     },
 
     stopPlayback() {
-      if (!context) {
+      if (!context || !output) {
         return;
       }
       playback++;
+      const played = playback;
       const now = context.currentTime;
       output.gain.setValueAtTime(output.gain.value, now);
       output.gain.linearRampToValueAtTime(0, now + FADE_SECONDS);
@@ -312,7 +338,13 @@ export function createWebAudioIo(options = {}) {
       }
       sources = new Set();
       const faded = output;
-      setTimeout(() => faded.disconnect(), FADE_SECONDS * 2000);
+      setTimeout(() => {
+        faded.disconnect();
+        if (played === playback && sources.size === 0 && sink) {
+          rendering = false;
+          sink.playbackEnded();
+        }
+      }, FADE_SECONDS * 2000);
       newOutput();
       queueEnd = 0;
     },

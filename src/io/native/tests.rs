@@ -97,7 +97,9 @@ fn the_capture_comes_out_at_16_khz_in_frames_without_the_echo() {
     // The speaker plays the reply in 10 ms blocks, and the microphone (stereo) hears it back 60 ms later, at -6 dB.
     let delay = 48 * 60;
     for (index, block) in reply.chunks(480).enumerate() {
-        pipeline.render(block);
+        let rendered = pipeline.render(block);
+        assert!(!rendered.is_empty());
+        assert!(rendered.iter().all(|sample| sample.is_finite()));
         let start = (index * 480).saturating_sub(delay);
         let mic: Vec<f32> = reply[start..start + block.len()]
             .iter()

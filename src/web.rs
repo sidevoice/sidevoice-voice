@@ -214,6 +214,17 @@ impl IoSink {
         self.send(IoEvent::Captured(samples));
     }
 
+    /// Rendered speaker samples, mono at 16 kHz after gain and fading.
+    pub fn rendered(&self, samples: Vec<f32>) {
+        self.send(IoEvent::Rendered(samples));
+    }
+
+    /// The rendered output ended, including any fade.
+    #[wasm_bindgen(js_name = playbackEnded)]
+    pub fn playback_ended(&self) {
+        self.send(IoEvent::PlaybackEnded);
+    }
+
     /// The first sample of a chunk reached the speaker.
     #[wasm_bindgen(js_name = chunkStarted)]
     pub fn chunk_started(&self, utterance: String, chunk: usize) {

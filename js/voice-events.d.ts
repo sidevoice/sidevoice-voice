@@ -42,6 +42,7 @@ export type VoiceCallEvent =
   | { type: "turn"; data: VoiceTurnEvent }
   | { type: "state"; data: VoiceCallState }
   | { type: "level"; /** The microphone's smoothed level, 0 to 1. */ data: number }
+  | { type: "playback-level"; /** The rendered speaker's smoothed level, 0 to 1. */ data: number }
   | { type: "error"; data: { code: string } }
   | { type: "take"; data: VoiceTake };
 

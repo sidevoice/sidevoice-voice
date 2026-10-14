@@ -4,6 +4,7 @@
 // interfaces of js/voice-models.d.ts) and a plain-object microphone and speaker, and the default web microphone and
 // speaker on a fake browser. It prints what it saw; the checks are xtask's.
 import { readFileSync } from "node:fs";
+import { runInNewContext } from "node:vm";
 import { createVoiceHost, createWebAudioIo, initSync, VoiceCall } from "@sidevoice/voice";
 
 const wasm = new URL(process.argv[2], import.meta.resolve("@sidevoice/voice"));
@@ -118,6 +119,11 @@ Object.defineProperty(globalThis, "navigator", { configurable: true, value: { me
   addEventListener: (name, listener) => { if (name === "devicechange") deviceChange = listener; },
 } } });
 const voice = createVoiceHost(source, { io });
+const playbackLevels = [];
+const unsubscribePlayback = voice.onPlaybackLevel((level) => playbackLevels.push(level));
+voice.onPlaybackLevel(() => { throw new Error("isolated listener"); });
+const secondPlayback = [];
+voice.onPlaybackLevel((level) => secondPlayback.push(level));
 const states = [];
 const seen = [];
 const hostErrors = [];
@@ -141,6 +147,16 @@ await voice.setSettings({
 });
 host.handed = asked.at(-1).stt;
 host.started = await code(voice.start());
+speaker.rendered(new Float32Array(512).fill(0.5));
+speaker.captured(new Float32Array(512));
+await until(() => playbackLevels.some((level) => level > 0));
+speaker.playbackEnded();
+await until(() => playbackLevels.at(-1) === 0);
+unsubscribePlayback();
+speaker.rendered(new Float32Array(512).fill(0.5));
+speaker.captured(new Float32Array(512));
+await until(() => secondPlayback.length > playbackLevels.length);
+host.playbackLevels = [playbackLevels.some((level) => level > 0), playbackLevels.at(-1), secondPlayback.some((level) => level > 0)];
 // Another voice and speed are the call's own: the source is not asked again.
 const asks = asked.length;
 await voice.setSettings({
@@ -228,8 +244,9 @@ Object.defineProperty(globalThis, "navigator", { configurable: true, value: { me
 // Every capture worklet made, the last one first.
 const worklets = [];
 globalThis.AudioWorkletNode = class {
-  constructor() { worklets.unshift(this); this.port = {}; this.onprocessorerror = null; }
+  constructor() { worklets.unshift(this); this.port = { close() {} }; this.onprocessorerror = null; }
   connect(node) { return node; }
+  disconnect() {}
 };
 globalThis.AudioContext = class {
   constructor() { this.audioWorklet = { addModule: async () => {} }; this.destination = {}; this.currentTime = 0; }
@@ -241,7 +258,7 @@ globalThis.AudioContext = class {
 };
 const webIo = createWebAudioIo({ inputDevice: "mic-a", onDeviceLost: (kind, id) => webAudio.lost.push([kind, id]) });
 webIo.start({
-  ready: () => webAudio.ready++, captured() {}, chunkStarted() {}, chunkPlayed() {},
+  ready: () => webAudio.ready++, captured() {}, rendered() {}, playbackEnded() {}, chunkStarted() {}, chunkPlayed() {},
   microphoneMuted: (muted) => webAudio.muted.push(muted), failed: (code) => webAudio.failed.push(code),
 });
 await until(() => webAudio.ready > 0);
@@ -262,6 +279,7 @@ startsMuted = true;
 createWebAudioIo().start({
   ready: () => heard.push("ready"),
   captured() {},
+  rendered() {}, playbackEnded() {},
   chunkStarted() {},
   chunkPlayed() {},
   microphoneMuted: (muted) => heard.push(muted ? "muted" : "unmuted"),
@@ -270,8 +288,45 @@ createWebAudioIo().start({
 await until(() => heard.includes("ready"));
 lastStream.track.onunmute?.();
 lastStream.track.onmute?.();
-worklets[0].onprocessorerror?.(new Event("processorerror"));
+worklets[1].onprocessorerror?.(new Event("processorerror"));
 await until(() => heard.includes("audio-capture-failed"));
+// Exercise the shipped processor itself with samples, not just events injected at its sink.
+const workletSource = readFileSync(new URL("./playback-worklet.js", import.meta.resolve("@sidevoice/voice")), "utf8");
+const rendered = [];
+let Processor;
+runInNewContext(workletSource, {
+  sampleRate: 16000, Float32Array, Math,
+  AudioWorkletProcessor: class { constructor() { this.port = { postMessage: (frame) => rendered.push(frame) }; } },
+  registerProcessor: (_name, implementation) => { Processor = implementation; },
+});
+const processor = new Processor();
+let passes = true;
+for (let i = 0; i < 4; i++) {
+  const input = new Float32Array(128).fill(0.5);
+  const output = new Float32Array(128);
+  processor.process([[input]], [[output]]);
+  passes &&= output.every((sample) => sample === 0.5);
+}
+if (!passes || rendered.length < 2 || !rendered[0].every((sample) => Math.abs(sample - 0.5) < 0.01)) {
+  throw new Error("playback worklet changed its audio or failed to report rendered frames");
+}
+const resampled = [];
+let ResamplingProcessor;
+runInNewContext(workletSource, {
+  sampleRate: 48000, Float32Array, Math,
+  AudioWorkletProcessor: class { constructor() { this.port = { postMessage: (frame) => resampled.push(frame) }; } },
+  registerProcessor: (_name, implementation) => { ResamplingProcessor = implementation; },
+});
+const resampler = new ResamplingProcessor();
+for (let i = 0; i < 48; i++) {
+  const input = new Float32Array(128).fill(0.5);
+  const output = new Float32Array(128);
+  resampler.process([[input]], [[output]]);
+  resampler.port.onmessage({ data: "ack" });
+  if (!output.every((sample) => sample === 0.5)) throw new Error("playback worklet changed 48 kHz output");
+}
+if (Math.abs(resampled.at(-1)?.[0] - 0.5) > 0.01) throw new Error("playback worklet did not resample 48 kHz");
+devicesSeen.workletSamples = [passes, rendered.length, true];
 console.log(
   JSON.stringify({
     wasm: wasm.pathname,

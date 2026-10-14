@@ -14,7 +14,6 @@
 //!   audio: what comes after is not kept.
 
 mod activity;
-mod level;
 mod volume;
 
 #[cfg(test)]
@@ -22,10 +21,10 @@ mod tests;
 
 use std::collections::VecDeque;
 
-use activity::{Activity, Change};
 #[cfg(test)]
-pub(crate) use level::instant;
-use level::Level;
+pub(crate) use crate::level::instant;
+use crate::level::Level;
+use activity::{Activity, Change};
 #[cfg(test)]
 pub(crate) use volume::loudness;
 use volume::Volume;

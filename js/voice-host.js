@@ -50,7 +50,7 @@ function devicesOf(listed, kind) {
 export function createVoiceHost(source, options = {}) {
   const { io: given, ...webAudio } = options;
   const listeners = {
-    turn: new Set(), state: new Set(), level: new Set(), error: new Set(), devices: new Set(), take: new Set(),
+    turn: new Set(), state: new Set(), level: new Set(), "playback-level": new Set(), error: new Set(), devices: new Set(), take: new Set(),
   };
   // The chosen microphone and output (null: the system's default), kept across calls like `muted`.
   let input = webAudio.inputDevice || null;
@@ -217,6 +217,7 @@ export function createVoiceHost(source, options = {}) {
     onTurn: on("turn"),
     onState: on("state"),
     onLevel: on("level"),
+    onPlaybackLevel: on("playback-level"),
     onError: on("error"),
     onTake: on("take"),
     audioDevices: () => devices(),

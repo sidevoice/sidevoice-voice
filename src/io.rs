@@ -2,6 +2,9 @@
 //! the echo of the call's own playback already cancelled, and the speaker plays the chunks of what is said in order
 //! and says when each starts and ends. The platform's implementations are in `io/`; each file says where it runs.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
 use futures_channel::mpsc::UnboundedSender;
 
 use crate::maybe_send::MaybeSend;
@@ -19,6 +22,10 @@ pub enum IoEvent {
     Ready,
     /// Captured audio: 16 kHz mono samples, in order, after echo cancellation.
     Captured(Vec<f32>),
+    /// Rendered speaker samples, mono at 16 kHz, after gain and fading.
+    Rendered(Vec<f32>),
+    /// Playback ended; discard any smoothing tail and report exact silence.
+    PlaybackEnded,
     /// The first sample of a chunk reached the speaker.
     ChunkStarted {
         /// What is being said.
@@ -43,12 +50,28 @@ pub enum IoEvent {
 /// Where an [`AudioIo`] sends its [`IoEvent`]s, from any thread.
 #[cfg_attr(web, wasm_bindgen::prelude::wasm_bindgen)]
 #[derive(Debug, Clone)]
-pub struct IoSink(pub(crate) UnboundedSender<Message>);
+pub struct IoSink {
+    pub(crate) messages: UnboundedSender<Message>,
+    pub(crate) generation: u64,
+    pub(crate) pending_rendered: Arc<AtomicUsize>,
+}
 
 impl IoSink {
     /// Sends one event; once the call is gone, it goes nowhere.
     pub fn send(&self, event: IoEvent) {
-        let _ = self.0.unbounded_send(Message::Io(event));
+        let rendered = matches!(&event, IoEvent::Rendered(_));
+        if rendered && self.pending_rendered.fetch_add(1, Ordering::AcqRel) >= 4 {
+            self.pending_rendered.fetch_sub(1, Ordering::AcqRel);
+            return;
+        }
+        if self
+            .messages
+            .unbounded_send(Message::Io(self.generation, event))
+            .is_err()
+            && rendered
+        {
+            self.pending_rendered.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 }
 

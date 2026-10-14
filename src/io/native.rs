@@ -192,6 +192,8 @@ fn run(
     let mut heard = Vec::new();
     let mut played = Vec::new();
     let mut speaker_switch = false;
+    let mut ending: Option<u64> = None;
+    let mut had_chunks = false;
     while !stop.load(Ordering::Acquire) {
         for command in commands.try_iter() {
             match command {
@@ -199,8 +201,12 @@ fn run(
                     utterance,
                     chunk,
                     samples,
-                } => queue.play(utterance, chunk, samples),
-                Command::Stop => queue.stop(&speaker.counters),
+                } => {
+                    had_chunks = true;
+                    ending = None;
+                    queue.play(utterance, chunk, samples);
+                }
+                Command::Stop => ending = Some(queue.stop(&speaker.counters)),
             }
         }
         if devices.take_switch(Kind::Input) {
@@ -242,6 +248,9 @@ fn run(
             match reopened {
                 Ok((rebuilt, next)) => {
                     (speaker, pipeline, queue) = (next, rebuilt, Queue::default());
+                    sink.send(IoEvent::PlaybackEnded);
+                    ending = None;
+                    had_chunks = false;
                     output_rate.store(speaker.rate, Ordering::Release);
                 }
                 Err(code) => return sink.send(IoEvent::Failed(code)),
@@ -253,13 +262,23 @@ fn run(
         if changed.swap(false, Ordering::AcqRel) {
             pipeline.reinitialize();
         }
-        pipeline.render(&played);
+        let rendered = pipeline.render(&played);
+        if !rendered.is_empty() {
+            sink.send(IoEvent::Rendered(rendered));
+        }
         for frame in pipeline.capture(&heard) {
             sink.send(IoEvent::Captured(frame.to_vec()));
         }
         let consumed = speaker.counters.consumed.load(Ordering::Acquire);
         for event in queue.schedule.due(consumed) {
             sink.send(event);
+        }
+        if ending.is_some_and(|end| consumed >= end)
+            || (had_chunks && queue.is_idle() && ending.is_none())
+        {
+            sink.send(IoEvent::PlaybackEnded);
+            ending = None;
+            had_chunks = false;
         }
         thread::sleep(TICK);
     }

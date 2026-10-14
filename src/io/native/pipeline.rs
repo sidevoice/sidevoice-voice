@@ -47,12 +47,13 @@ impl Pipeline {
     }
 
     /// Takes what the speaker played: mono samples at its rate.
-    pub(crate) fn render(&mut self, played: &[f32]) {
+    pub(crate) fn render(&mut self, played: &[f32]) -> Vec<f32> {
         self.scratch.clear();
         self.render.process(played, &mut self.scratch);
         self.ahead.extend(self.render_frames.push(&self.scratch));
         let excess = self.ahead.len().saturating_sub(MAX_AHEAD);
         self.ahead.drain(..excess);
+        self.scratch.clone()
     }
 
     /// Takes what the microphone heard (interleaved, at its rate) and returns every frame it completed, clean.

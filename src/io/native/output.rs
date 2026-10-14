@@ -181,10 +181,11 @@ impl Queue {
     }
 
     /// Stops: what waits is dropped, the schedule forgotten, and the callback drops what the ring holds.
-    pub(crate) fn stop(&mut self, counters: &Counters) {
+    pub(crate) fn stop(&mut self, counters: &Counters) -> u64 {
         self.pending.clear();
         self.schedule.clear();
         counters.flush_to.store(self.produced, Ordering::Release);
+        self.produced
     }
 
     /// Whether nothing waits and nothing queued is left to play.

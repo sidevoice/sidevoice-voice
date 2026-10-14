@@ -16,6 +16,8 @@ pub enum VoiceEvent {
     State(CallState),
     /// The microphone's smoothed level, from 0 to 1, once per detector window.
     Level(f32),
+    /// The rendered speaker's smoothed level, from 0 to 1, once per detector window, with a terminal zero.
+    PlaybackLevel(f32),
     /// Something failed that a person may be told, as a stable code.
     Error(VoiceError),
     /// What the microphone gave since the call listened, with where the turns fell in it: once each stretch of

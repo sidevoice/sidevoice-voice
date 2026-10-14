@@ -4,6 +4,10 @@ export interface AudioIoSink {
   ready(): void;
   /** Captured audio: 16 kHz mono samples, in order, after echo cancellation. */
   captured(samples: Float32Array): void;
+  /** Rendered speaker samples, mono at 16 kHz after gain and fading. */
+  rendered(samples: Float32Array): void;
+  /** The output finished, including its fade. */
+  playbackEnded(): void;
   /** The first sample of a chunk reached the speaker. */
   chunkStarted(utterance: string, chunk: number): void;
   /** The last sample of a chunk reached the speaker. */
