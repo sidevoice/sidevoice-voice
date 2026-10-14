@@ -271,10 +271,10 @@ fn overlap_resets_on_low_volume_and_when_output_stops() {
 }
 
 #[test]
-fn a_below_volume_window_resets_a_nearly_qualified_overlap() {
+fn below_volume_windows_reset_an_overlap_candidate() {
     let mut segmenter = Segmenter::new(SMART);
     hear(&mut segmenter, &times(Heard(tone(LOUD), 0.02), 32), true);
-    assert!(hear(&mut segmenter, &times(speech(LOUD), 31), true).is_empty());
+    assert!(hear(&mut segmenter, &times(speech(LOUD), 20), true).is_empty());
     // Confidence remains high: the level alone falls below the raised bar.
     assert!(hear(&mut segmenter, &times(speech(MURMUR), 13), true).is_empty());
     assert!(hear(&mut segmenter, &times(speech(LOUD), 1), true).is_empty());

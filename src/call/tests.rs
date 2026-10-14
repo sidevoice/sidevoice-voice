@@ -621,6 +621,42 @@ fn mute_and_playback_restart_reset_only_a_tentative_overlap_without_capture() {
 }
 
 #[test]
+fn continuous_sentence_chunks_preserve_overlap_but_a_real_output_end_resets_it() {
+    for output_ended in [false, true] {
+        let mut run = Run::new(config());
+        run.reply(
+            "u",
+            "The first sentence is long enough to stand alone. The second sentence follows it.",
+        );
+        run.sound("u", 0);
+        run.take();
+        for window in continuous_loud_speech(32).chunks(WINDOW) {
+            run.now += WINDOW_MS;
+            run.input(Input::Window {
+                pcm: window.to_vec(),
+                speech: false,
+                probability: Some(0.02),
+            });
+        }
+        run.hear(&continuous_loud_speech(20));
+        assert!(Run::turns(&run.take()).is_empty());
+        run.played("u", 0);
+        if output_ended {
+            run.input(Input::PlaybackEnded);
+        }
+        run.sound("u", 1);
+        run.take();
+        run.hear(&continuous_loud_speech(12));
+        assert_eq!(
+            Run::turns(&run.take())
+                .iter()
+                .any(|turn| turn.phase == TurnPhase::Started),
+            !output_ended
+        );
+    }
+}
+
+#[test]
 fn the_listening_bar_rises_while_a_reply_plays() {
     let mut run = Run::new(config());
     run.reply(

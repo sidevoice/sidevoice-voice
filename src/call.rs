@@ -66,6 +66,8 @@ pub(crate) enum Input {
     ChunkStarted { utterance: String, chunk: usize },
     /// The output played a chunk's last sample.
     ChunkPlayed { utterance: String, chunk: usize },
+    /// The output stream has ended after its last rendered sample.
+    PlaybackEnded,
     /// Whether the microphone is muted: an open turn ends with what was said.
     Mute(bool),
     /// Whether the microphone's device gives no audio for now (not the person's mute).
@@ -156,6 +158,8 @@ pub(crate) struct Call {
     next_turn: usize,
     recognition: Recognition,
     playback: Playback,
+    /// A chunk ended while its utterance still has audio; the next chunk may be contiguous.
+    continuing_chunk: Option<String>,
     /// Nothing starts to be said before this time (the grace after a turn).
     quiet_until: u64,
     /// Ids cancelled before the call heard of them: said later, they never play.
@@ -184,6 +188,7 @@ impl Call {
             next_turn: 0,
             recognition: Recognition::default(),
             playback: Playback::default(),
+            continuing_chunk: None,
             quiet_until: 0,
             cancelled: VecDeque::new(),
             state: None,
@@ -244,17 +249,29 @@ impl Call {
             }
             Input::ChunkStarted { utterance, chunk } => {
                 let was_sounding = self.playback.sounding();
+                let continuous =
+                    self.continuing_chunk.take().as_deref() == Some(utterance.as_str());
                 let mut actions = Vec::new();
                 self.playback.chunk_started(&utterance, chunk, &mut actions);
                 self.act(actions, &mut out);
-                self.playback_boundary(was_sounding);
+                if !continuous {
+                    self.playback_boundary(was_sounding);
+                }
             }
             Input::ChunkPlayed { utterance, chunk } => {
                 let was_sounding = self.playback.sounding();
                 let mut actions = Vec::new();
                 self.playback.chunk_played(&utterance, chunk, &mut actions);
                 self.act(actions, &mut out);
-                self.playback_boundary(was_sounding);
+                if was_sounding && !self.playback.sounding() && self.playback.busy() {
+                    self.continuing_chunk = Some(utterance);
+                } else {
+                    self.playback_boundary(was_sounding);
+                }
+            }
+            Input::PlaybackEnded => {
+                self.continuing_chunk = None;
+                self.segmenter.reset_candidate();
             }
             Input::Mute(muted) => {
                 self.muted = muted;
@@ -386,6 +403,7 @@ impl Call {
                 })));
                 let mut actions = Vec::new();
                 self.playback.interrupt(StopReason::BargeIn, &mut actions);
+                self.continuing_chunk = None;
                 self.act(actions, out);
             }
             Segment::Paused { pcm, pause } => {
@@ -519,6 +537,7 @@ impl Call {
         self.segmenter = Segmenter::new(segmentation(&self.config));
         let mut actions = Vec::new();
         self.playback.interrupt(StopReason::Stopped, &mut actions);
+        self.continuing_chunk = None;
         self.act(actions, out);
         self.started = false;
         self.microphone_muted = false;
@@ -562,7 +581,9 @@ impl Call {
     }
 
     fn playback_boundary(&mut self, was_sounding: bool) {
-        if was_sounding != self.playback.sounding() {
+        if was_sounding != self.playback.sounding()
+            || (!self.playback.busy() && self.continuing_chunk.take().is_some())
+        {
             self.segmenter.reset_candidate();
         }
     }

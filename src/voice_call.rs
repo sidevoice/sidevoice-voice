@@ -464,7 +464,10 @@ impl Driver {
             Message::Io(_, IoEvent::Rendered(pcm)) => {
                 self.accept_rendered(&pcm);
             }
-            Message::Io(_, IoEvent::PlaybackEnded) => self.reset_playback(),
+            Message::Io(_, IoEvent::PlaybackEnded) => {
+                self.input(Input::PlaybackEnded);
+                self.reset_playback();
+            }
             Message::Io(_, IoEvent::ChunkStarted { utterance, chunk }) => {
                 self.input(Input::ChunkStarted { utterance, chunk });
             }

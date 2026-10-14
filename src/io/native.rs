@@ -271,6 +271,7 @@ fn run(
         }
         let frames: Vec<Vec<f32>> = pipeline
             .capture(&heard)
+            .into_iter()
             .map(|frame| frame.to_vec())
             .collect();
         let consumed = speaker.counters.consumed.load(Ordering::Acquire);
