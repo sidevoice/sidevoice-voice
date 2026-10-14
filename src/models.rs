@@ -36,7 +36,8 @@ pub struct Models {
     pub end_of_turn: Option<Arc<dyn EndOfTurnModel>>,
 }
 
-/// What a voice activity detector knows after one of its windows.
+/// What a voice activity detector knows after one of its windows. The call decides on the window's probability,
+/// window by window, with its own timing; a frame without one is taken as `speech` says.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VadFrame {
     /// The sample after the window's last, counted from the stream's start or its last reset.

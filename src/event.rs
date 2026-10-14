@@ -91,10 +91,10 @@ pub enum Listening {
     Idle,
     /// Muted by the person.
     Muted,
-    /// Waiting for speech: no turn is open, or the person paused in the open one (a silence longer than the gaps
-    /// between words), which goes on.
+    /// Waiting for speech: no turn is open, or the person paused in the open one (their speech stopped, as the
+    /// detector decides it), which goes on.
     Listening,
-    /// The person speaks: a turn is open and its speech has not paused.
+    /// The person speaks: a turn is open and its speech has not stopped.
     Speaking,
 }
 

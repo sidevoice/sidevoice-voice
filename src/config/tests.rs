@@ -49,11 +49,10 @@ fn patience_sets_the_silence_the_smart_turn_pauses_and_the_merge_window() {
     let numbers: Vec<_> = [Patience::Fast, Patience::Normal, Patience::Calm]
         .iter()
         .map(|patience| {
-            let (pause, longest) = patience.smart_turn_ms();
             (
-                patience.end_of_turn_silence_ms(),
-                pause,
-                longest,
+                patience.silence_ms(),
+                patience.smart_turn_stop_ms(),
+                patience.smart_turn_longest_ms(),
                 patience.merge_window_ms(),
             )
         })

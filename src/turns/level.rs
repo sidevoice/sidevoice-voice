@@ -1,5 +1,5 @@
-//! How loud the microphone is: each window's RMS in dBFS, from −60 (0) to 0 (1), smoothed exponentially so that one
-//! loud click does not clear the listening bar.
+//! How loud the microphone looks, for a meter: each window's RMS in dBFS, from −60 (0) to 0 (1), smoothed
+//! exponentially. It decides nothing (what counts as speech is the volume's, `volume`).
 
 /// The weight of the newest window in the smoothed level.
 const SMOOTHING: f32 = 0.2;
@@ -11,10 +11,9 @@ pub(crate) struct Level {
 }
 
 impl Level {
-    /// Takes a window of samples (from −1 to 1) and returns the new smoothed level.
-    pub(crate) fn take(&mut self, pcm: &[f32]) -> f32 {
+    /// Takes a window of samples (from −1 to 1).
+    pub(crate) fn take(&mut self, pcm: &[f32]) {
         self.value += SMOOTHING * (instant(pcm) - self.value);
-        self.value
     }
 
     pub(crate) fn value(self) -> f32 {

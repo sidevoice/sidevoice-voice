@@ -37,8 +37,9 @@ pub(crate) fn silence(ms: usize) -> Vec<f32> {
     vec![0.0; ms * 16]
 }
 
-/// A voice activity detector on energy, as a streaming detector answers: speech is confirmed after
-/// `min_speech_ms` above the threshold, and ends after `min_silence_ms` below it.
+/// A voice activity detector on energy, as a streaming detector answers: each window's probability of speech, high
+/// for a window above −48 dBFS (a model like Silero hears soft speech as speech), and whether speech goes on, confirmed
+/// after `min_speech_ms` above a louder threshold and ended after `min_silence_ms` below it.
 pub(crate) struct EnergyVad {
     above: usize,
     below: usize,
@@ -46,6 +47,8 @@ pub(crate) struct EnergyVad {
 }
 
 impl EnergyVad {
+    /// The level from which a window is probably speech.
+    const PROBABLE: f32 = 0.2;
     const THRESHOLD: f32 = 0.45;
     const MIN_SPEECH: usize = 400 * 16;
     const MIN_SILENCE: usize = 200 * 16;
@@ -55,6 +58,15 @@ impl EnergyVad {
             above: 0,
             below: 0,
             speech: false,
+        }
+    }
+
+    /// The probability that a window is speech.
+    pub(crate) fn probability(pcm: &[f32]) -> f32 {
+        if instant(pcm) >= Self::PROBABLE {
+            0.9
+        } else {
+            0.05
         }
     }
 

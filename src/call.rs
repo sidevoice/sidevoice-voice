@@ -22,7 +22,7 @@ use crate::event::{
 use crate::playback::{Action, Playback};
 use crate::recognition::{accepted, Job, Outcome, Recognition};
 use crate::say::{SayEvent, SayOutcome, StopReason};
-use crate::turns::{duration_ms, Segment, Segmentation, Segmenter};
+use crate::turns::{duration_ms, Segment, Segmentation, Segmenter, SILENCE_STOP_MS};
 
 /// What happens to the call.
 #[derive(Debug)]
@@ -33,8 +33,14 @@ pub(crate) enum Input {
     Stop,
     /// A new configuration.
     Config(Box<VoiceConfig>),
-    /// One detector window: 16 kHz mono samples after echo cancellation, and whether the detector holds it for speech.
-    Window { pcm: Vec<f32>, speech: bool },
+    /// One detector window: 16 kHz mono samples after echo cancellation, whether the detector holds it for speech, and
+    /// its probability that the window is speech. The probability decides; a detector that gives none is taken at its
+    /// word, window by window.
+    Window {
+        pcm: Vec<f32>,
+        speech: bool,
+        probability: Option<f32>,
+    },
     /// A turn's transcript, or the stable code of why there is none.
     Transcribed {
         turn: usize,
@@ -76,7 +82,7 @@ pub(crate) enum Input {
 /// How many cancels of ids not heard of yet are kept.
 const CANCELS_KEPT: usize = 64;
 
-/// The end-of-turn probability from which a paused turn is over.
+/// The end-of-turn probability above which a paused turn is over.
 const END_OF_TURN_LIKELY: f32 = 0.5;
 
 /// What the driver must do.
@@ -184,7 +190,14 @@ impl Call {
                 self.segmenter.set_numbers(segmentation(&config));
                 self.config = *config;
             }
-            Input::Window { pcm, speech } => self.window(now, &pcm, speech, &mut out),
+            Input::Window {
+                pcm,
+                speech,
+                probability,
+            } => {
+                let confidence = probability.unwrap_or(if speech { 1.0 } else { 0.0 });
+                self.window(now, &pcm, confidence, &mut out);
+            }
             Input::Transcribed { turn, result } => self.transcribed(now, turn, result, &mut out),
             Input::Say { id, text, language } => self.say(id, &text, language, &mut out),
             Input::CancelSay(id) => {
@@ -233,7 +246,7 @@ impl Call {
                 pause,
                 result,
             } => match result {
-                Ok(probability) if probability >= END_OF_TURN_LIKELY && self.open == Some(turn) => {
+                Ok(probability) if probability > END_OF_TURN_LIKELY && self.open == Some(turn) => {
                     if let Some(segment) = self.segmenter.end_paused(pause) {
                         self.segment(now, segment, &mut out);
                     }
@@ -274,12 +287,12 @@ impl Call {
         out
     }
 
-    fn window(&mut self, now: u64, pcm: &[f32], speech: bool, out: &mut Vec<Effect>) {
+    fn window(&mut self, now: u64, pcm: &[f32], confidence: f32, out: &mut Vec<Effect>) {
         if !self.started || self.muted {
             return;
         }
         let playing = self.playback.sounding();
-        if let Some(segment) = self.segmenter.window(now, pcm, speech, playing) {
+        if let Some(segment) = self.segmenter.window(now, pcm, confidence, playing) {
             self.segment(now, segment, out);
         }
         out.push(Effect::Event(VoiceEvent::Level(self.segmenter.level())));
@@ -404,6 +417,8 @@ impl Call {
 
     fn stop(&mut self, now: u64, out: &mut Vec<Effect>) {
         self.cancel_input(now, out);
+        // The next start hears a new stream: nothing of this one's volume or speech carries over.
+        self.segmenter = Segmenter::new(segmentation(&self.config));
         let mut actions = Vec::new();
         self.playback.interrupt(StopReason::Stopped, &mut actions);
         self.act(actions, out);
@@ -572,17 +587,23 @@ impl Call {
     }
 }
 
-/// The numbers segmentation takes from a configuration.
+/// The numbers segmentation takes from a configuration: with `smart-turn`, the patience's stop and longest pause;
+/// with `silence`, a short stop and the patience's silence after it.
 fn segmentation(config: &VoiceConfig) -> Segmentation {
-    let (pause, longest) = config.patience.smart_turn_ms();
+    let patience = config.patience;
     let smart = config.end_of_turn == EndOfTurn::SmartTurn;
     Segmentation {
-        end_of_turn_silence_ms: if smart {
-            longest
+        stop_ms: if smart {
+            patience.smart_turn_stop_ms()
         } else {
-            config.patience.end_of_turn_silence_ms()
+            SILENCE_STOP_MS
         },
-        pause_ms: smart.then_some(pause),
+        end_ms: if smart {
+            patience.smart_turn_longest_ms()
+        } else {
+            patience.silence_ms()
+        },
+        ask: smart,
         quiet_bar: config.listening_bar.quiet,
         playing_bar: config.listening_bar.playing,
     }
