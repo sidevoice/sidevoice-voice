@@ -269,17 +269,16 @@ fn run(
         if (had_chunks || ending.is_some()) && !rendered.is_empty() {
             sink.send(IoEvent::Rendered(rendered));
         }
-        let frames: Vec<Vec<f32>> = pipeline
-            .capture(&heard)
-            .into_iter()
-            .map(|frame| frame.to_vec())
-            .collect();
+        let frames = pipeline.capture(&heard);
         let consumed = speaker.counters.consumed.load(Ordering::Acquire);
         // The callback publishes its consumed count after writing the reference. Report every playback boundary
         // visible at this snapshot before the capture from this tick can qualify a turn and freeze its extent.
-        send_capture_after_playback(&mut queue.schedule, consumed, frames, |event| {
-            sink.send(event)
-        });
+        send_capture_after_playback(
+            &mut queue.schedule,
+            consumed,
+            frames.into_iter().map(|frame| frame.to_vec()),
+            |event| sink.send(event),
+        );
         // `consumed` is published after the callback's reference writes. A callback may run between the drain above
         // and this load; wait until its published reference tail has crossed the worker before ending the meter.
         if playback_complete(
