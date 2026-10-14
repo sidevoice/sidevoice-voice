@@ -831,10 +831,10 @@ fn muting_ends_the_turn_and_cancelling_drops_it() {
         effect,
         Effect::Event(VoiceEvent::State(state)) if state.listening == Listening::Muted
     )));
-    run.hear(&speech());
-    assert!(Run::turns(&run.take()).is_empty(), "muted");
     run.hear(&silence(3_000));
     assert!(Run::transcribe(&run.take()).is_some());
+    run.hear(&speech());
+    assert!(Run::turns(&run.take()).is_empty(), "muted");
 
     run.input(Input::Cancel);
     let turns = Run::turns(&run.take());
