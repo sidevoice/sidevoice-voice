@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.4.0](https://github.com/sidevoice/sidevoice-voice/compare/v0.3.1...v0.4.0) (2026-10-14)
+
+
+### ⚠ BREAKING CHANGES
+
+* a start can keep its take: the audio heard, and where each turn's speech started, paused and ended ([#28](https://github.com/sidevoice/sidevoice-voice/issues/28))
+
+### Features
+
+* a start can keep its take: the audio heard, and where each turn's speech started, paused and ended ([#28](https://github.com/sidevoice/sidevoice-voice/issues/28)) ([5434aad](https://github.com/sidevoice/sidevoice-voice/commit/5434aad1330e83443329ce428cde97dcc9c49af2))
+* **host:** publish rendered playback level ([#30](https://github.com/sidevoice/sidevoice-voice/issues/30)) ([618c900](https://github.com/sidevoice/sidevoice-voice/commit/618c9008a9062782ffea389625ca68b1c27ec387)), closes [#29](https://github.com/sidevoice/sidevoice-voice/issues/29)
+* **turns:** a pause in the person's speech is told: the state says listening until they speak again ([#27](https://github.com/sidevoice/sidevoice-voice/issues/27)) ([a0f29c5](https://github.com/sidevoice/sidevoice-voice/commit/a0f29c5b37b17c42d47a714ddaf3918a9bd27ce4))
+
+
+### Bug Fixes
+
+* **turns:** speech and silence come from Silero, and smart turn is asked at every pause, as Pipecat did ([#25](https://github.com/sidevoice/sidevoice-voice/issues/25)) ([7dd02b9](https://github.com/sidevoice/sidevoice-voice/commit/7dd02b9876560d85a121027187b0ae7b86fa3b4a))
+
 ## [0.3.1](https://github.com/sidevoice/sidevoice-voice/compare/v0.3.0...v0.3.1) (2026-10-11)
 
 
