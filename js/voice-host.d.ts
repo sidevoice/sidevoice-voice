@@ -17,6 +17,7 @@ import type {
   VoiceCallState,
   VoiceSaying,
   VoiceSayOptions,
+  VoiceTake,
   VoiceTurnEvent,
 } from "./voice-events.js";
 
@@ -83,11 +84,14 @@ export interface VoiceHost {
   /** Loads the models, opens the microphone and the speaker, listens. `smart-turn` without an end-of-turn model
    *  rejects `{code: "end-of-turn-missing"}`. Resolves once the microphone and the speaker work, at the first
    *  state whose `listening` is not `idle` (at once if the call listens already; a second `start` while one is pending
-   *  settles with it). Rejects `VoiceHostError`; with `{code: "stopped"}` when `stop()` comes first. */
-  start(): Promise<void>;
+   *  settles with it). Rejects `VoiceHostError`; with `{code: "stopped"}` when `stop()` comes first. With `take`, the
+   *  call keeps what the microphone gives from the moment it listens until that listening ends, and hands it to
+   *  `onTake` then; never otherwise (a call is not recorded). A start while one runs changes nothing, its take
+   *  included. */
+  start(options?: { take?: boolean }): Promise<void>;
   /** Stops listening and speaking: the turn not told yet is cancelled, and what is being said or waits to be ends
    *  (`stopped`). The models stay loaded. Safe at any time; a `start` after it, awaited or not, starts the call
-   *  again. */
+   *  again. After a start that asked for a take, it resolves once the take was handed to `onTake`. */
   stop(): Promise<void>;
   /** Says `text` after whatever is being said, once nothing of the person's holds it back. The handle tells its steps
    *  and how it ended, and cancels it. Before `setSettings`, or with the call stopped, its outcome is `not-played`
@@ -105,6 +109,10 @@ export interface VoiceHost {
   /** The microphone's level, 0 to 1, once per detector window (about 30 a second). */
   onLevel(listener: (level: number) => void): () => void;
   onError(listener: (error: VoiceHostError) => void): () => void;
+  /** The take of a start that asked for one (`start({take: true})`), once per stretch of listening, as it ends: before
+   *  `stop()` resolves, before the error that ended it, before a restart on other models listens again. Handed over:
+   *  the call keeps no copy. */
+  onTake(listener: (take: VoiceTake) => void): () => void;
   /** The audio devices now, and which are chosen. */
   audioDevices(): Promise<VoiceAudioDevices>;
   /** Chooses the microphone, the output or both by id (null: the system's default), at any time: a call that runs

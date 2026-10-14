@@ -123,17 +123,33 @@ fn a_silence_in_a_turn_is_a_pause_once_longer_than_a_gap_between_words() {
     assert!(!segmenter.paused(), "no turn, no pause");
     while segmenter.window(0, &window(true), true, false).is_none() {}
     assert!(!segmenter.paused());
-    // 480 ms of silence: a gap between words.
+    // 480 ms of silence: still a gap between words.
     for _ in 0..15 {
         assert_eq!(segmenter.window(0, &window(false), false, false), None);
     }
     assert!(!segmenter.paused());
+    // Speech again after 320 ms (and the windows the smoothed level takes to clear the bar): no pause to tell.
+    let mut segmenter = Segmenter::new(NUMBERS);
+    while segmenter.window(0, &window(true), true, false).is_none() {}
+    for _ in 0..10 {
+        segmenter.window(0, &window(false), false, false);
+    }
+    for _ in 0..10 {
+        assert_eq!(segmenter.window(0, &window(true), true, false), None);
+    }
+    for _ in 0..15 {
+        segmenter.window(0, &window(false), false, false);
+    }
     // 512 ms: a pause, and the turn goes on.
     segmenter.window(0, &window(false), false, false);
     assert!(segmenter.paused() && segmenter.speaking());
-    // Speech again, once loud enough for the smoothed level: the pause is over.
-    for _ in 0..10 {
-        segmenter.window(0, &window(true), true, false);
-    }
+    // Speech again, once loud enough for the smoothed level: the pause is over, and says how long it was.
+    let resumed: Vec<Segment> = (0..10)
+        .filter_map(|_| segmenter.window(0, &window(true), true, false))
+        .collect();
     assert!(!segmenter.paused() && segmenter.speaking());
+    let [Segment::Resumed { silent }] = resumed.as_slice() else {
+        panic!("resumed once: {resumed:?}")
+    };
+    assert!(*silent >= 16 * 512 && *silent < 20 * 512, "{silent}");
 }

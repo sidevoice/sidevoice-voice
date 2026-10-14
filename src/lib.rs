@@ -6,7 +6,8 @@
 //!
 //! Inside: `config` ([`VoiceConfig`]), `event` (what a call tells its host), `say` (something said and its handle),
 //! `turns` (segmentation: detector windows into turns), `recognition` (the queue, the acceptance filter and the merge
-//! window), `speech` (a text in sentence chunks), `playback` (the queue, barge-in and the heard position) and `call`
+//! window), `speech` (a text in sentence chunks), `playback` (the queue, barge-in and the heard position), `take` (what
+//! the microphone gave over one stretch of listening, and where the turns fell in it) and `call`
 //! (the state machine that runs the three regions).
 
 #[cfg(native)]
@@ -24,6 +25,7 @@ mod residency;
 mod runtime;
 mod say;
 mod speech;
+mod take;
 mod turns;
 mod voice_call;
 #[cfg(web)]
@@ -46,4 +48,5 @@ pub use io::{AudioIo, IoEvent, IoSink};
 pub use maybe_send::{MaybeSend, MaybeSync};
 pub use models::{EndOfTurnModel, Models, Speaker, Transcriber, Vad, VadFrame, VoiceModels};
 pub use say::{SayCancel, SayEvent, SayOptions, SayOutcome, Saying, StopReason};
-pub use voice_call::{Events, VoiceCall};
+pub use take::{Take, TakePause, TakeTurn};
+pub use voice_call::{Events, StartOptions, VoiceCall};

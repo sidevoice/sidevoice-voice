@@ -52,6 +52,9 @@ pub(crate) enum Segment {
     /// The open turn has paused for `pause_ms`: its audio so far, and the pause's number in the turn, to ask an
     /// end-of-turn model whether it is over.
     Paused { pcm: Vec<f32>, pause: u32 },
+    /// The open turn's speech came back after a pause (a silence longer than the gaps between words) of `silent`
+    /// samples, which this window ends.
+    Resumed { silent: usize },
 }
 
 /// The audio of a turn that ended.
@@ -154,9 +157,12 @@ impl Segmenter {
                 let room = MAX_TURN.saturating_sub(open.pcm.len());
                 open.pcm.extend_from_slice(&pcm[..pcm.len().min(room)]);
                 if speech && level >= self.numbers.quiet_bar {
+                    let silent = open.silent;
                     open.silent = 0;
                     open.offered = false;
-                    return None;
+                    return (silent >= PAUSE).then_some(Segment::Resumed {
+                        silent: silent as usize,
+                    });
                 }
                 if open.silent == 0 {
                     open.pauses += 1;

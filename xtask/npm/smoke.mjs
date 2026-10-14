@@ -167,6 +167,16 @@ host.deviceGone = [told[0].input, told[0].lost?.input ?? null, switched.at(-1), 
 // Said with the call listening: heard, its handle telling how.
 const sayingHost = voice.say("The host says this.", { language: "en" });
 host.said = [typeof sayingHost.cancel, (await sayingHost.outcome).status];
+// A start that asks for a take: what the microphone gives from then on, handed to `onTake` before the stop resolves.
+await voice.stop();
+const takes = [];
+voice.onTake((take) => takes.push(take));
+await voice.start({ take: true });
+speaker.captured(new Float32Array(1600).fill(0.25));
+await new Promise((resolve) => setTimeout(resolve, 50));
+await voice.stop();
+host.take = takes.map((take) => [take.sampleRate, take.samples.constructor.name, take.samples.length, take.ended_at - take.started_at, take.turns.length]);
+await voice.start();
 // A stop and a start straight after it, both awaited, no pause: the call ends up listening.
 await voice.stop();
 host.restarted = await code(voice.start());
