@@ -12,11 +12,28 @@ initSync({ module: readFileSync(wasm) });
 
 // The page's models, as the call loads them: each load records the slots it filled.
 const loaded = [];
+const detector = () => {
+  let end = 0;
+  let pending = 0;
+  return {
+    async accept(samples) {
+      pending += samples.length;
+      const frames = [];
+      while (pending >= 512) {
+        pending -= 512;
+        end += 512;
+        frames.push({ end, speech: false, probability: 0 });
+      }
+      return frames;
+    },
+    async reset() { end = 0; pending = 0; },
+  };
+};
 const models = {
   async load() {
     loaded.push("vad", "transcriber", "speaker");
     return {
-      vad: { accept: async () => [], reset: async () => {} },
+      vad: detector(),
       transcriber: { transcribe: async () => "" },
       speaker: { speak: async () => ({ samples: new Float32Array(160), sampleRate: 16000 }) },
     };
