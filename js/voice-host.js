@@ -159,16 +159,18 @@ export function createVoiceHost(source, options = {}) {
         if (!call) return;
         release(chosen, id, idleMinutes);
         stopping++; active = false; listening = false;
-        const kept = taking; taking = false;
+        taking = false;
         const answered = new Promise((resolve) => answers.push(resolve));
         call.stop();
-        if (kept) await answered;
+        await answered;
       },
       async dispose() {
         if (disposed) return;
         disposed = true;
         settle(fail("stopped"));
         await hostCall.stop();
+        call?.free?.();
+        call = null;
         io.dispose?.();
         calls.delete(id);
       },

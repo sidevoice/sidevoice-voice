@@ -1,7 +1,7 @@
 //! The bridge to JavaScript, only in the wasm32 build (the npm package): `VoiceCall.create(models, io, config)`, the
 //! same call as the Rust [`VoiceCall`](crate::VoiceCall), on the page's models and a JavaScript microphone and speaker.
 //!
-//! - `models` is the page's `VoiceModels` (`js/voice-models.d.ts`): `load()` answers `{vad, transcriber, speaker,
+//! - `models` is the page's `VoiceModels` (`js/voice-models.d.ts`): `load()` answers `{createVad(), transcriber, speaker,
 //!   endOfTurn?}`, objects with the methods of [`Vad`](crate::Vad), [`Transcriber`](crate::Transcriber),
 //!   [`Speaker`](crate::Speaker) and [`EndOfTurnModel`](crate::EndOfTurnModel).
 //! - `io` is an object with `start(sink)`, `play(utterance, chunk, samples, sampleRate)`, `stopPlayback()` and
