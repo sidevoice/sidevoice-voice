@@ -5,7 +5,7 @@ use std::sync::atomic::Ordering;
 
 use rtrb::RingBuffer;
 
-use super::output::{Counters, Output, Queue, Schedule};
+use super::output::{Counters, Output, Queue, ReferenceSample, Schedule};
 use super::pipeline::Pipeline;
 use super::{drain, playback_complete, send_capture_after_playback};
 use crate::call::{Call, Effect, Input};
@@ -14,7 +14,14 @@ use crate::io::IoEvent;
 use crate::say::SayEvent;
 use crate::test_support::{clip, config, EnergyVad, FLEURS_ES, QUILTER, WINDOW};
 
-fn output(fade: usize) -> (rtrb::Producer<f32>, Output, rtrb::Consumer<f32>, Counters) {
+fn output(
+    fade: usize,
+) -> (
+    rtrb::Producer<f32>,
+    Output,
+    rtrb::Consumer<ReferenceSample>,
+    Counters,
+) {
     let (playback, queued) = RingBuffer::new(1_000);
     let (reference, played) = RingBuffer::new(1_000);
     (
@@ -35,8 +42,18 @@ fn what_plays_is_the_reference_and_silence_fills_the_gaps() {
     assert_eq!(out, [0.1, 0.2, 0.3, 0.0, 0.0]);
     player.publish(&counters);
     assert_eq!(counters.consumed.load(Ordering::Acquire), 3);
-    let copied: Vec<f32> = (0..5).map(|_| reference.pop().unwrap()).collect();
-    assert_eq!(copied, out);
+    let copied: Vec<ReferenceSample> = (0..5).map(|_| reference.pop().unwrap()).collect();
+    assert_eq!(
+        copied.iter().map(|sample| sample.value).collect::<Vec<_>>(),
+        out
+    );
+    assert_eq!(
+        copied
+            .iter()
+            .map(|sample| sample.queued)
+            .collect::<Vec<_>>(),
+        [true, true, true, false, false]
+    );
 }
 
 #[test]
@@ -66,9 +83,16 @@ fn completion_waits_for_a_callback_that_publishes_after_the_reference_drain() {
     ));
     drain(&mut reference, &mut drained, 1);
     count += drained.len() as u64;
-    assert!(drained.iter().any(|sample| *sample > 0.0));
+    assert!(drained.iter().any(|sample| sample.value > 0.0));
     let mut pipeline = Pipeline::new(16_000, 1, 16_000).unwrap();
-    let mut events = vec![IoEvent::Rendered(pipeline.render(&drained))];
+    let mut events = vec![IoEvent::Rendered(
+        pipeline.render(
+            &drained
+                .iter()
+                .map(|sample| sample.value)
+                .collect::<Vec<_>>(),
+        ),
+    )];
     assert!(playback_complete(
         None,
         true,
@@ -84,7 +108,12 @@ fn completion_waits_for_a_callback_that_publishes_after_the_reference_drain() {
     }
     drain(&mut reference, &mut drained, 1);
     assert!(pipeline
-        .render(&drained)
+        .render(
+            &drained
+                .iter()
+                .map(|sample| sample.value)
+                .collect::<Vec<_>>()
+        )
         .iter()
         .all(|sample| *sample == 0.0));
     assert!(matches!(events.last(), Some(IoEvent::PlaybackEnded)));

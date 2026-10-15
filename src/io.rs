@@ -100,9 +100,11 @@ impl IoSink {
             IoEvent::Rendered(samples) => {
                 #[cfg(native)]
                 if self.direct_rendered {
-                    let _ = self
-                        .messages
-                        .unbounded_send(Message::PhysicalRendered(self.generation, samples));
+                    let _ = self.messages.unbounded_send(Message::PhysicalRendered(
+                        self.generation,
+                        vec![true; samples.len()],
+                        samples,
+                    ));
                     return;
                 }
                 let mut mailbox = self.rendered.lock().expect("rendered mailbox");
@@ -133,6 +135,22 @@ impl IoSink {
                     .messages
                     .unbounded_send(Message::Io(self.generation, other));
             }
+        }
+    }
+
+    /// The native callback's rendered samples and its aligned queued-playback markers. Private to the physical
+    /// backend: ordinary AudioIo implementers retain the public Rendered event.
+    #[cfg(native)]
+    pub(crate) fn send_physical_rendered(&self, samples: Vec<f32>, queued: Vec<bool>) {
+        debug_assert_eq!(samples.len(), queued.len());
+        if self.direct_rendered {
+            let _ = self.messages.unbounded_send(Message::PhysicalRendered(
+                self.generation,
+                queued,
+                samples,
+            ));
+        } else {
+            self.send(IoEvent::Rendered(samples));
         }
     }
 }

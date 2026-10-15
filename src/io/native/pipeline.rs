@@ -22,6 +22,7 @@ pub(crate) struct Pipeline {
     capture_frames: Framer,
     render: Resampler,
     meter: Resampler,
+    meter_presence: Resampler,
     render_rate: u32,
     render_frames: Framer,
     ahead: VecDeque<[f32; FRAME]>,
@@ -42,6 +43,7 @@ impl Pipeline {
             capture_frames: Framer::default(),
             render: Resampler::new(render_rate, RATE),
             meter: Resampler::new(render_rate, RATE),
+            meter_presence: Resampler::new(render_rate, RATE),
             render_rate,
             render_frames: Framer::default(),
             ahead: VecDeque::new(),
@@ -62,9 +64,17 @@ impl Pipeline {
         metered
     }
 
+    /// Resample the callback's queued-sample marker on the same timeline as the rendered meter.
+    pub(crate) fn render_presence(&mut self, queued: &[f32]) -> Vec<bool> {
+        let mut resampled = Vec::new();
+        self.meter_presence.process(queued, &mut resampled);
+        resampled.into_iter().map(|value| value >= 0.5).collect()
+    }
+
     /// Clear only the playback meter's filter tail; the AEC reference stream continues across utterances.
     pub(crate) fn reset_playback_meter(&mut self) {
         self.meter = Resampler::new(self.render_rate, RATE);
+        self.meter_presence = Resampler::new(self.render_rate, RATE);
     }
 
     /// Takes what the microphone heard (interleaved, at its rate) and returns every frame it completed, clean.

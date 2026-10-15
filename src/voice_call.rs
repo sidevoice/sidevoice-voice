@@ -86,7 +86,7 @@ pub(crate) enum Message {
     Io(u64, IoEvent),
     Rendered(u64),
     #[cfg(native)]
-    PhysicalRendered(u64, Vec<f32>),
+    PhysicalRendered(u64, Vec<bool>, Vec<f32>),
     EndOfTurn {
         turn: usize,
         pause: u32,
@@ -442,7 +442,7 @@ impl Driver {
             #[cfg(native)]
             Message::SharedRoute(_, _) => {}
             #[cfg(native)]
-            Message::PhysicalRendered(_, _) => {}
+            Message::PhysicalRendered(_, _, _) => {}
             Message::Io(generation, _) if generation != self.generation => {}
             Message::Rendered(generation) => {
                 let frame = self

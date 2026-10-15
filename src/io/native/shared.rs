@@ -274,25 +274,18 @@ impl Drop for LaneIo {
 impl State {
     /// Attribute only the physical samples actually consumed by the output. The physical backend reports rendered
     /// samples before progress in a tick, so hold them until its first chunk-start marker arrives.
-    fn rendered(&mut self, samples: Vec<f32>) {
+    fn rendered(&mut self, samples: Vec<f32>, queued: Vec<bool>) {
         if self.frame_order.is_empty() {
             return;
         }
-        if !self
-            .frame_order
-            .front()
-            .and_then(|id| self.frames.get(id))
-            .is_some_and(|frame| frame.started)
-        {
-            let first = samples
-                .iter()
-                .position(|sample| sample.abs() > 1.0e-6)
-                .unwrap_or(samples.len());
-            self.rendered_pending
-                .extend(samples.into_iter().skip(first));
-        } else {
-            self.rendered_pending.extend(samples);
-        }
+        // A queued silent sample belongs to the frame. An unqueued silent sample is device idle time.
+        // The callback reports this distinction explicitly, even when Rendered precedes ChunkStarted.
+        self.rendered_pending.extend(
+            samples
+                .into_iter()
+                .zip(queued)
+                .filter_map(|(sample, queued)| queued.then_some(sample)),
+        );
         self.drain_rendered();
     }
 
@@ -436,7 +429,10 @@ impl State {
                     }
                 }
             }
-            IoEvent::Rendered(samples) => self.rendered(samples),
+            IoEvent::Rendered(samples) => {
+                let queued = vec![true; samples.len()];
+                self.rendered(samples, queued);
+            }
             IoEvent::PlaybackEnded => {
                 self.frames.clear();
                 self.frame_order.clear();
@@ -523,8 +519,10 @@ async fn dispatch(inner: Weak<Inner>, mut received: UnboundedReceiver<Message>) 
         let mut state = inner.state.lock().expect("shared audio");
         match message {
             Message::Io(generation, event) if generation == state.generation => state.event(event),
-            Message::PhysicalRendered(generation, samples) if generation == state.generation => {
-                state.rendered(samples)
+            Message::PhysicalRendered(generation, queued, samples)
+                if generation == state.generation =>
+            {
+                state.rendered(samples, queued)
             }
             Message::SharedRoute(id, answer) => {
                 let result =

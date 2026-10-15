@@ -27,16 +27,28 @@ pub(crate) struct Counters {
 /// What the output callback runs: one sample at a time, no lock and no allocation.
 pub(crate) struct Output {
     ring: Consumer<f32>,
-    reference: Producer<f32>,
+    reference: Producer<ReferenceSample>,
     fade: usize,
     fading: Option<usize>,
     consumed: u64,
     referenced: u64,
 }
 
+/// The reference includes whether the callback took a queued playback sample. Amplitude cannot identify this:
+/// a chunk may itself begin with silence.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ReferenceSample {
+    pub(crate) value: f32,
+    pub(crate) queued: bool,
+}
+
 impl Output {
     /// Plays from `ring` and copies what it plays to `reference`, fading out over `fade` samples on a stop.
-    pub(crate) fn new(ring: Consumer<f32>, reference: Producer<f32>, fade: usize) -> Self {
+    pub(crate) fn new(
+        ring: Consumer<f32>,
+        reference: Producer<ReferenceSample>,
+        fade: usize,
+    ) -> Self {
         Self {
             ring,
             reference,
@@ -53,7 +65,7 @@ impl Output {
         if self.consumed < flush_to && self.fading.is_none() {
             self.fading = Some(self.fade);
         }
-        let sample = match self.fading {
+        let rendered = match self.fading {
             Some(left) if left == 0 || self.consumed >= flush_to => {
                 let dropped =
                     (flush_to.saturating_sub(self.consumed) as usize).min(self.ring.slots());
@@ -62,28 +74,39 @@ impl Output {
                     self.consumed += dropped as u64;
                 }
                 self.fading = None;
-                0.0
+                ReferenceSample {
+                    value: 0.0,
+                    queued: false,
+                }
             }
             Some(left) => {
                 self.fading = Some(left - 1);
-                self.take() * left as f32 / self.fade as f32
+                let mut rendered = self.take();
+                rendered.value *= left as f32 / self.fade as f32;
+                rendered
             }
             None => self.take(),
         };
-        if self.reference.push(sample).is_ok() {
+        if self.reference.push(rendered).is_ok() {
             self.referenced += 1;
         }
-        sample
+        rendered.value
     }
 
     /// The next queued sample, or silence.
-    fn take(&mut self) -> f32 {
+    fn take(&mut self) -> ReferenceSample {
         match self.ring.pop() {
             Ok(sample) => {
                 self.consumed += 1;
-                sample
+                ReferenceSample {
+                    value: sample,
+                    queued: true,
+                }
             }
-            Err(_) => 0.0,
+            Err(_) => ReferenceSample {
+                value: 0.0,
+                queued: false,
+            },
         }
     }
 

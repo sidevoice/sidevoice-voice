@@ -293,3 +293,59 @@ fn rendered_levels_follow_partial_physical_consumption_and_never_anticipate_a_lo
         lane.stop();
     });
 }
+
+#[test]
+fn rendered_before_start_preserves_a_queued_silent_prefix_and_its_peak() {
+    runtime().block_on(async {
+        let recorded = Arc::new(Mutex::new(Recorded::default()));
+        let shared = SharedNativeAudio::with_physical(
+            NativeDevices::default(),
+            Box::new(Physical(Arc::clone(&recorded))),
+        );
+        let (mut lane, _) = shared.attach();
+        let (sink, mut events) = lane_sink();
+        let mailbox = Arc::clone(&sink.rendered);
+        lane.start(sink).unwrap();
+        next_io(&mut events).await;
+        lane.play(
+            "silent-prefix",
+            0,
+            [vec![0.0; 120], vec![0.9; 40]].concat(),
+            RATE,
+        );
+        let frame = recorded.lock().unwrap().played[0].0.clone();
+        let physical = recorded.lock().unwrap().sink.as_ref().unwrap().clone();
+
+        // The native worker reports rendered samples before the progress marker. Idle output and
+        // the chunk's own leading silence have the same amplitude but different callback markers.
+        physical.send_physical_rendered(vec![0.0; 100], [vec![false; 20], vec![true; 80]].concat());
+        physical.send(IoEvent::ChunkStarted {
+            utterance: frame.clone(),
+            chunk: 0,
+        });
+        assert!(matches!(
+            next_io(&mut events).await,
+            IoEvent::ChunkStarted { .. }
+        ));
+        assert_eq!(next_rendered(&mut events, &mailbox).await, vec![0.0; 80]);
+        assert_eq!(
+            shared.inner.state.lock().unwrap().frames[&frame].rendered,
+            80
+        );
+
+        physical.send_physical_rendered(vec![0.0; 40], vec![true; 40]);
+        assert_eq!(next_rendered(&mut events, &mailbox).await, vec![0.0; 40]);
+        physical.send_physical_rendered(vec![0.9; 40], vec![true; 40]);
+        let peak = next_rendered(&mut events, &mailbox).await;
+        assert_eq!(peak.len(), 40);
+        assert!(peak[..39]
+            .iter()
+            .all(|sample| (*sample - 0.9).abs() < 0.001));
+        assert_eq!(peak[39], 0.0);
+        assert_eq!(
+            shared.inner.state.lock().unwrap().frames[&frame].rendered,
+            FRAME
+        );
+        lane.stop();
+    });
+}
