@@ -116,7 +116,10 @@ const source = {
     asked.push(settings);
     if (settings.stt.model !== "smoke-stt") throw Object.assign(new Error("unknown"), { code: "model-unknown" });
     // A build that comes with an end-of-turn model, for smart-turn.
-    return settings.stt.build === "ends-turns" ? ending : models;
+    return { load: async () => {
+      const { vad: _vad, ...shared } = await (settings.stt.build === "ends-turns" ? ending : models).load();
+      return { ...shared, createVad: detector };
+    } };
   },
 };
 const ending = {
@@ -135,7 +138,11 @@ Object.defineProperty(globalThis, "navigator", { configurable: true, value: { me
   enumerateDevices: async () => deviceList,
   addEventListener: (name, listener) => { if (name === "devicechange") deviceChange = listener; },
 } } });
-const voice = createVoiceHost(source, { io });
+const sharedIo = { outputSelectable: io.outputSelectable,
+  attach() { return { io, input: {} }; }, routeInput: async () => {},
+  setInputDevice: io.setInputDevice, setOutputDevice: io.setOutputDevice };
+const owner = createVoiceHost(source, { io: sharedIo });
+const voice = owner.createCall();
 const playbackLevels = [];
 const unsubscribePlayback = voice.onPlaybackLevel((level) => playbackLevels.push(level));
 voice.onPlaybackLevel(() => { throw new Error("isolated listener"); });
@@ -153,7 +160,7 @@ const until = async (done) => {
   for (let waited = 0; !done() && waited < 5000; waited += 10) await new Promise((r) => setTimeout(r, 10));
 };
 const host = { missing: await code(voice.start()) };
-await voice.setCaptureBoundary("smoke-initial-focus");
+await owner.routeInput(voice);
 // Said before any settings: there is no call, so it is not played.
 host.early = (await voice.say("Too early.").outcome).status;
 // Muted before any settings: the call they create must start that way.
@@ -188,16 +195,16 @@ voice.mute(false);
 host.again = await code(voice.start());
 // Audio devices with the call listening: the list (the default one is no entry: it is null), a choice the io switches
 // to at once, and the chosen microphone gone: the default one again, said once with the list.
-const listed = await voice.audioDevices();
+const listed = await owner.audioDevices();
 host.devices = [listed.inputs.map((device) => device.id), listed.outputs.map((device) => device.label), listed.input, listed.outputSelectable];
-const chosen = await voice.setAudioDevices({ input: "mic-a", output: "out-b" });
+const chosen = await owner.setAudioDevices({ input: "mic-a", output: "out-b" });
 host.chosen = [chosen.input, chosen.output, switched.slice()];
 const told = [];
-voice.onAudioDevices((devices) => told.push(devices));
+owner.onAudioDevices((devices) => told.push(devices));
 deviceList = deviceList.filter((device) => device.deviceId !== "mic-a");
 deviceChange();
 await until(() => told.length > 0);
-host.deviceGone = [told[0].input, told[0].lost?.input ?? null, switched.at(-1), (await voice.audioDevices()).lost ?? null];
+host.deviceGone = [told[0].input, told[0].lost?.input ?? null, switched.at(-1), (await owner.audioDevices()).lost ?? null];
 // Said with the call listening: heard, its handle telling how.
 const sayingHost = voice.say("The host says this.", { language: "en" });
 host.said = [typeof sayingHost.cancel, (await sayingHost.outcome).status];
@@ -238,7 +245,8 @@ await voice.setSettings({
 host.smartMissing = await code(voice.start());
 await until(() => states.at(-1) === "idle");
 host.states = states;
-host.seam = Object.keys(voice).sort();
+host.seam = Object.keys(owner).sort();
+host.callSeam = Object.keys(voice).sort();
 
 // The browser's own microphone and speaker (createWebAudioIo) over a fake getUserMedia and Web Audio: a chosen
 // microphone, switched mid-call (the new one open before the old one is let go, the worklet kept), the chosen one

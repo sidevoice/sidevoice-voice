@@ -97,7 +97,7 @@ fn a_smoke_report_must_show_a_running_call() {
             "outputSelectable": true, "heard": ["muted", "ready", "unmuted", "muted", "audio-capture-failed"],
         },
         "host": {
-            "missing": "settings-missing", "unknown": "model-unknown", "reloaded": 1,
+            "missing": "settings-missing", "unknown": "model-unknown", "reloaded": 0,
             "smartMissing": "end-of-turn-missing", "flags": ["muted"],
             "early": "not-played", "said": ["function", "heard"],
             "started": "resolved", "again": "resolved", "restarted": "resolved", "afterRestart": "listening",
@@ -109,6 +109,7 @@ fn a_smoke_report_must_show_a_running_call() {
         "deviceGone": [null, "mic-a", ["input", null], null],
             "take": [[16_000, "Float32Array", 1_760, 110, 0]],
             "seam": SEAM,
+            "callSeam": CALL_SEAM,
             "playbackLevels": [true, 0, true],
         },
     });

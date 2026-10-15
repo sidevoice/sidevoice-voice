@@ -1,13 +1,12 @@
 // What a call tells the page, and what becomes of what it is asked to say: the JSON of the crate's VoiceEvent,
-// SayEvent and SayOutcome (src/event.rs, src/say.rs). The call knows nothing of the room; the page translates.
+// SayEvent and SayOutcome (src/event.rs, src/say.rs). The call exposes only its own events and handle outcomes.
 
 /** A step of a turn of the person's speech, under the call's own `turn_id` (the same in every step). */
 export type VoiceTurnEvent =
-  | { phase: "started"; turn_id: string; capture_boundary_id: string; /** Unix milliseconds. */ started_at: number }
+  | { phase: "started"; turn_id: string; /** Unix milliseconds. */ started_at: number }
   | {
       phase: "finished";
       turn_id: string;
-      capture_boundary_id: string;
       /** What the person said. */
       text: string;
       language?: string;
@@ -18,7 +17,7 @@ export type VoiceTurnEvent =
       merged: boolean;
       timings: { audio_ms: number; endpoint_silence_ms: number; recognition_ms: number };
     }
-  | { phase: "cancelled"; turn_id: string; capture_boundary_id: string; /** Joined into the next turn. */ merged: boolean };
+  | { phase: "cancelled"; turn_id: string; /** Joined into the next turn. */ merged: boolean };
 
 /** Where the call is. */
 export interface VoiceCallState {
@@ -44,7 +43,6 @@ export type VoiceCallEvent =
   | { type: "state"; data: VoiceCallState }
   | { type: "level"; /** The microphone's smoothed level, 0 to 1. */ data: number }
   | { type: "playback-level"; /** The rendered speaker's smoothed level, 0 to 1. */ data: number }
-  | { type: "agent-interrupted"; data: { utterance_id: string; heard_until: number; played: boolean } }
   | { type: "error"; data: { code: string } }
   | { type: "take"; data: VoiceTake };
 

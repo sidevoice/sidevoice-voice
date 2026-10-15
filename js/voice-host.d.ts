@@ -8,10 +8,10 @@
 // (the page's, wired into `voice-models.d.ts`'s interfaces). Which models there are, and how a setting names one,
 // are the page's: the call reads a slot's language, voice and speed, and hands the rest of it to `source` as it is.
 //
-// The call knows nothing of the room: it tells the page the person's turns under its own ids, and says what the page
-// asks it to through a handle that tells how it went (`voice-events.d.ts`). The page translates both ways.
+// Each call emits its own turns and saying outcomes (`voice-events.d.ts`).
 
-import type { AudioIo, WebAudioIoOptions } from "./web-audio-io.js";
+import type { WebAudioIoOptions } from "./web-audio-io.js";
+import type { SharedWebAudioIo } from "./shared-web-audio-io.js";
 import type { VoiceModels } from "./voice-models.js";
 import type {
   VoiceCallState,
@@ -40,21 +40,19 @@ export interface VoiceSettings {
   patience?: "fast" | "normal" | "calm";
   /** `silence` by default; `smart-turn` needs `source` to give an end-of-turn model. */
   end_of_turn?: "silence" | "smart-turn";
-  /** How long the models stay in memory with the call stopped, in minutes (10 by default; 0: they leave as it stops).
-   *  The next `start` loads them again. */
+  /** How long an unused model choice stays loaded, in minutes (10 by default; 0: release it at once). */
   idle_unload_minutes?: number;
   /** Continuous raised-bar speech, in seconds, before sounding agent audio is cut (default 1.0). */
   barge_in_min_speech?: number;
 }
 
-/** What a failed call rejects with, and what `onError` hears: rely on `code`. The desktop app adds its `key`. */
+/** What a failed call rejects with, and what `onError` hears: rely on `code`. */
 export interface VoiceHostError {
   /** `microphone-denied`, `microphone-unavailable`, `speaker-unavailable`, `audio-device-unavailable`,
    *  `echo-cancellation-unavailable`, `settings-missing`, `stopped`, `end-of-turn-missing`, and the codes of the page's models and of its source's
    *  refusals of settings, as they give them. */
   code: string;
   message?: string;
-  key?: string;
 }
 
 /** An audio device as the platform lists it. `label` may be empty until the page may use the microphone. */
@@ -78,9 +76,21 @@ export interface VoiceAudioDevices {
   lost?: { input?: string; output?: string };
 }
 
-/** The voice seam. Every event of a call reaches the listeners subscribed when it is emitted, in the order the call
- *  emitted it, across kinds; nothing is buffered, so subscribe before `start`. Each `on…` returns `stop`. */
+/** A generic owner of shared devices and model loads. */
 export interface VoiceHost {
+  createCall(): VoiceCallHost;
+  /** Acknowledged next-frame switch; null supplies silence to every call. */
+  routeInput(target: VoiceCallHost | null): Promise<void>;
+  audioDevices(): Promise<VoiceAudioDevices>;
+  setAudioDevices(choice: { input?: string | null; output?: string | null }): Promise<VoiceAudioDevices>;
+  onAudioDevices(listener: (devices: VoiceAudioDevices) => void): () => void;
+}
+
+/** A call's state, events, and saying handles are independent of every other call. */
+export interface VoiceCallHost {
+  readonly id: string;
+  dispose(): Promise<void>;
+
   /** Sets the person's choices; the first creates the call. Rejects `VoiceHostError`. */
   setSettings(settings: VoiceSettings): Promise<void>;
   /** Loads the models, opens the microphone and the speaker, listens. `smart-turn` without an end-of-turn model
@@ -104,12 +114,6 @@ export interface VoiceHost {
   mute(muted: boolean): void;
   /** Cancels what the person said that is not told yet. */
   cancelInput(): void;
-  /** Assigns a fresh opaque ID for the initial focus and every change in the host's target for future capture.
-   *  Earlier open, transcribing and held turns retain their turn IDs and boundary IDs; no transcript merges across
-   *  different IDs. Call before a new turn can start for the new target, including before setSettings. Repeating the
-   *  same ID changes nothing. Resolves after voice has applied the boundary: await it before speech can start for the
-   *  new target. This does not cancel input or stop the call. */
-  setCaptureBoundary(id: string): Promise<void>;
   /** For each `turn_id`: `started`, then exactly one `finished` (the words) or `cancelled`. */
   onTurn(listener: (turn: VoiceTurnEvent) => void): () => void;
   /** The state, each time it changes (the first once the call starts). */
@@ -119,22 +123,11 @@ export interface VoiceHost {
   /** The rendered speaker's level, 0 to 1, on detector windows (normally 32 ms); exact zero when output ends.
    *  It continues while the microphone is muted. */
   onPlaybackLevel(listener: (level: number) => void): () => void;
-  /** Each say displaced by a confirmed spoken turn, including queued says with `played: false` and `heard_until: 0`. */
-  onAgentInterrupted(listener: (cut: { utterance_id: string; heard_until: number; played: boolean }) => void): () => void;
   onError(listener: (error: VoiceHostError) => void): () => void;
   /** The take of a start that asked for one (`start({take: true})`), once per stretch of listening, as it ends: before
    *  `stop()` resolves, before the error that ended it, before a restart on other models listens again. Handed over:
    *  the call keeps no copy. */
   onTake(listener: (take: VoiceTake) => void): () => void;
-  /** The audio devices now, and which are chosen. */
-  audioDevices(): Promise<VoiceAudioDevices>;
-  /** Chooses the microphone, the output or both by id (null: the system's default), at any time: a call that runs
-   *  switches without ending, and the choice holds for every call after it. Resolves with the devices then; rejects
-   *  `VoiceHostError` (`microphone-denied`, `microphone-unavailable`, `audio-output-unselectable`,
-   *  `audio-output-failed`), the choice unchanged. */
-  setAudioDevices(choice: { input?: string | null; output?: string | null }): Promise<VoiceAudioDevices>;
-  /** The devices, each time the platform's list changes or a chosen one goes away (then with `lost`). */
-  onAudioDevices(listener: (devices: VoiceAudioDevices) => void): () => void;
 }
 
 /** The page's side of `createVoiceHost`: which models fill the call's slots. */
@@ -147,8 +140,8 @@ export interface VoiceModelSource {
 }
 
 export interface VoiceHostOptions extends WebAudioIoOptions {
-  /** The microphone and speaker instead of the browser's (`createWebAudioIo`). */
-  io?: AudioIo;
+  /** A shared audio factory with attach and acknowledged routeInput. */
+  io?: SharedWebAudioIo;
 }
 
 /** The voice seam over this package's call, on the page's `source` of models. */

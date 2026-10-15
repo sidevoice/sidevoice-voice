@@ -23,25 +23,8 @@ const SMOKE_JS: &str = include_str!("../npm/smoke.mjs");
 /// The slots the smoke test's models fill, recorded each time the call loads them.
 const SMOKE_SLOTS: [&str; 3] = ["vad", "transcriber", "speaker"];
 /// The calls of the voice seam, `VoiceHost` (js/voice-host.d.ts), sorted.
-const SEAM: [&str; 17] = [
-    "audioDevices",
-    "cancelInput",
-    "mute",
-    "onAgentInterrupted",
-    "onAudioDevices",
-    "onError",
-    "onLevel",
-    "onPlaybackLevel",
-    "onState",
-    "onTake",
-    "onTurn",
-    "say",
-    "setAudioDevices",
-    "setCaptureBoundary",
-    "setSettings",
-    "start",
-    "stop",
-];
+const SEAM: [&str; 5] = ["audioDevices", "createCall", "onAudioDevices", "routeInput", "setAudioDevices"];
+const CALL_SEAM: [&str; 14] = ["cancelInput", "dispose", "id", "mute", "onError", "onLevel", "onPlaybackLevel", "onState", "onTake", "onTurn", "say", "setSettings", "start", "stop"];
 
 fn parse(bytes: &[u8], what: &str) -> Result<Value> {
     serde_json::from_slice(bytes).map_err(|error| format!("{what}: {error}"))
@@ -189,7 +172,7 @@ fn check_smoke(report: &Value) -> Result<()> {
     }
     let host = &report["host"];
     let want = json!({
-        "missing": "settings-missing", "unknown": "model-unknown", "reloaded": 1,
+        "missing": "settings-missing", "unknown": "model-unknown", "reloaded": 0,
         "smartMissing": "end-of-turn-missing", "flags": ["muted"],
         "early": "not-played", "said": ["function", "heard"],
         "started": "resolved", "again": "resolved", "restarted": "resolved", "afterRestart": "listening",
@@ -203,6 +186,7 @@ fn check_smoke(report: &Value) -> Result<()> {
         // Float32Array, handed over before the stop resolved; no turn in it.
         "take": [[16_000, "Float32Array", 1_760, 110, 0]],
         "seam": SEAM,
+        "callSeam": CALL_SEAM,
         "playbackLevels": [true, 0, true],
     });
     if *host != want {

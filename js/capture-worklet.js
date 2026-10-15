@@ -46,6 +46,13 @@ class CaptureProcessor extends AudioWorkletProcessor {
     this.previous = 0;
     this.frame = new Float32Array(FRAME);
     this.filled = 0;
+    this.route = null;
+    this.port.onmessage = ({ data }) => {
+      if (data?.type === "route") {
+        this.route = data.generation;
+        this.port.postMessage({ type: "routed", generation: this.route });
+      }
+    };
   }
 
   process(inputs) {
@@ -80,7 +87,7 @@ class CaptureProcessor extends AudioWorkletProcessor {
   push(sample) {
     this.frame[this.filled++] = sample;
     if (this.filled === FRAME) {
-      this.port.postMessage(this.frame, [this.frame.buffer]);
+      this.port.postMessage(this.route === null ? this.frame : { type: "captured", generation: this.route, samples: this.frame }, [this.frame.buffer]);
       this.frame = new Float32Array(FRAME);
       this.filled = 0;
     }

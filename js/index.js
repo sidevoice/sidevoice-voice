@@ -4,9 +4,10 @@
 // brings another, and the voice seam a page drives a call through, `createVoiceHost` (voice-host.js).
 import { VoiceCall as WasmVoiceCall } from "../dist/sidevoice_voice.js";
 import { createWebAudioIo } from "./web-audio-io.js";
+import { createSharedWebAudioIo } from "./shared-web-audio-io.js";
 
 export { default, initSync, IoSink } from "../dist/sidevoice_voice.js";
-export { createWebAudioIo };
+export { createWebAudioIo, createSharedWebAudioIo };
 export { createVoiceHost } from "./voice-host.js";
 
 export const VoiceCall = {

@@ -1,0 +1,228 @@
+// One browser capture and output context with independent call lanes.
+const CAPTURE = { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 };
+const FRAME = 160;
+const FADE_SECONDS = 0.03;
+const selectable = () => typeof AudioContext !== "undefined" && typeof AudioContext.prototype.setSinkId === "function";
+const failure = (code, message) => Object.assign(new Error(message || code), { code });
+
+export function createSharedWebAudioIo(options = {}) {
+  const lanes = new Map();
+  let nextPort = 0;
+  let selected = null;
+  let generation = 0;
+  let pendingRoutes = new Map();
+  let context = null;
+  let stream = null;
+  let microphone = null;
+  let capture = null;
+  let opening = null;
+  let session = 0;
+  let inputDevice = options.inputDevice || null;
+  let outputDevice = options.outputDevice || null;
+  const frame = () => Math.ceil((context?.currentTime || 0) * (context?.sampleRate || 16000));
+
+  function releaseDevices() {
+    session++;
+    for (const pending of pendingRoutes.values()) pending.reject(failure("stopped"));
+    pendingRoutes = new Map();
+    for (const track of stream?.getTracks() ?? []) { track.onended = track.onmute = track.onunmute = null; track.stop(); }
+    stream = null;
+    microphone?.disconnect(); microphone = null;
+    capture?.disconnect(); capture?.port?.close(); capture = null;
+    for (const lane of lanes.values()) {
+      lane.gain?.disconnect(); lane.meter?.disconnect(); lane.meter?.port?.close();
+      lane.gain = lane.meter = null;
+      lane.sources.clear(); lane.queueEnd = 0;
+    }
+    context?.close().catch(() => {}); context = null;
+    opening = null;
+  }
+  function failAll(code) {
+    const current = [...lanes.values()].filter((lane) => lane.sink);
+    for (const lane of current) lane.sink.failed(code);
+    for (const lane of current) lane.io.stop();
+  }
+  async function media(id) {
+    if (!globalThis.navigator?.mediaDevices?.getUserMedia) throw failure("microphone-unavailable");
+    try {
+      const result = await navigator.mediaDevices.getUserMedia({ audio: { ...CAPTURE, ...(id ? { deviceId: { exact: id } } : {}) } });
+      if (result.getAudioTracks().some((track) => track.getSettings?.().echoCancellation === false)) {
+        result.getTracks().forEach((track) => track.stop());
+        throw failure("echo-cancellation-unavailable");
+      }
+      return result;
+    } catch (error) {
+      if (error.code) throw error;
+      throw failure(error.name === "NotAllowedError" || error.name === "SecurityError" ? "microphone-denied" : "microphone-unavailable", error.message);
+    }
+  }
+  function useStream(next, opened) {
+    for (const track of stream?.getTracks() ?? []) { track.onended = track.onmute = track.onunmute = null; track.stop(); }
+    stream = next;
+    for (const track of next.getAudioTracks()) {
+      track.onended = async () => {
+        if (opened !== session) return;
+        if (!inputDevice) return failAll("microphone-lost");
+        const old = inputDevice; inputDevice = null;
+        try { useStream(await media(null), opened); options.onDeviceLost?.("input", old); }
+        catch (_) { failAll("microphone-lost"); }
+      };
+      track.onmute = () => { if (opened === session) for (const lane of lanes.values()) lane.sink?.microphoneMuted(true); };
+      track.onunmute = () => { if (opened === session) for (const lane of lanes.values()) lane.sink?.microphoneMuted(false); };
+    }
+    if (capture) { microphone?.disconnect(); microphone = context.createMediaStreamSource(next); microphone.connect(capture); }
+  }
+  async function open(opened) {
+    const mediaStream = await media(inputDevice);
+    if (opened !== session) { mediaStream.getTracks().forEach((track) => track.stop()); return; }
+    useStream(mediaStream, opened);
+    context = new AudioContext();
+    await context.audioWorklet.addModule(new URL("./capture-worklet.js", import.meta.url).href);
+    await context.audioWorklet.addModule(new URL("./playback-worklet.js", import.meta.url).href);
+    if (opened !== session) return;
+    microphone = context.createMediaStreamSource(stream);
+    capture = new AudioWorkletNode(context, "sidevoice-capture");
+    capture.port.onmessage = ({ data }) => {
+      if (opened !== session) return;
+      if (data?.type === "routed") { pendingRoutes.get(data.generation)?.resolve(); pendingRoutes.delete(data.generation); return; }
+      if (data?.type !== "captured") return;
+      const target = pendingRoutes.get(data.generation)?.target ?? (data.generation === generation ? selected : null);
+      for (const lane of lanes.values()) if (lane.sink) lane.sink.captured(lane.port === target ? data.samples : new Float32Array(FRAME));
+    };
+    capture.onprocessorerror = () => failAll("audio-capture-failed");
+    microphone.connect(capture).connect(context.destination);
+    if (outputDevice && selectable()) await context.setSinkId(outputDevice);
+    await context.resume();
+    if (opened !== session) return;
+    // The worklet acknowledges the initial route before any lane reports ready.
+    await route(selected);
+  }
+  async function ensureOpen() {
+    if (opening) return opening;
+    if (context && capture) return;
+    if (!opening) {
+      const opened = session;
+      opening = open(opened).catch((error) => {
+        const code = error?.code || "audio-output-failed";
+        failAll(code);
+        releaseDevices();
+        throw error;
+      });
+    }
+    await opening;
+  }
+  function route(port) {
+    if (port !== null && !lanes.has(port)) return Promise.reject(new TypeError("an attached input port"));
+    selected = port;
+    if (!capture) return Promise.resolve();
+    const serial = ++generation;
+    return new Promise((resolve, reject) => {
+      pendingRoutes.set(serial, { target: port, resolve, reject });
+      capture.port.postMessage({ type: "route", generation: serial });
+    });
+  }
+  function outputFor(lane) {
+    if (lane.meter) return;
+    lane.meter = new AudioWorkletNode(context, "sidevoice-playback", { outputChannelCount: [1] });
+    lane.meter.port.onmessage = ({ data }) => {
+      if (!lane.sink) return;
+      if (data?.type === "fence") { lane.sink.playbackEnded(); return; }
+      if (data?.type === "reset") return;
+      lane.meter.port.postMessage("ack");
+      if (data?.samples instanceof Float32Array && frame() - data.endFrame <= (context.sampleRate || 16000) / 4) lane.sink.rendered(data.samples);
+    };
+    lane.meter.onprocessorerror = () => lane.sink?.failed("audio-output-failed");
+    lane.meter.connect(context.destination);
+    lane.gain = context.createGain();
+    lane.gain.connect(lane.meter);
+  }
+  function stopPlayback(lane) {
+    if (!lane.gain || !context) return;
+    lane.playback++;
+    const now = context.currentTime;
+    lane.gain.gain.setValueAtTime(lane.gain.gain.value, now);
+    lane.gain.gain.linearRampToValueAtTime(0, now + FADE_SECONDS);
+    for (const source of lane.sources) { source.onended = null; source.stop(now + FADE_SECONDS); }
+    lane.sources.clear();
+    const old = lane.gain;
+    const meter = lane.meter;
+    const epoch = lane.playback;
+    setTimeout(() => { old.disconnect(); if (meter === lane.meter) meter?.port.postMessage({ type: "fence", id: epoch }); }, FADE_SECONDS * 2000);
+    lane.gain = context.createGain(); lane.gain.connect(lane.meter);
+    lane.queueEnd = 0;
+  }
+  return {
+    get outputSelectable() { return selectable(); },
+    attach() {
+      const port = Object.freeze({ id: ++nextPort });
+      const lane = { port, sink: null, meter: null, gain: null, sources: new Set(), queueEnd: 0, playback: 0 };
+      const io = {
+        start(sink) {
+          lane.sink = sink;
+          ensureOpen().then(() => {
+            if (!lane.sink || lane.sink !== sink) return;
+            outputFor(lane);
+            sink.ready();
+            if (stream?.getAudioTracks().some((track) => track.muted)) sink.microphoneMuted(true);
+          }, (error) => { if (lane.sink === sink) sink.failed(error?.code || "audio-output-failed"); });
+        },
+        play(utterance, chunk, samples, sampleRate) {
+          if (!lane.sink || !context || !lane.gain) return;
+          const epoch = ++lane.playback;
+          const buffer = context.createBuffer(1, Math.max(samples.length, 1), sampleRate);
+          buffer.copyToChannel(samples, 0);
+          const source = context.createBufferSource();
+          source.buffer = buffer; source.connect(lane.gain);
+          const at = Math.max(context.currentTime, lane.queueEnd);
+          lane.queueEnd = at + buffer.duration;
+          lane.sources.add(source);
+          source.onended = () => {
+            lane.sources.delete(source);
+            if (lane.sink) lane.sink.chunkPlayed(utterance, chunk);
+            if (!lane.sources.size) lane.meter?.port.postMessage({ type: "fence", id: epoch });
+          };
+          source.start(at);
+          const started = () => {
+            if (!lane.sink || !lane.sources.has(source)) return;
+            const left = at - context.currentTime;
+            if (left > 0) setTimeout(started, left * 1000);
+            else lane.sink.chunkStarted(utterance, chunk);
+          };
+          started();
+        },
+        stopPlayback() { stopPlayback(lane); },
+        stop() {
+          stopPlayback(lane);
+          lane.sink = null;
+          if (![...lanes.values()].some((other) => other.sink)) releaseDevices();
+        },
+        dispose() {
+          io.stop();
+          lane.meter?.disconnect(); lane.meter?.port.close();
+          lane.gain?.disconnect();
+          lanes.delete(port);
+          if (selected === port) selected = null;
+        },
+      };
+      lane.io = io;
+      lanes.set(port, lane);
+      return { io, input: port };
+    },
+    routeInput: route,
+    async setInputDevice(id) {
+      const next = id || null;
+      if (!stream) { inputDevice = next; return; }
+      const opened = session;
+      const mediaStream = await media(next);
+      if (opened !== session) { mediaStream.getTracks().forEach((track) => track.stop()); return; }
+      inputDevice = next; useStream(mediaStream, opened);
+    },
+    async setOutputDevice(id) {
+      const next = id || null;
+      if (!selectable()) { if (next) throw failure("audio-output-unselectable"); return; }
+      if (context) await context.setSinkId(next ?? "").catch(() => { throw failure("audio-output-failed"); });
+      outputDevice = next;
+      for (const lane of lanes.values()) lane.sink?.playbackEnded();
+    },
+  };
+}

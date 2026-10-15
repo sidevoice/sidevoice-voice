@@ -5,6 +5,8 @@ import type { VoiceCallEvent, VoiceSaying, VoiceSayOptions } from "./voice-event
 export { default, initSync, IoSink } from "../dist/sidevoice_voice.js";
 export type { InitInput, InitOutput, SyncInitInput } from "../dist/sidevoice_voice.js";
 export { createWebAudioIo } from "./web-audio-io.js";
+export { createSharedWebAudioIo } from "./shared-web-audio-io.js";
+export type { SharedWebAudioIo, InputPort } from "./shared-web-audio-io.js";
 export type { AudioIo, AudioIoSink, WebAudioIoOptions } from "./web-audio-io.js";
 export type {
   VoiceAudio,
@@ -17,7 +19,7 @@ export type {
   VoiceVadFrame,
 } from "./voice-models.js";
 
-/** One voice call: it tells the page its events and says what the page asks it to. It knows nothing of the room. */
+/** One voice call: it tells the page its events and says what the page asks it to. It carries no application routing metadata. */
 export interface VoiceCall {
   /** Hears every event from now on: turns, state, level, errors. */
   onEvent(listener: (event: VoiceCallEvent) => void): void;
@@ -70,6 +72,7 @@ export type {
   VoiceAudioDevice,
   VoiceAudioDevices,
   VoiceHost,
+  VoiceCallHost,
   VoiceHostError,
   VoiceHostOptions,
   VoiceModelSource,
