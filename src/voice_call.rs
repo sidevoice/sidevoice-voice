@@ -453,7 +453,7 @@ impl Driver {
             }
             Message::CancelInput => self.input(Input::Cancel),
             Message::EndInput(done) => {
-                self.input(Input::EndInput);
+                self.input(Input::EndTurn);
                 let _ = done.send(());
             }
             #[cfg(native)]
