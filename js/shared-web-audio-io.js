@@ -33,6 +33,7 @@ export function createSharedWebAudioIo(options = {}) {
       lane.gain?.disconnect(); lane.meter?.disconnect(); lane.meter?.port?.close();
       lane.gain = lane.meter = null;
       lane.sources.clear(); lane.queueEnd = 0;
+      lane.active = null; lane.closing.clear(); lane.deferred = null; lane.rendering = false;
     }
     context?.close().catch(() => {}); context = null;
     opening = null;
@@ -126,15 +127,38 @@ export function createSharedWebAudioIo(options = {}) {
     lane.meter = new AudioWorkletNode(context, "sidevoice-playback", { outputChannelCount: [1] });
     lane.meter.port.onmessage = ({ data }) => {
       if (!lane.sink) return;
-      if (data?.type === "fence") { lane.sink.playbackEnded(); return; }
-      if (data?.type === "reset") return;
+      if (data?.type === "fence") {
+        if (!lane.closing.delete(data.id)) return;
+        lane.sink.playbackEnded();
+        if (lane.closing.size === 0 && lane.deferred && lane.active?.id === lane.deferred.id) lane.sink.rendered(lane.deferred.samples);
+        if (lane.closing.size === 0) lane.deferred = null;
+        return;
+      }
+      if (data?.type === "reset") { if (lane.active?.id === data.id) lane.active.ready = true; return; }
       lane.meter.port.postMessage("ack");
-      if (data?.samples instanceof Float32Array && frame() - data.endFrame <= (context.sampleRate || 16000) / 4) lane.sink.rendered(data.samples);
+      if (!(data?.samples instanceof Float32Array) || frame() - data.endFrame > (context.sampleRate || 16000) / 4) return;
+      const epoch = [...lane.closing.values()].find((past) => data.startFrame >= past.startFrame && data.endFrame <= past.endFrame)
+        ?? (lane.active && data.startFrame >= lane.active.startFrame ? lane.active : null);
+      if (!epoch || (epoch.endFrame !== undefined && data.endFrame > epoch.endFrame) || (epoch === lane.active && !epoch.ready)) return;
+      if (epoch === lane.active && lane.closing.size > 0) lane.deferred = { id: epoch.id, samples: data.samples };
+      else lane.sink.rendered(data.samples);
     };
     lane.meter.onprocessorerror = () => lane.sink?.failed("audio-output-failed");
     lane.meter.connect(context.destination);
     lane.gain = context.createGain();
     lane.gain.connect(lane.meter);
+  }
+  function closePlayback(lane, epoch, endTime, waitMs = 0) {
+    if (!epoch || lane.closing.has(epoch.id)) return;
+    epoch.endFrame = Math.ceil(endTime * (context?.sampleRate || 16000));
+    if (lane.active === epoch) lane.active = null;
+    lane.rendering = false;
+    lane.closing.set(epoch.id, epoch);
+    const opened = session;
+    const meter = lane.meter;
+    setTimeout(() => {
+      if (opened === session && meter === lane.meter && lane.closing.has(epoch.id)) meter.port.postMessage({ type: "fence", id: epoch.id });
+    }, waitMs);
   }
   function stopPlayback(lane) {
     if (!lane.gain || !context) return;
@@ -145,9 +169,8 @@ export function createSharedWebAudioIo(options = {}) {
     for (const source of lane.sources) { source.onended = null; source.stop(now + FADE_SECONDS); }
     lane.sources.clear();
     const old = lane.gain;
-    const meter = lane.meter;
-    const epoch = lane.playback;
-    setTimeout(() => { old.disconnect(); if (meter === lane.meter) meter?.port.postMessage({ type: "fence", id: epoch }); }, FADE_SECONDS * 2000);
+    closePlayback(lane, lane.active, now + FADE_SECONDS, FADE_SECONDS * 2000);
+    setTimeout(() => old.disconnect(), FADE_SECONDS * 2000);
     lane.gain = context.createGain(); lane.gain.connect(lane.meter);
     lane.queueEnd = 0;
   }
@@ -155,7 +178,8 @@ export function createSharedWebAudioIo(options = {}) {
     get outputSelectable() { return selectable(); },
     attach() {
       const port = Object.freeze({ id: ++nextPort });
-      const lane = { port, sink: null, meter: null, gain: null, sources: new Set(), queueEnd: 0, playback: 0 };
+      const lane = { port, sink: null, meter: null, gain: null, sources: new Set(), queueEnd: 0, playback: 0,
+        active: null, closing: new Map(), deferred: null, rendering: false };
       const io = {
         start(sink) {
           lane.sink = sink;
@@ -168,7 +192,16 @@ export function createSharedWebAudioIo(options = {}) {
         },
         play(utterance, chunk, samples, sampleRate) {
           if (!lane.sink || !context || !lane.gain) return;
-          const epoch = ++lane.playback;
+          if (!lane.rendering) {
+            lane.playback++;
+            const startFrame = Math.ceil(Math.max(context.currentTime, lane.queueEnd) * context.sampleRate);
+            lane.active = { id: lane.playback, startFrame, ready: false };
+            lane.meter.port.postMessage({ type: "reset", id: lane.active.id,
+              frame: Math.max(startFrame, ...[...lane.closing.values()].map((past) => past.endFrame)) });
+            lane.rendering = true;
+          }
+          const epoch = lane.active;
+          const played = lane.playback;
           const buffer = context.createBuffer(1, Math.max(samples.length, 1), sampleRate);
           buffer.copyToChannel(samples, 0);
           const source = context.createBufferSource();
@@ -178,8 +211,9 @@ export function createSharedWebAudioIo(options = {}) {
           lane.sources.add(source);
           source.onended = () => {
             lane.sources.delete(source);
+            if (played !== lane.playback) return;
             if (lane.sink) lane.sink.chunkPlayed(utterance, chunk);
-            if (!lane.sources.size) lane.meter?.port.postMessage({ type: "fence", id: epoch });
+            if (!lane.sources.size) { lane.playback++; closePlayback(lane, epoch, lane.queueEnd); }
           };
           source.start(at);
           const started = () => {
@@ -194,6 +228,11 @@ export function createSharedWebAudioIo(options = {}) {
         stop() {
           stopPlayback(lane);
           lane.sink = null;
+          const meter = lane.meter;
+          lane.gain?.disconnect();
+          lane.gain = lane.meter = null;
+          lane.active = null; lane.closing.clear(); lane.deferred = null; lane.rendering = false;
+          setTimeout(() => { meter?.disconnect(); meter?.port.close(); }, FADE_SECONDS * 2000);
           if (![...lanes.values()].some((other) => other.sink)) releaseDevices();
         },
         dispose() {

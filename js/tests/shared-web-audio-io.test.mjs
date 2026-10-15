@@ -14,6 +14,7 @@ function browser() {
       this.port = { close() {}, postMessage: (message) => {
         if (message.type === "route") queueMicrotask(() => this.port.onmessage?.({ data: { type: "routed", generation: message.generation } }));
         if (message.type === "fence") queueMicrotask(() => this.port.onmessage?.({ data: { type: "fence", id: message.id } }));
+        if (message.type === "reset") queueMicrotask(() => this.port.onmessage?.({ data: { type: "reset", id: message.id } }));
       } };
       all.nodes.push(this);
     }
@@ -76,8 +77,9 @@ test("independent playback meters report only their own lane", async () => {
   assert.equal(meters.length, 2);
   a.io.play("a", 0, new Float32Array(160).fill(0.5), 16000);
   b.io.play("b", 0, new Float32Array(160).fill(0.8), 16000);
-  meters[0].port.onmessage({ data: { samples: new Float32Array(160).fill(0.5), endFrame: 160 } });
-  meters[1].port.onmessage({ data: { samples: new Float32Array(160).fill(0.8), endFrame: 160 } });
+  await Promise.resolve();
+  meters[0].port.onmessage({ data: { samples: new Float32Array(160).fill(0.5), startFrame: 0, endFrame: 160 } });
+  meters[1].port.onmessage({ data: { samples: new Float32Array(160).fill(0.8), startFrame: 0, endFrame: 160 } });
   assert.ok(Math.abs(as.events.rendered.at(-1)[0] - 0.5) < 0.001);
   assert.ok(Math.abs(bs.events.rendered.at(-1)[0] - 0.8) < 0.001);
   a.io.stop(); b.io.stop();
@@ -104,4 +106,44 @@ test("capture processor stamps its route before the next 10 ms frame", async () 
   capture.port.onmessage({ data: { type: "route", generation: 10 } });
   for (let i = 0; i < 2; i++) capture.process([[new Float32Array(128).fill(0.2)]]);
   assert.ok(posted.some((message) => message.type === "captured" && message.generation === 10));
+});
+
+test("a cut emits terminal zero before successor playback telemetry", async () => {
+  const physical = browser();
+  const audio = createSharedWebAudioIo();
+  const lane = audio.attach();
+  const heard = sink();
+  lane.io.start(heard);
+  for (let i = 0; i < 5 && !heard.events.ready; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+  const meter = physical.nodes.find((node) => node.name === "sidevoice-playback");
+  lane.io.play("first", 0, new Float32Array(160), 16000);
+  await Promise.resolve();
+  lane.io.stopPlayback();
+  lane.io.play("next", 0, new Float32Array(160), 16000);
+  await Promise.resolve();
+  meter.port.onmessage({ data: { samples: new Float32Array(160).fill(0.8), startFrame: 480, endFrame: 640 } });
+  assert.equal(heard.events.rendered.length, 0, "new telemetry is held behind the old fade");
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(heard.events.ended, 1);
+  assert.ok(Math.abs(heard.events.rendered.at(-1)[0] - 0.8) < 0.001);
+  lane.io.stop();
+});
+
+test("restarting one lane cannot deliver an old meter report to its new sink", async () => {
+  const physical = browser();
+  const audio = createSharedWebAudioIo();
+  const a = audio.attach(); const b = audio.attach();
+  const old = sink(); const other = sink();
+  a.io.start(old); b.io.start(other);
+  for (let i = 0; i < 5 && !old.events.ready; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+  const oldMeter = physical.nodes.find((node) => node.name === "sidevoice-playback");
+  a.io.play("old", 0, new Float32Array(160), 16000);
+  a.io.stop();
+  const next = sink();
+  a.io.start(next);
+  for (let i = 0; i < 5 && !next.events.ready; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+  oldMeter.port.onmessage({ data: { samples: new Float32Array(160).fill(0.9), startFrame: 0, endFrame: 160 } });
+  assert.equal(next.events.rendered.length, 0);
+  assert.equal(other.events.ready, 1);
+  a.io.stop(); b.io.stop();
 });
