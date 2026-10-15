@@ -33,7 +33,7 @@ const models = {
   async load() {
     loaded.push("vad", "transcriber", "speaker");
     return {
-      vad: detector(),
+      createVad: detector,
       transcriber: { transcribe: async () => "" },
       speaker: { speak: async () => ({ samples: new Float32Array(160), sampleRate: 16000 }) },
     };
@@ -116,10 +116,7 @@ const source = {
     asked.push(settings);
     if (settings.stt.model !== "smoke-stt") throw Object.assign(new Error("unknown"), { code: "model-unknown" });
     // A build that comes with an end-of-turn model, for smart-turn.
-    return { load: async () => {
-      const { vad: _vad, ...shared } = await (settings.stt.build === "ends-turns" ? ending : models).load();
-      return { ...shared, createVad: detector };
-    } };
+    return settings.stt.build === "ends-turns" ? ending : models;
   },
 };
 const ending = {

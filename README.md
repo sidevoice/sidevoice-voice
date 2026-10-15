@@ -99,7 +99,7 @@ through wasm-bindgen's structural imports (`src/models/web.rs`); the page wires 
 import init, { VoiceCall } from "@sidevoice/voice";
 
 await init();
-const models = { load: async () => ({ vad, transcriber, speaker /*, endOfTurn */ }) }; // the page's VoiceModels
+const models = { load: async () => ({ createVad: () => newDetector(), transcriber, speaker /*, endOfTurn */ }) }; // the page's VoiceModels
 const call = VoiceCall.create(models, config); // the same configuration, as JSON
 call.onEvent(({ type, data }) => { /* "turn", "state", "level", "playback-level", "error", "take" */ });
 call.start(); // loads the models, asks for the microphone, listens

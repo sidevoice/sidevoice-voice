@@ -15,8 +15,8 @@ class FakeCall {
   onEvent(listener) { this.listener = listener; }
   mute() {}
   start() {
-    this.models.load().then((loaded) => {
-      this.loaded = loaded;
+    this.models.load().then(async (loaded) => {
+      this.loaded = { ...loaded, vad: await loaded.createVad() };
       this.io.start({ ready: () => this.listener({ type: "state", data: { listening: "listening" } }), captured: () => {} });
     });
   }

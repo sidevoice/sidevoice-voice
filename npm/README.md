@@ -20,7 +20,7 @@ import init, { VoiceCall } from "@sidevoice/voice";
 
 await init();
 // The page's models: `load()` answers objects with the methods js/voice-models.d.ts types.
-const models = { load: async () => ({ vad, transcriber, speaker }) };
+const models = { load: async () => ({ createVad: () => newDetector(), transcriber, speaker }) };
 const call = VoiceCall.create(models, { language: "es", voice: "ef_dora", patience: "normal" });
 call.onEvent(({ type, data }) => {
   // "turn", "state", "level", "playback-level", "error" ({ code })

@@ -131,11 +131,7 @@ export function createVoiceHost(source, options = {}) {
         const key = stages(settings);
         const changed = key !== chosen;
         if (changed) await provider(settings);
-        const models = changed ? { load: async () => {
-          const shared = await loaded(settings);
-          const vad = await shared.createVad();
-          return { vad, transcriber: shared.transcriber, speaker: shared.speaker, ...(shared.endOfTurn ? { endOfTurn: shared.endOfTurn } : {}) };
-        } } : null;
+        const models = changed ? { load: () => loaded(settings) } : null;
         const config = {
           language: settings.stt.language ?? null, voice: settings.tts.voice ?? null, speed: settings.tts.speed ?? 1,
           end_of_turn: settings.end_of_turn ?? "silence",

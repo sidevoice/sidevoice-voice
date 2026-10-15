@@ -56,7 +56,7 @@ export interface VoiceModels {
   load(): VoiceLoadedModels | Promise<VoiceLoadedModels>;
 }
 
-/** The models of one call. Without `endOfTurn`, `smart-turn` refuses to start (`end-of-turn-missing`). */
+/** Loaded model resources. `createVad` gives each load a fresh detector stream. Without `endOfTurn`, `smart-turn` refuses to start (`end-of-turn-missing`). */
 export interface VoiceLoadedModels {
   /** A fresh detector stream for every call; loaded weights may be shared. */
   createVad(): VoiceVad | Promise<VoiceVad>;
