@@ -125,8 +125,9 @@ export function createSharedWebAudioIo(options = {}) {
   function outputFor(lane) {
     if (lane.meter) return;
     lane.meter = new AudioWorkletNode(context, "sidevoice-playback", { outputChannelCount: [1] });
+    const meter = lane.meter;
     lane.meter.port.onmessage = ({ data }) => {
-      if (!lane.sink) return;
+      if (!lane.sink || lane.meter !== meter) return;
       if (data?.type === "fence") {
         if (!lane.closing.delete(data.id)) return;
         lane.sink.playbackEnded();
@@ -143,7 +144,7 @@ export function createSharedWebAudioIo(options = {}) {
       if (epoch === lane.active && lane.closing.size > 0) lane.deferred = { id: epoch.id, samples: data.samples };
       else lane.sink.rendered(data.samples);
     };
-    lane.meter.onprocessorerror = () => lane.sink?.failed("audio-output-failed");
+    lane.meter.onprocessorerror = () => { if (lane.meter === meter) lane.sink?.failed("audio-output-failed"); };
     lane.meter.connect(context.destination);
     lane.gain = context.createGain();
     lane.gain.connect(lane.meter);

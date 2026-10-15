@@ -142,6 +142,8 @@ test("restarting one lane cannot deliver an old meter report to its new sink", a
   const next = sink();
   a.io.start(next);
   for (let i = 0; i < 5 && !next.events.ready; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+  a.io.play("new", 0, new Float32Array(160), 16000);
+  await Promise.resolve();
   oldMeter.port.onmessage({ data: { samples: new Float32Array(160).fill(0.9), startFrame: 0, endFrame: 160 } });
   assert.equal(next.events.rendered.length, 0);
   assert.equal(other.events.ready, 1);
