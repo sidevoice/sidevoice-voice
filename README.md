@@ -161,7 +161,7 @@ implementations:
 
 ```js
 const voice = window.__sidevoiceDesktop?.host?.voice ?? createVoiceHost(source); // source: the page's models
-voice.setCaptureBoundary(crypto.randomUUID()); // initial capture target; use a fresh ID on every focus change
+await voice.setCaptureBoundary(crypto.randomUUID()); // initial capture target; use a fresh ID on every focus change
 voice.onTurn((turn) => turn.phase === "finished" && sendWords(turn.turn_id, turn.text)); // the page's to send
 await voice.setSettings({ stt: { ...sttChoice, language: "es" }, tts: { ...ttsChoice, voice: "ef_dora" } }); // choices: the page's
 await voice.start();                                    // resolves once listening; rejects {code}
@@ -190,7 +190,8 @@ What both promise, beyond the types:
   `finished` (the words) or `cancelled`. A turn merged into the next is `cancelled` with `merged`, after that next
   turn's `started`.
   The client assigns a fresh opaque `capture_boundary_id` for the initial focus and every focus change, calling
-  `voice.setCaptureBoundary(id)` (native: `call.set_capture_boundary(id)`) before the next target's turn can start.
+  `await voice.setCaptureBoundary(id)` (native: `call.set_capture_boundary(id).await`) before the next target's turn can
+  start. The operation resolves once voice has applied the boundary, including releasing any held words.
   Each `started`, `finished` and `cancelled` turn event carries the ID active when that turn started. Changing it
   finishes a held transcript under its existing turn ID at once; an earlier open, queued or transcribing turn later
   finishes under that same ID. Subsequent turns cannot merge with turns from a different boundary ID. The client

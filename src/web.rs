@@ -135,8 +135,8 @@ impl WebVoiceCall {
 
     /// Marks a change in the host's capture target without cancelling earlier words.
     #[wasm_bindgen(js_name = setCaptureBoundary)]
-    pub fn set_capture_boundary(&self, id: String) {
-        self.call.set_capture_boundary(id);
+    pub async fn set_capture_boundary(&self, id: String) {
+        self.call.set_capture_boundary(id).await;
     }
 }
 

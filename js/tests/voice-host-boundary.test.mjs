@@ -15,7 +15,7 @@ class TestCall {
   static create() { return TestCall.last = new TestCall(); }
   onEvent(listener) { this.listener = listener; }
   mute() {}
-  setCaptureBoundary(id) { this.boundaries = [...(this.boundaries ?? []), id]; this.boundary = id; }
+  async setCaptureBoundary(id) { this.boundaries = [...(this.boundaries ?? []), id]; this.boundary = id; }
   emit(phase, turn_id, text, capture_boundary_id = this.boundary) {
     this.listener({ type: "turn", data: { phase, turn_id, capture_boundary_id, ...(text ? { text } : {}) } });
   }
@@ -39,13 +39,13 @@ test("host forwards capture boundary and routes each terminal by its started tur
       delivered.push([focus.get(turn.turn_id), turn.text]);
     }
   });
-  host.setCaptureBoundary("initial-a");
+  await host.setCaptureBoundary("initial-a");
   await host.setSettings({ stt: {}, tts: {} });
   const call = TestCall.last;
 
   // A is still in STT when the host changes focus. The terminal can follow B's start.
   call.emit("started", "a-stt");
-  host.setCaptureBoundary("next-b");
+  await host.setCaptureBoundary("next-b");
   selected = "B";
   call.emit("started", "b-stt");
   call.emit("finished", "a-stt", "Private instruction for A.", "initial-a");
@@ -58,9 +58,9 @@ test("host forwards capture boundary and routes each terminal by its started tur
   // A's merge hold releases at the boundary before B starts.
   delivered.length = 0;
   selected = "A";
-  host.setCaptureBoundary("second-a");
+  await host.setCaptureBoundary("second-a");
   call.emit("started", "a-held");
-  host.setCaptureBoundary("second-b");
+  await host.setCaptureBoundary("second-b");
   call.emit("finished", "a-held", "Held words for A.", "second-a");
   selected = "B";
   call.emit("started", "b-held");

@@ -107,8 +107,9 @@ export interface VoiceHost {
   /** Assigns a fresh opaque ID for the initial focus and every change in the host's target for future capture.
    *  Earlier open, transcribing and held turns retain their turn IDs and boundary IDs; no transcript merges across
    *  different IDs. Call before a new turn can start for the new target, including before setSettings. Repeating the
-   *  same ID changes nothing. This does not cancel input or stop the call. */
-  setCaptureBoundary(id: string): void;
+   *  same ID changes nothing. Resolves after voice has applied the boundary: await it before speech can start for the
+   *  new target. This does not cancel input or stop the call. */
+  setCaptureBoundary(id: string): Promise<void>;
   /** For each `turn_id`: `started`, then exactly one `finished` (the words) or `cancelled`. */
   onTurn(listener: (turn: VoiceTurnEvent) => void): () => void;
   /** The state, each time it changes (the first once the call starts). */

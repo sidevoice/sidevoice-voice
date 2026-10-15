@@ -175,7 +175,7 @@ export function createVoiceHost(source, options = {}) {
         call = WasmVoiceCall.create(models, io, config);
         call.onEvent(receive);
         call.mute(muted);
-        if (captureBoundaryId !== null) call.setCaptureBoundary(captureBoundaryId);
+        if (captureBoundaryId !== null) await call.setCaptureBoundary(captureBoundaryId);
       } else if (models) {
         // Other models with the configuration they go with, together: a live call restarts once, on both.
         call.setModels(models, config);
@@ -217,10 +217,10 @@ export function createVoiceHost(source, options = {}) {
       withCall((c) => c.mute(muted));
     },
     cancelInput: () => withCall((c) => c.cancelInput()),
-    setCaptureBoundary(id) {
+    async setCaptureBoundary(id) {
       if (typeof id !== "string" || !id) throw new TypeError("a nonempty capture boundary id");
       captureBoundaryId = id;
-      withCall((c) => c.setCaptureBoundary(id));
+      if (call) await call.setCaptureBoundary(id);
     },
     onTurn: on("turn"),
     onState: on("state"),
