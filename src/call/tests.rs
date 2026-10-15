@@ -421,6 +421,85 @@ fn a_turn_within_the_merge_window_joins_the_one_before() {
     );
 }
 
+fn assert_focus_routing(events: &[Seen]) {
+    let starts: Vec<_> = events
+        .iter()
+        .filter(|turn| turn.phase == TurnPhase::Started)
+        .map(|turn| turn.turn_id.as_str())
+        .collect();
+    assert_eq!(starts, ["c-turn-0", "c-turn-1"]);
+    let target = |id: &str| match id {
+        "c-turn-0" => "A",
+        "c-turn-1" => "B",
+        _ => panic!("unexpected turn {id}"),
+    };
+    let routed: Vec<_> = events
+        .iter()
+        .filter(|turn| turn.phase == TurnPhase::Finished)
+        .map(|turn| (target(&turn.turn_id), turn.text.as_deref(), turn.merged))
+        .collect();
+    assert_eq!(
+        routed,
+        [
+            ("A", Some("Private instruction for A."), false),
+            ("B", Some("Instruction for B."), false),
+        ]
+    );
+    assert!(events.iter().all(|turn| turn.phase != TurnPhase::Cancelled));
+}
+
+#[test]
+fn focus_boundary_during_stt_keeps_both_targets_words() {
+    let mut run = Run::new(VoiceConfig {
+        patience: Patience::Calm,
+        ..config()
+    });
+    run.hear(&speech());
+    run.hear(&silence(3_800));
+    let mut events = Run::turns(&run.effects);
+    let (first, _) = Run::transcribe(&run.take()).expect("A is in transcription");
+
+    run.input(Input::CaptureBoundary);
+    events.extend(Run::turns(&run.take()));
+    run.hear(&speech());
+    run.hear(&silence(3_800));
+    events.extend(Run::turns(&run.take()));
+    run.transcribed(first, "Private instruction for A.");
+    let effects = run.take();
+    events.extend(Run::turns(&effects));
+    let (second, _) = Run::transcribe(&effects).expect("B follows A in STT");
+    run.transcribed(second, "Instruction for B.");
+    run.wait(1_500);
+    events.extend(Run::turns(&run.take()));
+    assert_focus_routing(&events);
+}
+
+#[test]
+fn focus_boundary_during_merge_hold_finishes_a_before_b() {
+    let mut run = Run::new(VoiceConfig {
+        patience: Patience::Calm,
+        ..config()
+    });
+    run.hear(&speech());
+    run.hear(&silence(3_800));
+    let mut events = Run::turns(&run.effects);
+    let (first, _) = Run::transcribe(&run.take()).expect("A transcribes");
+    run.transcribed(first, "Private instruction for A.");
+    assert!(Run::turns(&run.take()).is_empty(), "A is held");
+
+    run.input(Input::CaptureBoundary);
+    events.extend(Run::turns(&run.take()));
+    run.hear(&speech());
+    run.hear(&silence(3_800));
+    let effects = run.take();
+    events.extend(Run::turns(&effects));
+    let (second, _) = Run::transcribe(&effects).expect("B transcribes");
+    run.transcribed(second, "Instruction for B.");
+    run.wait(1_500);
+    events.extend(Run::turns(&run.take()));
+    assert_focus_routing(&events);
+}
+
 #[test]
 fn speech_over_a_reply_interrupts_it_and_drops_the_queue() {
     let mut run = Run::new(config());

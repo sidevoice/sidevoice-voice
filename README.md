@@ -111,7 +111,7 @@ const outcome = await saying.outcome; // { status: "heard" | "heard-up-to" | "no
 
 `onEvent(listener)` hears the same events as `{type, data}`; `say(text, options)` answers a `Saying` (`id`,
 `cancel()`, `onEvent(listener)` for its steps, and `outcome`, a promise); `setConfig`, `setModels`, `mute`,
-`cancelInput`, `start` and `stop` mirror the Rust methods (`src/web.rs`). The microphone is `getUserMedia` with the
+`cancelInput`, `captureBoundary`, `start` and `stop` mirror the Rust methods (`src/web.rs`). The microphone is `getUserMedia` with the
 browser's echo cancellation, noise suppression and gain control, brought to 16 kHz mono in an AudioWorklet; the speaker
 is Web Audio (`js/web-audio-io.js`). `VoiceCall.create(models, config, {inputDevice, outputDevice})` captures from another
 microphone, and plays on another output where
@@ -188,6 +188,13 @@ What both promise, beyond the types:
   own `turn_id`: `started` comes before exactly one
   `finished` (the words) or `cancelled`. A turn merged into the next is `cancelled` with `merged`, after that next
   turn's `started`.
+  When the host changes the target for future speech, it calls `voice.captureBoundary()` (native:
+  `call.capture_boundary()`) before the next target's turn can start. The operation has no arguments or return value:
+  its local generation is opaque and carries no room or conversation policy. It finishes a held transcript under its
+  existing turn ID at once, and an earlier open, queued or transcribing turn later finishes under that same ID.
+  Subsequent turns cannot merge with those earlier turns. The host retains each `turn_id` to captured-target
+  association from `started` through `finished` or `cancelled`, even when the call stays running during focus change.
+  Calling the boundary does not cancel input, stop the call, or change the target of an already started turn.
   The state says `speaking` while the person speaks in an open turn, and `listening` again when they pause in it (their
   speech stopped, as the detector decides it) or it ends; its end shows as `recognising` rises.
 - **A take** (`VoiceTake`) is what the microphone gave from the moment the call listened until that listening ended,

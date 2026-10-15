@@ -215,6 +215,7 @@ export function createVoiceHost(source, options = {}) {
       withCall((c) => c.mute(muted));
     },
     cancelInput: () => withCall((c) => c.cancelInput()),
+    captureBoundary: () => withCall((c) => c.captureBoundary()),
     onTurn: on("turn"),
     onState: on("state"),
     onLevel: on("level"),

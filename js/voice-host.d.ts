@@ -104,6 +104,10 @@ export interface VoiceHost {
   mute(muted: boolean): void;
   /** Cancels what the person said that is not told yet. */
   cancelInput(): void;
+  /** Marks a change in the host's target for future capture. Earlier open, transcribing and held turns retain their
+   *  turn IDs and finish with their own words; no transcript merges across this boundary. Call on every focus change,
+   *  before a new turn can start for the new target. This does not cancel input or stop the call. */
+  captureBoundary(): void;
   /** For each `turn_id`: `started`, then exactly one `finished` (the words) or `cancelled`. */
   onTurn(listener: (turn: VoiceTurnEvent) => void): () => void;
   /** The state, each time it changes (the first once the call starts). */

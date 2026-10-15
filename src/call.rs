@@ -21,7 +21,7 @@ use crate::event::{
     VoiceEvent,
 };
 use crate::playback::{Action, Playback};
-use crate::recognition::{accepted, Job, Outcome, Recognition};
+use crate::recognition::{accepted, Job, Outcome, Pending, Recognition};
 use crate::say::{SayEvent, SayOutcome, StopReason};
 use crate::take::{TakePause, TakeTurn};
 use crate::turns::{duration_ms, Segment, Segmentation, Segmenter, SILENCE_STOP_MS};
@@ -74,6 +74,8 @@ pub(crate) enum Input {
     MicrophoneMuted(bool),
     /// The person cancels what they said that is not reported yet.
     Cancel,
+    /// The host changed capture target; keep earlier turns but end their merge window.
+    CaptureBoundary,
     /// What the end-of-turn model said of a turn's pause: the probability that the turn is over, or the stable code
     /// of why there is none.
     EndOfTurn {
@@ -130,6 +132,7 @@ pub(crate) enum Effect {
 #[derive(Debug)]
 struct Turn {
     id: String,
+    boundary: u64,
     started_ms: u64,
     ended_ms: Option<u64>,
     audio_ms: u64,
@@ -156,6 +159,8 @@ pub(crate) struct Call {
     open: Option<usize>,
     turns: HashMap<usize, Turn>,
     next_turn: usize,
+    /// Opaque local merge generation; only the host decides when to advance it.
+    capture_boundary: u64,
     recognition: Recognition,
     playback: Playback,
     /// A chunk ended while its utterance still has audio; the next chunk may be contiguous.
@@ -186,6 +191,7 @@ impl Call {
             open: None,
             turns: HashMap::new(),
             next_turn: 0,
+            capture_boundary: 0,
             recognition: Recognition::default(),
             playback: Playback::default(),
             continuing_chunk: None,
@@ -281,6 +287,7 @@ impl Call {
             }
             Input::MicrophoneMuted(muted) => self.microphone_muted = muted,
             Input::Cancel => self.cancel_input(now, &mut out),
+            Input::CaptureBoundary => self.capture_boundary(now, &mut out),
             Input::EndOfTurn {
                 turn,
                 pause,
@@ -388,6 +395,7 @@ impl Call {
                     number,
                     Turn {
                         id: id.clone(),
+                        boundary: self.capture_boundary,
                         started_ms: now,
                         ended_ms: None,
                         audio_ms: 0,
@@ -504,7 +512,11 @@ impl Call {
                     record.recognised_ms = Some(now);
                 }
                 let merge = u64::from(self.config.patience.merge_window_ms());
-                if merge == 0 {
+                if merge == 0
+                    || self.turns.get(&turn).is_some_and(|record| {
+                        record.boundary != self.capture_boundary
+                    })
+                {
                     self.close_turn(now, turn, Some(text), false, out);
                 } else if let Outcome::Joined(joined) =
                     self.recognition.hold(turn, text, now + merge)
@@ -529,6 +541,25 @@ impl Call {
         for turn in turns {
             self.close_turn(now, turn, None, false, out);
         }
+    }
+
+    fn capture_boundary(&mut self, now: u64, out: &mut Vec<Effect>) {
+        if let Some(pending) = self.recognition.take_pending() {
+            self.finish_pending(now, pending, out);
+        }
+        self.capture_boundary = self.capture_boundary.wrapping_add(1);
+    }
+
+    fn finish_pending(&mut self, now: u64, pending: Pending, out: &mut Vec<Effect>) {
+        let (last, earlier) = pending.turns.split_last().expect("a held transcript");
+        let merged = !earlier.is_empty();
+        if let Some(first) = earlier.first().and_then(|first| self.turns.get(first)) {
+            let started = first.started_ms;
+            if let Some(turn) = self.turns.get_mut(last) {
+                turn.started_ms = started;
+            }
+        }
+        self.close_turn(now, *last, Some(pending.text), merged, out);
     }
 
     fn stop(&mut self, now: u64, out: &mut Vec<Effect>) {
@@ -602,15 +633,7 @@ impl Call {
     fn settle(&mut self, now: u64, out: &mut Vec<Effect>) {
         let speaking = self.segmenter.speaking();
         if let Some(pending) = self.recognition.due(now, speaking) {
-            let (last, earlier) = pending.turns.split_last().expect("a held transcript");
-            let merged = !earlier.is_empty();
-            if let Some(first) = earlier.first().and_then(|first| self.turns.get(first)) {
-                let started = first.started_ms;
-                if let Some(turn) = self.turns.get_mut(last) {
-                    turn.started_ms = started;
-                }
-            }
-            self.close_turn(now, *last, Some(pending.text), merged, out);
+            self.finish_pending(now, pending, out);
         }
         if self.quiet(speaking) && now >= self.quiet_until && !self.playback.busy() {
             let mut actions = Vec::new();
