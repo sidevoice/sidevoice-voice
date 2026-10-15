@@ -18,7 +18,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures_channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
-use futures_channel::oneshot;
 use futures_util::future::{abortable, ready, select, AbortHandle, Either};
 use futures_util::{stream, Stream, StreamExt};
 
@@ -78,7 +77,6 @@ pub(crate) enum Message {
     CancelSay(String),
     Mute(bool),
     CancelInput,
-    SetCaptureBoundary(String, oneshot::Sender<()>),
     Models(Arc<dyn VoiceModels>, Box<VoiceConfig>),
     Io(u64, IoEvent),
     Rendered(u64),
@@ -211,14 +209,6 @@ impl VoiceCall {
     /// Cancels what the person said that is not reported yet.
     pub fn cancel_input(&self) {
         self.send(Message::CancelInput);
-    }
-
-    /// Ends the current merge window without dropping an open, queued or transcribing turn. Call when the host
-    /// changes the target of future capture; earlier words still finish under their original turn IDs.
-    pub async fn set_capture_boundary(&self, id: String) {
-        let (answered, received) = oneshot::channel();
-        self.send(Message::SetCaptureBoundary(id, answered));
-        let _ = received.await;
     }
 
     fn send(&self, message: Message) {
@@ -442,10 +432,6 @@ impl Driver {
                 self.input(Input::Mute(muted));
             }
             Message::CancelInput => self.input(Input::Cancel),
-            Message::SetCaptureBoundary(id, answered) => {
-                self.input(Input::SetCaptureBoundary(id));
-                let _ = answered.send(());
-            }
             Message::Io(generation, _) if generation != self.generation => {}
             Message::Rendered(generation) => {
                 let frame = self

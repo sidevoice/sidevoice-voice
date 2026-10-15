@@ -237,18 +237,6 @@ fn rendered_boundaries_precede_qualifying_capture_even_when_the_driver_is_delaye
             .count(),
         1
     );
-    let cuts: Vec<_> = effects
-        .iter()
-        .filter_map(|effect| match effect {
-            Effect::Event(VoiceEvent::AgentInterrupted(cut)) => Some((cut.heard_until, cut.played)),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        cuts,
-        [(heard, true)],
-        "the completed chunk was rendered before the cut"
-    );
     assert!(effects.iter().any(|effect| matches!(effect, Effect::Say { event: SayEvent::Done { outcome: crate::say::SayOutcome::HeardUpTo { heard_chars, reason: crate::say::StopReason::BargeIn } }, .. } if *heard_chars == heard)));
 }
 
@@ -347,7 +335,6 @@ fn recorded_speaker_echo_cannot_start_a_turn_but_a_person_over_it_can() {
         Effect::Event(VoiceEvent::Turn(_))
             | Effect::Transcribe { .. }
             | Effect::StopPlayback
-            | Effect::Event(VoiceEvent::AgentInterrupted(_))
     )));
     let person = scenario(true);
     assert!(person.iter().any(|effect| matches!(

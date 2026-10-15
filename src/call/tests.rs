@@ -26,7 +26,6 @@ enum TurnPhase {
 #[derive(Debug, Clone)]
 struct Seen {
     turn_id: String,
-    capture_boundary_id: String,
     phase: TurnPhase,
     text: Option<String>,
     language: Option<String>,
@@ -136,11 +135,9 @@ impl Run {
                 Effect::Event(VoiceEvent::Turn(turn)) => Some(match turn.clone() {
                     TurnEvent::Started {
                         turn_id,
-                        capture_boundary_id,
                         started_at,
                     } => Seen {
                         turn_id,
-                        capture_boundary_id,
                         phase: TurnPhase::Started,
                         text: None,
                         language: None,
@@ -151,7 +148,6 @@ impl Run {
                     },
                     TurnEvent::Finished {
                         turn_id,
-                        capture_boundary_id,
                         text,
                         language,
                         started_at,
@@ -160,7 +156,6 @@ impl Run {
                         timings,
                     } => Seen {
                         turn_id,
-                        capture_boundary_id,
                         phase: TurnPhase::Finished,
                         text: Some(text),
                         language,
@@ -171,11 +166,9 @@ impl Run {
                     },
                     TurnEvent::Cancelled {
                         turn_id,
-                        capture_boundary_id,
                         merged,
                     } => Seen {
                         turn_id,
-                        capture_boundary_id,
                         phase: TurnPhase::Cancelled,
                         text: None,
                         language: None,
@@ -431,117 +424,55 @@ fn a_turn_within_the_merge_window_joins_the_one_before() {
     );
 }
 
-fn assert_focus_routing(events: &[Seen]) {
-    let starts: Vec<_> = events
-        .iter()
-        .filter(|turn| turn.phase == TurnPhase::Started)
-        .map(|turn| turn.turn_id.as_str())
-        .collect();
-    assert_eq!(starts, ["c-turn-0", "c-turn-1"]);
-    let target = |id: &str, boundary: &str| match (id, boundary) {
-        ("c-turn-0", "focus-a") => "A",
-        ("c-turn-1", "focus-b") => "B",
-        _ => panic!("unexpected turn {id}"),
-    };
-    let routed: Vec<_> = events
-        .iter()
-        .filter(|turn| turn.phase == TurnPhase::Finished)
-        .map(|turn| {
-            (
-                target(&turn.turn_id, &turn.capture_boundary_id),
-                turn.text.as_deref(),
-                turn.merged,
-            )
-        })
-        .collect();
-    assert_eq!(
-        routed,
-        [
-            ("A", Some("Private instruction for A."), false),
-            ("B", Some("Instruction for B."), false),
-        ]
-    );
-    assert!(events.iter().all(|turn| turn.phase != TurnPhase::Cancelled));
+#[test]
+fn two_calls_keep_transcription_and_merge_queues_separate() {
+    let config = VoiceConfig { patience: Patience::Calm, ..config() };
+    let mut a = Run::new(config.clone());
+    let mut b = Run::new(config);
+    a.hear(&speech());
+    b.hear(&silence(1_000));
+    a.hear(&silence(3_800));
+    let a_effects = a.take();
+    let (a_turn, _) = Run::transcribe(&a_effects).expect("A transcribes");
+    a.transcribed(a_turn, "Private instruction for A.");
+    assert!(Run::turns(&a.take()).is_empty(), "A holds its own merge window");
+    b.hear(&speech());
+    b.hear(&silence(3_800));
+    let b_effects = b.take();
+    let (b_turn, _) = Run::transcribe(&b_effects).expect("B transcribes");
+    b.transcribed(b_turn, "Instruction for B.");
+    a.wait(1_500);
+    b.wait(1_500);
+    let a_terminal = Run::turns(&a.take());
+    let b_terminal = Run::turns(&b.take());
+    assert_eq!(a_terminal.len(), 1);
+    assert_eq!(b_terminal.len(), 1);
+    assert_eq!(a_terminal[0].text.as_deref(), Some("Private instruction for A."));
+    assert_eq!(b_terminal[0].text.as_deref(), Some("Instruction for B."));
+    assert!(!a_terminal[0].merged && !b_terminal[0].merged);
 }
 
 #[test]
-fn focus_boundary_during_stt_keeps_both_targets_words() {
-    let mut run = Run::new(VoiceConfig {
-        patience: Patience::Calm,
-        ..config()
-    });
-    run.input(Input::SetCaptureBoundary("focus-a".into()));
+fn resumed_audio_within_patience_continues_the_same_turn() {
+    let mut run = Run::new(config());
     run.hear(&speech());
-    run.hear(&silence(3_800));
-    let mut events = Run::turns(&run.effects);
-    let (first, _) = Run::transcribe(&run.take()).expect("A is in transcription");
-
-    run.input(Input::SetCaptureBoundary("focus-b".into()));
-    events.extend(Run::turns(&run.take()));
+    let first = Run::turns(&run.take());
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].phase, TurnPhase::Started);
+    run.hear(&silence(1_000));
+    assert!(Run::transcribe(&run.take()).is_none(), "silence does not force an endpoint");
     run.hear(&speech());
-    run.hear(&silence(3_800));
-    events.extend(Run::turns(&run.take()));
-    run.transcribed(first, "Private instruction for A.");
+    assert!(Run::turns(&run.take()).is_empty(), "same open turn resumes");
+    run.hear(&silence(3_000));
     let effects = run.take();
-    events.extend(Run::turns(&effects));
-    let (second, _) = Run::transcribe(&effects).expect("B follows A in STT");
-    run.transcribed(second, "Instruction for B.");
-    run.wait(1_500);
-    events.extend(Run::turns(&run.take()));
-    assert_focus_routing(&events);
-}
-
-#[test]
-fn focus_boundary_during_merge_hold_finishes_a_before_b() {
-    let mut run = Run::new(VoiceConfig {
-        patience: Patience::Calm,
-        ..config()
-    });
-    run.input(Input::SetCaptureBoundary("focus-a".into()));
-    run.hear(&speech());
-    run.hear(&silence(3_800));
-    let mut events = Run::turns(&run.effects);
-    let (first, _) = Run::transcribe(&run.take()).expect("A transcribes");
-    run.transcribed(first, "Private instruction for A.");
-    assert!(Run::turns(&run.take()).is_empty(), "A is held");
-
-    run.input(Input::SetCaptureBoundary("focus-b".into()));
-    events.extend(Run::turns(&run.take()));
-    run.hear(&speech());
-    run.hear(&silence(3_800));
-    let effects = run.take();
-    events.extend(Run::turns(&effects));
-    let (second, _) = Run::transcribe(&effects).expect("B transcribes");
-    run.transcribed(second, "Instruction for B.");
-    run.wait(1_500);
-    events.extend(Run::turns(&run.take()));
-    assert_focus_routing(&events);
-}
-
-#[test]
-fn focus_boundary_ends_open_audio_without_discarding_a_or_capturing_b() {
-    let mut run = Run::new(VoiceConfig {
-        patience: Patience::Calm,
-        ..config()
-    });
-    run.input(Input::SetCaptureBoundary("focus-a".into()));
-    run.hear(&speech());
-    let mut events = Run::turns(&run.take());
-    assert_eq!(events.len(), 1, "A started but has not ended");
-    run.input(Input::SetCaptureBoundary("focus-b".into()));
-    let effects = run.take();
-    let (first, _) = Run::transcribe(&effects).expect("A's captured audio is transcribed");
-    run.hear(&speech());
-    run.hear(&silence(3_800));
-    events.extend(Run::turns(&run.take()));
-    run.transcribed(first, "Private instruction for A.");
-    let effects = run.take();
-    events.extend(Run::turns(&effects));
-    let (second, _) = Run::transcribe(&effects).expect("B's separate audio is transcribed");
-    run.transcribed(second, "Instruction for B.");
-    run.wait(1_500);
-    events.extend(Run::turns(&run.take()));
-    assert_focus_routing(&events);
+    let (turn, _) = Run::transcribe(&effects).expect("normal silence endpoint");
+    assert_eq!(turn, 0);
+    run.transcribed(turn, "Both parts of the same turn.");
+    run.wait(500);
+    let terminal = Run::turns(&run.take());
+    assert_eq!(terminal.len(), 1);
+    assert_eq!(terminal[0].turn_id, first[0].turn_id);
+    assert_eq!(terminal[0].text.as_deref(), Some("Both parts of the same turn."));
 }
 
 #[test]
@@ -575,16 +506,6 @@ fn speech_over_a_reply_interrupts_it_and_drops_the_queue() {
             ("u2".into(), PlaybackStatus::Unplayed, 0),
         ]
     );
-    let cuts: Vec<_> = effects
-        .iter()
-        .filter_map(|effect| match effect {
-            Effect::Event(VoiceEvent::AgentInterrupted(cut)) => {
-                Some((cut.utterance_id.as_str(), cut.heard_until, cut.played))
-            }
-            _ => None,
-        })
-        .collect();
-    assert_eq!(cuts, [("u1", 24, true), ("u2", 0, false)]);
     // A chunk the output reports after the stop changes nothing.
     run.played("u1", 1);
     assert!(Run::playbacks(&run.take()).is_empty());
@@ -657,7 +578,6 @@ fn locally_late_accepted_reply_is_settled_during_speech_pause_and_recognition() 
                     }
                 )]
             );
-            assert!(effects.iter().any(|effect| matches!(effect, Effect::Event(VoiceEvent::AgentInterrupted(cut)) if cut.utterance_id == id && !cut.played && cut.heard_until == 0)));
             assert!(Run::synthesize(&effects).is_empty());
         }
         run.hear(&silence(3_000));
@@ -1399,9 +1319,6 @@ fn skipping_sounding_reply_keeps_two_successors_in_fifo_without_a_turn() {
         .iter()
         .any(|(id, _, _)| id == "second"));
     assert!(Run::turns(&effects).is_empty());
-    assert!(!effects
-        .iter()
-        .any(|effect| matches!(effect, Effect::Event(VoiceEvent::AgentInterrupted(_)))));
     run.sound("second", 0);
     run.played("second", 0);
     let effects = run.take();

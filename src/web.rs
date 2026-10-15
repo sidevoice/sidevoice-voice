@@ -148,11 +148,6 @@ impl WebVoiceCall {
         self.call.cancel_input();
     }
 
-    /// Marks a change in the host's capture target without cancelling earlier words.
-    #[wasm_bindgen(js_name = setCaptureBoundary)]
-    pub async fn set_capture_boundary(&self, id: String) {
-        self.call.set_capture_boundary(id).await;
-    }
 }
 
 /// Something the call is saying, for JavaScript: its `id`, `cancel()`, `onEvent(listener)` for its steps in order

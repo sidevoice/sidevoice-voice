@@ -318,23 +318,6 @@ impl Segmenter {
         still.then(|| self.end(silence_ms))
     }
 
-    /// Ends speech already captured for an old host target, or clears its tentative pre-roll. Future windows may
-    /// start a new turn without carrying audio across the target boundary.
-    pub(crate) fn capture_boundary(&mut self) -> Option<Segment> {
-        self.activity.reset();
-        self.barge_run = 0;
-        self.was_playing = false;
-        self.start_run = 0;
-        let silence_ms = self.open.as_ref().map(|open| open.silent / PER_MS);
-        match silence_ms {
-            Some(silence_ms) => Some(self.end(silence_ms)),
-            None => {
-                self.recent.clear();
-                None
-            }
-        }
-    }
-
     /// Drops the open turn and the audio before it; the speech going on is not heard again until it starts anew.
     pub(crate) fn cancel(&mut self) {
         self.open = None;

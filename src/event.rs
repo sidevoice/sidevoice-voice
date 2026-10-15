@@ -18,23 +18,12 @@ pub enum VoiceEvent {
     Level(f32),
     /// The rendered speaker's smoothed level, from 0 to 1, once per detector window, with a terminal zero.
     PlaybackLevel(f32),
-    /// A confirmed user turn stopped this say. `heard_until` is the completed Unicode-scalar chunk boundary;
-    /// `played` is false and the boundary is zero when it never sounded.
-    AgentInterrupted(AgentInterrupted),
     /// Something failed that a person may be told, as a stable code.
     Error(VoiceError),
     /// What the microphone gave since the call listened, with where the turns fell in it: once each stretch of
     /// listening of a start that asked for a take ends (a stop, a failure, a restart on other models), before the error
     /// that ended it and before the state that says the call stopped.
     Take(Take),
-}
-
-/// A say displaced by a confirmed spoken turn, derived from its terminal [`crate::SayOutcome`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct AgentInterrupted {
-    pub utterance_id: String,
-    pub heard_until: usize,
-    pub played: bool,
 }
 
 /// One step of a turn of the person's speech, under the call's own id for the turn.
@@ -44,15 +33,12 @@ pub enum TurnEvent {
     /// The person started speaking.
     Started {
         turn_id: String,
-        /// Opaque host-supplied equality fence for the turn's capture target.
-        capture_boundary_id: String,
         /// When, in Unix milliseconds.
         started_at: u64,
     },
     /// The turn's transcript is final: what the person said.
     Finished {
         turn_id: String,
-        capture_boundary_id: String,
         text: String,
         /// The language the transcript is in, when the transcriber was told one.
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -69,7 +55,6 @@ pub enum TurnEvent {
     /// (`merged`).
     Cancelled {
         turn_id: String,
-        capture_boundary_id: String,
         merged: bool,
     },
 }

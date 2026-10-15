@@ -16,10 +16,7 @@ mod tests;
 use std::collections::{HashMap, VecDeque};
 
 use crate::config::{EndOfTurn, VoiceConfig};
-use crate::event::{
-    AgentInterrupted, CallState, Listening, Microphone, TurnEvent, TurnTimings, VoiceError,
-    VoiceEvent,
-};
+use crate::event::{CallState, Listening, Microphone, TurnEvent, TurnTimings, VoiceError, VoiceEvent};
 use crate::playback::{Action, Playback};
 use crate::recognition::{accepted, Job, Outcome, Pending, Recognition};
 use crate::say::{SayEvent, SayOutcome, StopReason};
@@ -74,8 +71,6 @@ pub(crate) enum Input {
     MicrophoneMuted(bool),
     /// The person cancels what they said that is not reported yet.
     Cancel,
-    /// The host changed capture target; keep earlier turns but end their merge window.
-    SetCaptureBoundary(String),
     /// What the end-of-turn model said of a turn's pause: the probability that the turn is over, or the stable code
     /// of why there is none.
     EndOfTurn {
@@ -132,7 +127,6 @@ pub(crate) enum Effect {
 #[derive(Debug)]
 struct Turn {
     id: String,
-    capture_boundary_id: String,
     started_ms: u64,
     ended_ms: Option<u64>,
     audio_ms: u64,
@@ -159,8 +153,6 @@ pub(crate) struct Call {
     open: Option<usize>,
     turns: HashMap<usize, Turn>,
     next_turn: usize,
-    /// Opaque local merge generation; only the host decides when to advance it.
-    capture_boundary_id: String,
     recognition: Recognition,
     playback: Playback,
     /// A chunk ended while its utterance still has audio; the next chunk may be contiguous.
@@ -191,7 +183,6 @@ impl Call {
             open: None,
             turns: HashMap::new(),
             next_turn: 0,
-            capture_boundary_id: String::new(),
             recognition: Recognition::default(),
             playback: Playback::default(),
             continuing_chunk: None,
@@ -287,7 +278,6 @@ impl Call {
             }
             Input::MicrophoneMuted(muted) => self.microphone_muted = muted,
             Input::Cancel => self.cancel_input(now, &mut out),
-            Input::SetCaptureBoundary(id) => self.set_capture_boundary(now, id, &mut out),
             Input::EndOfTurn {
                 turn,
                 pause,
@@ -395,7 +385,6 @@ impl Call {
                     number,
                     Turn {
                         id: id.clone(),
-                        capture_boundary_id: self.capture_boundary_id.clone(),
                         started_ms: now,
                         ended_ms: None,
                         audio_ms: 0,
@@ -407,7 +396,6 @@ impl Call {
                 self.open = Some(number);
                 out.push(Effect::Event(VoiceEvent::Turn(TurnEvent::Started {
                     turn_id: id,
-                    capture_boundary_id: self.capture_boundary_id.clone(),
                     started_at: self.epoch_unix_ms + now,
                 })));
                 let mut actions = Vec::new();
@@ -513,11 +501,7 @@ impl Call {
                     record.recognised_ms = Some(now);
                 }
                 let merge = u64::from(self.config.patience.merge_window_ms());
-                if merge == 0
-                    || self.turns.get(&turn).is_some_and(|record| {
-                        record.capture_boundary_id != self.capture_boundary_id
-                    })
-                {
+                if merge == 0 {
                     self.close_turn(now, turn, Some(text), false, out);
                 } else if let Outcome::Joined(joined) =
                     self.recognition.hold(turn, text, now + merge)
@@ -542,19 +526,6 @@ impl Call {
         for turn in turns {
             self.close_turn(now, turn, None, false, out);
         }
-    }
-
-    fn set_capture_boundary(&mut self, now: u64, id: String, out: &mut Vec<Effect>) {
-        if id == self.capture_boundary_id {
-            return;
-        }
-        if let Some(segment) = self.segmenter.capture_boundary() {
-            self.segment(now, segment, out);
-        }
-        if let Some(pending) = self.recognition.take_pending() {
-            self.finish_pending(now, pending, out);
-        }
-        self.capture_boundary_id = id;
     }
 
     fn finish_pending(&mut self, now: u64, pending: Pending, out: &mut Vec<Effect>) {
@@ -689,7 +660,6 @@ impl Call {
                 let ended = turn.ended_ms.unwrap_or(now);
                 TurnEvent::Finished {
                     turn_id: turn.id,
-                    capture_boundary_id: turn.capture_boundary_id,
                     language: self.config.language.clone(),
                     text,
                     started_at: self.epoch_unix_ms + turn.started_ms,
@@ -704,7 +674,6 @@ impl Call {
             }
             None => TurnEvent::Cancelled {
                 turn_id: turn.id,
-                capture_boundary_id: turn.capture_boundary_id,
                 merged,
             },
         };
@@ -739,37 +708,7 @@ impl Call {
                     sample_rate,
                 },
                 Action::Stop => Effect::StopPlayback,
-                Action::Say { utterance, event } => {
-                    let interrupted = match &event {
-                        SayEvent::Done {
-                            outcome:
-                                SayOutcome::HeardUpTo {
-                                    heard_chars,
-                                    reason: StopReason::BargeIn,
-                                },
-                        } => Some((*heard_chars, true)),
-                        SayEvent::Done {
-                            outcome:
-                                SayOutcome::NotPlayed {
-                                    reason: StopReason::BargeIn,
-                                },
-                        } => Some((0, false)),
-                        _ => None,
-                    };
-                    if let Some((heard_until, played)) = interrupted {
-                        out.push(Effect::Event(VoiceEvent::AgentInterrupted(
-                            AgentInterrupted {
-                                utterance_id: utterance.clone(),
-                                heard_until,
-                                played,
-                            },
-                        )));
-                    }
-                    Effect::Say {
-                        id: utterance,
-                        event,
-                    }
-                }
+                Action::Say { utterance, event } => Effect::Say { id: utterance, event },
                 Action::Error(code) => Effect::Event(VoiceEvent::Error(VoiceError { code })),
             };
             out.push(effect);
