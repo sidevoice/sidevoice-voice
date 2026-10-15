@@ -103,15 +103,13 @@ impl VoiceModels for SharedModels {
             }
         };
         let vad = lease.models.vad.new_stream().await?;
+        let has_end_of_turn = lease.models.end_of_turn.is_some();
         Ok(Models {
             vad,
             transcriber: Arc::new(LeasedTranscriber(Arc::clone(&lease))),
             speaker: Arc::new(LeasedSpeaker(Arc::clone(&lease))),
-            end_of_turn: lease
-                .models
-                .end_of_turn
-                .as_ref()
-                .map(|_| Arc::new(LeasedEndOfTurn(lease)) as Arc<dyn EndOfTurnModel>),
+            end_of_turn: has_end_of_turn
+                .then(|| Arc::new(LeasedEndOfTurn(lease)) as Arc<dyn EndOfTurnModel>),
         })
     }
 }
