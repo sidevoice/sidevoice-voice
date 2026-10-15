@@ -164,10 +164,7 @@ impl Run {
                         ended_at: Some(ended_at),
                         timings: Some(timings),
                     },
-                    TurnEvent::Cancelled {
-                        turn_id,
-                        merged,
-                    } => Seen {
+                    TurnEvent::Cancelled { turn_id, merged } => Seen {
                         turn_id,
                         phase: TurnPhase::Cancelled,
                         text: None,
@@ -426,7 +423,10 @@ fn a_turn_within_the_merge_window_joins_the_one_before() {
 
 #[test]
 fn two_calls_keep_transcription_and_merge_queues_separate() {
-    let config = VoiceConfig { patience: Patience::Calm, ..config() };
+    let config = VoiceConfig {
+        patience: Patience::Calm,
+        ..config()
+    };
     let mut a = Run::new(config.clone());
     let mut b = Run::new(config);
     a.hear(&speech());
@@ -435,7 +435,10 @@ fn two_calls_keep_transcription_and_merge_queues_separate() {
     let a_effects = a.take();
     let (a_turn, _) = Run::transcribe(&a_effects).expect("A transcribes");
     a.transcribed(a_turn, "Private instruction for A.");
-    assert!(Run::turns(&a.take()).is_empty(), "A holds its own merge window");
+    assert!(
+        Run::turns(&a.take()).is_empty(),
+        "A holds its own merge window"
+    );
     b.hear(&speech());
     b.hear(&silence(3_800));
     let b_effects = b.take();
@@ -447,7 +450,10 @@ fn two_calls_keep_transcription_and_merge_queues_separate() {
     let b_terminal = Run::turns(&b.take());
     assert_eq!(a_terminal.len(), 1);
     assert_eq!(b_terminal.len(), 1);
-    assert_eq!(a_terminal[0].text.as_deref(), Some("Private instruction for A."));
+    assert_eq!(
+        a_terminal[0].text.as_deref(),
+        Some("Private instruction for A.")
+    );
     assert_eq!(b_terminal[0].text.as_deref(), Some("Instruction for B."));
     assert!(!a_terminal[0].merged && !b_terminal[0].merged);
 }
@@ -460,7 +466,10 @@ fn resumed_audio_within_patience_continues_the_same_turn() {
     assert_eq!(first.len(), 1);
     assert_eq!(first[0].phase, TurnPhase::Started);
     run.hear(&silence(1_000));
-    assert!(Run::transcribe(&run.take()).is_none(), "silence does not force an endpoint");
+    assert!(
+        Run::transcribe(&run.take()).is_none(),
+        "silence does not force an endpoint"
+    );
     run.hear(&speech());
     assert!(Run::turns(&run.take()).is_empty(), "same open turn resumes");
     run.hear(&silence(3_000));
@@ -472,7 +481,10 @@ fn resumed_audio_within_patience_continues_the_same_turn() {
     let terminal = Run::turns(&run.take());
     assert_eq!(terminal.len(), 1);
     assert_eq!(terminal[0].turn_id, first[0].turn_id);
-    assert_eq!(terminal[0].text.as_deref(), Some("Both parts of the same turn."));
+    assert_eq!(
+        terminal[0].text.as_deref(),
+        Some("Both parts of the same turn.")
+    );
 }
 
 #[test]

@@ -9,6 +9,9 @@
 
 mod web;
 
+#[cfg(test)]
+mod tests;
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -24,6 +27,36 @@ pub(crate) use web::JsVoiceModels;
 pub trait VoiceModels: MaybeSend + MaybeSync {
     /// The models, loaded and ready; a stable code when one cannot be.
     async fn load(&self) -> Result<Models, String>;
+}
+
+/// Creates a fresh detector stream from one loaded detector model. Its weights may be shared, but a stream's
+/// recurrent/window state belongs to one call.
+#[cfg_attr(native, async_trait)]
+#[cfg_attr(web, async_trait(?Send))]
+pub trait VadFactory: MaybeSend + MaybeSync {
+    async fn new_stream(&self) -> Result<Box<dyn Vad>, String>;
+}
+
+/// Already-loaded models reusable by several calls. Each call gets its own VAD stream; the other interfaces are
+/// shared. Providers whose inference instances are not reentrant serialize their own requests.
+pub struct SharedModels {
+    pub vad: Arc<dyn VadFactory>,
+    pub transcriber: Arc<dyn Transcriber>,
+    pub speaker: Arc<dyn Speaker>,
+    pub end_of_turn: Option<Arc<dyn EndOfTurnModel>>,
+}
+
+#[cfg_attr(native, async_trait)]
+#[cfg_attr(web, async_trait(?Send))]
+impl VoiceModels for SharedModels {
+    async fn load(&self) -> Result<Models, String> {
+        Ok(Models {
+            vad: self.vad.new_stream().await?,
+            transcriber: Arc::clone(&self.transcriber),
+            speaker: Arc::clone(&self.speaker),
+            end_of_turn: self.end_of_turn.clone(),
+        })
+    }
 }
 
 /// The models of one call.

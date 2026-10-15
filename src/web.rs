@@ -147,7 +147,6 @@ impl WebVoiceCall {
     pub fn cancel_input(&self) {
         self.call.cancel_input();
     }
-
 }
 
 /// Something the call is saying, for JavaScript: its `id`, `cancel()`, `onEvent(listener)` for its steps in order

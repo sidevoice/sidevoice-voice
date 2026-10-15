@@ -53,10 +53,7 @@ pub enum TurnEvent {
     },
     /// Nothing comes of the turn: no words in it, the person cancelled it, or it was joined into the next one
     /// (`merged`).
-    Cancelled {
-        turn_id: String,
-        merged: bool,
-    },
+    Cancelled { turn_id: String, merged: bool },
 }
 
 /// How long a turn's parts took, in milliseconds.

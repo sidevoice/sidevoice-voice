@@ -18,6 +18,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures_channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
+#[cfg(native)]
+use futures_channel::oneshot;
 use futures_util::future::{abortable, ready, select, AbortHandle, Either};
 use futures_util::{stream, Stream, StreamExt};
 
@@ -77,6 +79,9 @@ pub(crate) enum Message {
     CancelSay(String),
     Mute(bool),
     CancelInput,
+    /// The shared native input router applies this after preceding captured frames.
+    #[cfg(native)]
+    SharedRoute(u64, oneshot::Sender<Result<(), String>>),
     Models(Arc<dyn VoiceModels>, Box<VoiceConfig>),
     Io(u64, IoEvent),
     Rendered(u64),
@@ -432,6 +437,8 @@ impl Driver {
                 self.input(Input::Mute(muted));
             }
             Message::CancelInput => self.input(Input::Cancel),
+            #[cfg(native)]
+            Message::SharedRoute(_, _) => {}
             Message::Io(generation, _) if generation != self.generation => {}
             Message::Rendered(generation) => {
                 let frame = self

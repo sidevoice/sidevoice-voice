@@ -13,6 +13,7 @@
 mod devices;
 mod output;
 mod pipeline;
+mod shared;
 
 #[cfg(test)]
 mod tests;
@@ -30,6 +31,7 @@ use self::devices::{by_id, Kind};
 pub use self::devices::{AudioDevice, AudioDevices, LostDevices, NativeDevices};
 use self::output::{Counters, Output, Queue, Schedule};
 use self::pipeline::Pipeline;
+pub use self::shared::{InputPort, SharedNativeAudio};
 use crate::audio::Resampler;
 use crate::io::{AudioIo, IoEvent, IoSink};
 

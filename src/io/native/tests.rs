@@ -332,9 +332,7 @@ fn recorded_speaker_echo_cannot_start_a_turn_but_a_person_over_it_can() {
     let alone = scenario(false);
     assert!(!alone.iter().any(|effect| matches!(
         effect,
-        Effect::Event(VoiceEvent::Turn(_))
-            | Effect::Transcribe { .. }
-            | Effect::StopPlayback
+        Effect::Event(VoiceEvent::Turn(_)) | Effect::Transcribe { .. } | Effect::StopPlayback
     )));
     let person = scenario(true);
     assert!(person.iter().any(|effect| matches!(

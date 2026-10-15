@@ -16,7 +16,9 @@ mod tests;
 use std::collections::{HashMap, VecDeque};
 
 use crate::config::{EndOfTurn, VoiceConfig};
-use crate::event::{CallState, Listening, Microphone, TurnEvent, TurnTimings, VoiceError, VoiceEvent};
+use crate::event::{
+    CallState, Listening, Microphone, TurnEvent, TurnTimings, VoiceError, VoiceEvent,
+};
 use crate::playback::{Action, Playback};
 use crate::recognition::{accepted, Job, Outcome, Pending, Recognition};
 use crate::say::{SayEvent, SayOutcome, StopReason};
@@ -708,7 +710,10 @@ impl Call {
                     sample_rate,
                 },
                 Action::Stop => Effect::StopPlayback,
-                Action::Say { utterance, event } => Effect::Say { id: utterance, event },
+                Action::Say { utterance, event } => Effect::Say {
+                    id: utterance,
+                    event,
+                },
                 Action::Error(code) => Effect::Event(VoiceEvent::Error(VoiceError { code })),
             };
             out.push(effect);
