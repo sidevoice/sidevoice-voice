@@ -37,7 +37,9 @@ use crate::{VoiceConfig, VoiceEvent};
 fn host_say_event_json(event: &SayEvent) -> String {
     let mut value = serde_json::to_value(event).expect("say events serialize");
     if let SayEvent::Done { .. } = event {
-        let outcome = value["outcome"].as_object_mut().expect("say outcome object");
+        let outcome = value["outcome"]
+            .as_object_mut()
+            .expect("say outcome object");
         if let Some(reason) = outcome.remove("reason") {
             outcome.extend(reason.as_object().expect("stop reason object").clone());
         }
@@ -208,24 +210,54 @@ mod tests {
         let cases = [
             (SayOutcome::Heard, "heard", None, None, None),
             (
-                SayOutcome::HeardUpTo { heard_chars: 2, reason: StopReason::Cancelled },
-                "heard-up-to", Some(2), Some("cancelled"), None,
+                SayOutcome::HeardUpTo {
+                    heard_chars: 2,
+                    reason: StopReason::Cancelled,
+                },
+                "heard-up-to",
+                Some(2),
+                Some("cancelled"),
+                None,
             ),
             (
-                SayOutcome::HeardUpTo { heard_chars: 2, reason: StopReason::BargeIn },
-                "heard-up-to", Some(2), Some("barge-in"), None,
+                SayOutcome::HeardUpTo {
+                    heard_chars: 2,
+                    reason: StopReason::BargeIn,
+                },
+                "heard-up-to",
+                Some(2),
+                Some("barge-in"),
+                None,
             ),
             (
-                SayOutcome::HeardUpTo { heard_chars: 2, reason: StopReason::Stopped },
-                "heard-up-to", Some(2), Some("stopped"), None,
+                SayOutcome::HeardUpTo {
+                    heard_chars: 2,
+                    reason: StopReason::Stopped,
+                },
+                "heard-up-to",
+                Some(2),
+                Some("stopped"),
+                None,
             ),
             (
-                SayOutcome::NotPlayed { reason: StopReason::Stopped },
-                "not-played", None, Some("stopped"), None,
+                SayOutcome::NotPlayed {
+                    reason: StopReason::Stopped,
+                },
+                "not-played",
+                None,
+                Some("stopped"),
+                None,
             ),
             (
-                SayOutcome::NotPlayed { reason: StopReason::Failed { code: "speech-failed".into() } },
-                "not-played", None, Some("failed"), Some("speech-failed"),
+                SayOutcome::NotPlayed {
+                    reason: StopReason::Failed {
+                        code: "speech-failed".into(),
+                    },
+                },
+                "not-played",
+                None,
+                Some("failed"),
+                Some("speech-failed"),
             ),
         ];
         // Send real Rust outcomes through WebSaying's serializer, event listener, and
@@ -241,14 +273,22 @@ mod tests {
                 *received.borrow_mut() = Some(step);
             });
             web.on_event(listener.as_ref().unchecked_ref::<Function>().clone());
-            send_event.unbounded_send(SayEvent::Done { outcome }).expect("send done");
-            let promised = JsFuture::from(web.outcome()).await.expect("outcome promise");
+            send_event
+                .unbounded_send(SayEvent::Done { outcome })
+                .expect("send done");
+            let promised = JsFuture::from(web.outcome())
+                .await
+                .expect("outcome promise");
             let step = observed.borrow().clone().expect("done listener");
             let event_outcome = Reflect::get(&step, &"outcome".into()).expect("done outcome");
             for web_outcome in [event_outcome, promised] {
-                let field = |name: &str| Reflect::get(&web_outcome, &name.into()).expect("web field");
+                let field =
+                    |name: &str| Reflect::get(&web_outcome, &name.into()).expect("web field");
                 assert_eq!(field("status").as_string().as_deref(), Some(status));
-                assert_eq!(field("heard_chars").as_f64().map(|n| n as usize), heard_chars);
+                assert_eq!(
+                    field("heard_chars").as_f64().map(|n| n as usize),
+                    heard_chars
+                );
                 assert_eq!(field("reason").as_string().as_deref(), reason);
                 assert_eq!(field("code").as_string().as_deref(), code);
                 assert!(field("reason").is_undefined() || field("reason").as_string().is_some());
