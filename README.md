@@ -232,9 +232,12 @@ time; a task around it (`src/voice_call.rs`) feeds it and does what it answers.
   of audio before it. Where speech stops a pause begins: with `smart-turn` the end-of-turn model is asked, at every
   stop, about the turn so far (from 0.9 s before its speech started, its last 8 s); more than 0.5 ends the turn there,
   and the pause ends it anyway 2.5, 3 or 4 s after the stop. With `silence` the pause ends it 2, 2.5 or 3.5 s after the
-  stop. Speech that starts again ends the pause. A turn also ends when its audio stops arriving for 5 s or the
-  microphone is muted, and keeps at most a minute. `endInput` (`VoiceCall::end_input`) ends the open turn at once with what it holds and reports it like any turn;
-  with none open it does nothing, and it touches neither playback, mute nor how later turns end.
+  stop. Speech that starts again ends the pause. A turn also ends when its audio stops arriving for 5 s, and
+  keeps at most a minute. Mute does not end it: a muted microphone is ordinary silence, so the turn ends by the usual
+  endpoint and releasing the mute within it continues the same turn. `endInput` (`VoiceCall::end_input`) is the one way to close the
+  open turn at once with what it holds; it then goes through recognition like any turn. With none open it does nothing,
+  and it touches neither playback, mute nor how later turns end. Its acknowledgement means the turn is closed, not
+  transcribed: the words arrive as the turn's `finished`.
 - **Recognition.** Turns are transcribed in order, one at a time, at most eight waiting. A transcript is dropped
   when it is empty, or written in no Latin letter for a language that is; the turn is then
   `cancelled`. Otherwise it waits the merge window (none, 0.5 or 1.5 s by patience): a turn that follows within it

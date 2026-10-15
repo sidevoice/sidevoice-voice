@@ -117,7 +117,9 @@ export interface VoiceCallHost {
   /** Closes the open turn now with what was captured so far: it is transcribed and told like any turn (`finished` with
    *  the words, through `onTurn`). Nothing happens when no turn is open, so a second call is harmless. It does not touch
    *  playback, mute, other calls or how later turns end; the next utterance opens a fresh turn. Resolves once the turn
-   *  is closed, before its `finished` (which follows the transcription and the merge window). Before `setSettings`, or
+   *  is closed, not transcribed: the words arrive later as its `finished`, after the transcription and the merge window
+   *  (a turn that opens within that window joins it, and this one is then `cancelled` with `merged`, its words carried
+   *  by the later `finished`). Mute is not a substitute: it is ordinary silence and does not end a turn. Before `setSettings`, or
    *  with the call stopped, it resolves at once. */
   endInput(): Promise<void>;
   /** For each `turn_id`: `started`, then exactly one `finished` (the words) or `cancelled`. */

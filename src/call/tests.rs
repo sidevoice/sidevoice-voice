@@ -1547,9 +1547,12 @@ fn end_input_closes_the_turn_of_a_muted_call_and_leaves_it_muted() {
 }
 
 #[test]
-fn end_input_leaves_the_playback_and_later_endpointing_alone() {
+fn end_input_with_no_open_turn_leaves_a_reply_that_is_playing_alone() {
     let mut run = Run::new(config());
-    run.hear(&speech());
+    run.reply("playing", "A reply that sounds.");
+    let effects = run.take();
+    assert_eq!(Run::synthesize(&effects).len(), 1, "admitted and asked");
+    run.sound("playing", 0);
     run.take();
     run.input(Input::EndTurn);
     let effects = run.take();
@@ -1557,13 +1560,39 @@ fn end_input_leaves_the_playback_and_later_endpointing_alone() {
         .iter()
         .any(|effect| matches!(effect, Effect::StopPlayback)));
     assert!(Run::outcomes(&effects).is_empty());
+    run.played("playing", 0);
+    assert_eq!(
+        Run::playbacks(&run.take())
+            .iter()
+            .map(|(id, status, _)| (id.as_str(), *status))
+            .collect::<Vec<_>>(),
+        [("playing", PlaybackStatus::Heard)]
+    );
+}
+
+#[test]
+fn after_end_input_a_reply_is_admitted_and_the_next_turn_ends_by_its_own_silence() {
+    let mut run = Run::new(config());
+    run.hear(&speech());
+    run.reply("early", "Refused while the person speaks.");
+    assert_eq!(
+        Run::outcomes(&run.take()),
+        [(
+            "early".into(),
+            SayOutcome::NotPlayed {
+                reason: StopReason::BargeIn
+            }
+        )]
+    );
+    run.input(Input::EndTurn);
+    run.take();
     run.transcribed(0, "Mister Quilter");
     run.wait(3_000);
     run.take();
     run.reply("later", "Said once the person is done.");
     assert!(
         !Run::synthesize(&run.take()).is_empty(),
-        "said after the turn, as ever"
+        "admitted after the turn, as ever"
     );
     // The next turn ends by its own silence, not at once.
     run.hear(&speech());

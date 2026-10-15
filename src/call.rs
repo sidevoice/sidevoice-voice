@@ -67,7 +67,7 @@ pub(crate) enum Input {
     ChunkPlayed { utterance: String, chunk: usize },
     /// The output stream has ended after its last rendered sample.
     PlaybackEnded,
-    /// Whether the microphone is muted: an open turn ends with what was said.
+    /// Whether the microphone is muted: muted windows are silence, and the open turn ends as ordinary silence ends it.
     Mute(bool),
     /// Whether the microphone's device gives no audio for now (not the person's mute).
     MicrophoneMuted(bool),
