@@ -142,6 +142,17 @@ impl WebVoiceCall {
         self.call.mute(muted);
     }
 
+    /// Closes the open turn now with what was captured so far, to be told as `finished` like any turn; nothing happens
+    /// when none is open. Resolves once the call has closed it.
+    #[wasm_bindgen(js_name = endInput)]
+    pub fn end_input(&self) -> Promise {
+        let closed = self.call.end_input();
+        wasm_bindgen_futures::future_to_promise(async move {
+            closed.await;
+            Ok(JsValue::UNDEFINED)
+        })
+    }
+
     /// Cancels what the person said that is not reported yet.
     #[wasm_bindgen(js_name = cancelInput)]
     pub fn cancel_input(&self) {

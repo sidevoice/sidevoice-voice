@@ -73,6 +73,8 @@ pub(crate) enum Input {
     MicrophoneMuted(bool),
     /// The person cancels what they said that is not reported yet.
     Cancel,
+    /// Close the open turn now with what was captured so far; nothing when none is open.
+    EndInput,
     /// What the end-of-turn model said of a turn's pause: the probability that the turn is over, or the stable code
     /// of why there is none.
     EndOfTurn {
@@ -280,6 +282,11 @@ impl Call {
             }
             Input::MicrophoneMuted(muted) => self.microphone_muted = muted,
             Input::Cancel => self.cancel_input(now, &mut out),
+            Input::EndInput => {
+                if let Some(segment) = self.segmenter.end_now() {
+                    self.segment(now, segment, &mut out);
+                }
+            }
             Input::EndOfTurn {
                 turn,
                 pause,

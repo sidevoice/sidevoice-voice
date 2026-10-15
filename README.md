@@ -109,7 +109,8 @@ const outcome = await saying.outcome; // { status: "heard" | "heard-up-to" | "no
 
 `onEvent(listener)` hears the same events as `{type, data}`; `say(text, options)` answers a `Saying` (`id`,
 `cancel()`, `onEvent(listener)` for its steps, and `outcome`, a promise); `setConfig`, `setModels`, `mute`,
-`cancelInput`, `start` and `stop` mirror the Rust methods (`src/web.rs`). The microphone is `getUserMedia` with the
+`cancelInput`, `endInput` (closes the open turn now with what was captured, to be told as `finished`; nothing when none
+is open), `start` and `stop` mirror the Rust methods (`src/web.rs`). The microphone is `getUserMedia` with the
 browser's echo cancellation, noise suppression and gain control, brought to 16 kHz mono in an AudioWorklet; the speaker
 is Web Audio (`js/web-audio-io.js`). `VoiceCall.create(models, config, {inputDevice, outputDevice})` captures from another
 microphone, and plays on another output where
@@ -232,7 +233,8 @@ time; a task around it (`src/voice_call.rs`) feeds it and does what it answers.
   stop, about the turn so far (from 0.9 s before its speech started, its last 8 s); more than 0.5 ends the turn there,
   and the pause ends it anyway 2.5, 3 or 4 s after the stop. With `silence` the pause ends it 2, 2.5 or 3.5 s after the
   stop. Speech that starts again ends the pause. A turn also ends when its audio stops arriving for 5 s or the
-  microphone is muted, and keeps at most a minute.
+  microphone is muted, and keeps at most a minute. `endInput` (`VoiceCall::end_input`) ends the open turn at once with what it holds and reports it like any turn;
+  with none open it does nothing, and it touches neither playback, mute nor how later turns end.
 - **Recognition.** Turns are transcribed in order, one at a time, at most eight waiting. A transcript is dropped
   when it is empty, or written in no Latin letter for a language that is; the turn is then
   `cancelled`. Otherwise it waits the merge window (none, 0.5 or 1.5 s by patience): a turn that follows within it

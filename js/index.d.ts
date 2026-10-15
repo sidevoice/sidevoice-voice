@@ -38,6 +38,8 @@ export interface VoiceCall {
   mute(muted: boolean): void;
   /** Cancels what the person said that is not told yet. */
   cancelInput(): void;
+  /** Closes the open turn now with what was captured so far; nothing when none is open. Resolves once the call has closed it. */
+  endInput(): Promise<void>;
   /** Ends the call: the microphone and the speaker close, and the models are dropped. */
   free(): void;
 }

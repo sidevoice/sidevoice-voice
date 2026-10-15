@@ -991,3 +991,97 @@ fn fatal_live_configuration_ends_take_and_playback_before_error() {
         }
     });
 }
+
+/// Starts `call` and sends it `audio` as its microphone; answers its events.
+async fn hear(
+    call: &VoiceCall,
+    events: &mut Events,
+    speakers: &Arc<Mutex<Speakers>>,
+    audio: Vec<f32>,
+) {
+    call.start(StartOptions::default());
+    next(events, |event| match event {
+        VoiceEvent::State(state) if state.listening == crate::Listening::Listening => Some(()),
+        _ => None,
+    })
+    .await;
+    let sink = speakers.lock().unwrap().sink.clone().expect("started");
+    for frame in audio.chunks(160) {
+        sink.send(IoEvent::Captured(frame.to_vec()));
+    }
+}
+
+#[test]
+fn end_input_closes_the_open_turn_without_waiting_for_its_silence() {
+    runtime().block_on(async {
+        let (call, mut events, speakers) = call(FakeModels::default());
+        // Nothing is open: it resolves and nothing happens.
+        call.end_input().await;
+        // Speech with no silence after it: the turn is open and would wait for its endpoint.
+        hear(
+            &call,
+            &mut events,
+            &speakers,
+            [silence(300), clip(QUILTER, 0.9)].concat(),
+        )
+        .await;
+        next(&mut events, |event| match event {
+            VoiceEvent::Turn(TurnEvent::Started { .. }) => Some(()),
+            _ => None,
+        })
+        .await;
+        call.end_input().await;
+        call.end_input().await;
+        let said = next(&mut events, |event| match event {
+            VoiceEvent::Turn(TurnEvent::Finished { text, .. }) => Some(text),
+            _ => None,
+        })
+        .await;
+        assert!(!said.is_empty());
+        // Exactly one: the second call found nothing open.
+        let another = tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                if let Some(VoiceEvent::Turn(TurnEvent::Finished { .. })) = events.next().await {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(another.is_err(), "one finished per turn");
+    });
+}
+
+#[test]
+fn end_input_of_one_call_leaves_another_calls_turn_open() {
+    runtime().block_on(async {
+        let (first, mut first_events, first_speakers) = call(FakeModels::default());
+        let (second, mut second_events, second_speakers) = call(FakeModels::default());
+        let audio = [silence(300), clip(QUILTER, 0.9)].concat();
+        hear(&first, &mut first_events, &first_speakers, audio.clone()).await;
+        hear(&second, &mut second_events, &second_speakers, audio).await;
+        for events in [&mut first_events, &mut second_events] {
+            next(events, |event| match event {
+                VoiceEvent::Turn(TurnEvent::Started { .. }) => Some(()),
+                _ => None,
+            })
+            .await;
+        }
+        first.end_input().await;
+        next(&mut first_events, |event| match event {
+            VoiceEvent::Turn(TurnEvent::Finished { .. }) => Some(()),
+            _ => None,
+        })
+        .await;
+        let other = tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                if let Some(VoiceEvent::Turn(TurnEvent::Finished { .. })) =
+                    second_events.next().await
+                {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(other.is_err(), "the other call's turn is still open");
+    });
+}

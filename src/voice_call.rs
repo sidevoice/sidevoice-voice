@@ -18,7 +18,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures_channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
-#[cfg(native)]
 use futures_channel::oneshot;
 use futures_util::future::{abortable, ready, select, AbortHandle, Either};
 use futures_util::{stream, Stream, StreamExt};
@@ -79,6 +78,8 @@ pub(crate) enum Message {
     CancelSay(String),
     Mute(bool),
     CancelInput,
+    /// Close the open turn now, then answer.
+    EndInput(oneshot::Sender<()>),
     /// The shared native input router applies this after preceding captured frames.
     #[cfg(native)]
     SharedRoute(u64, oneshot::Sender<Result<(), String>>),
@@ -216,6 +217,18 @@ impl VoiceCall {
     /// Cancels what the person said that is not reported yet.
     pub fn cancel_input(&self) {
         self.send(Message::CancelInput);
+    }
+
+    /// Closes the person's open turn now with what was captured so far: it is transcribed and reported like any turn
+    /// (`finished`, or `cancelled` when nothing was said). Nothing is open, or the call is stopped: nothing happens.
+    /// It touches neither the playback, nor the mute, nor how later turns end. The message is sent when this is called;
+    /// the future resolves once the call has closed the turn (or at once if the call has ended).
+    pub fn end_input(&self) -> impl Future<Output = ()> + Send + 'static {
+        let (done, closed) = oneshot::channel();
+        self.send(Message::EndInput(done));
+        async move {
+            let _ = closed.await;
+        }
     }
 
     fn send(&self, message: Message) {
@@ -439,6 +452,10 @@ impl Driver {
                 self.input(Input::Mute(muted));
             }
             Message::CancelInput => self.input(Input::Cancel),
+            Message::EndInput(done) => {
+                self.input(Input::EndInput);
+                let _ = done.send(());
+            }
             #[cfg(native)]
             Message::SharedRoute(_, _) => {}
             #[cfg(native)]

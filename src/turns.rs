@@ -318,6 +318,14 @@ impl Segmenter {
         still.then(|| self.end(silence_ms))
     }
 
+    /// Ends the open turn now with the audio it holds, if one is open: the person is not heard to stop, so the speech
+    /// going on is not heard again until it starts anew (as when a turn ends for lack of audio).
+    pub(crate) fn end_now(&mut self) -> Option<Segment> {
+        let silence_ms = self.open.as_ref()?.silent / PER_MS;
+        self.activity.reset();
+        Some(self.end(silence_ms))
+    }
+
     /// Drops the open turn and the audio before it; the speech going on is not heard again until it starts anew.
     pub(crate) fn cancel(&mut self) {
         self.open = None;
