@@ -14,10 +14,14 @@ use super::{EndOfTurnModel, Models, Speaker, Transcriber, Vad, VadFrame, VoiceMo
 
 #[wasm_bindgen]
 extern "C" {
-    /// `VoiceModels`: `{ load(): Promise<{vad, transcriber, speaker, endOfTurn?}> }`.
+    /// `VoiceModels`: `{ load(): Promise<{createVad(), transcriber, speaker, endOfTurn?}> }`.
     pub type JsVoiceModels;
     #[wasm_bindgen(method, catch)]
     fn load(this: &JsVoiceModels) -> Result<JsValue, JsValue>;
+
+    type JsLoadedModels;
+    #[wasm_bindgen(method, catch, js_name = createVad)]
+    fn create_vad(this: &JsLoadedModels) -> Result<JsValue, JsValue>;
 
     type JsVad;
     #[wasm_bindgen(method, catch)]
@@ -59,7 +63,12 @@ impl VoiceModels for JsVoiceModels {
         let loaded = settle(JsVoiceModels::load(self), "models-load-failed").await?;
         let field = |name: &str| Reflect::get(&loaded, &name.into()).unwrap_or(JsValue::UNDEFINED);
         let present = |value: &JsValue| !value.is_undefined() && !value.is_null();
-        let (vad, transcriber, speaker) = (field("vad"), field("transcriber"), field("speaker"));
+        let (transcriber, speaker) = (field("transcriber"), field("speaker"));
+        let vad = settle(
+            JsLoadedModels::create_vad(&loaded.clone().unchecked_into()),
+            "vad-failed",
+        )
+        .await?;
         if !present(&vad) || !present(&transcriber) || !present(&speaker) {
             return Err("models-incomplete".into());
         }

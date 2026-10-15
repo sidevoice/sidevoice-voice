@@ -2,7 +2,7 @@
      (https://shieldcn.dev), each a light/dark pair so the row follows the reader's GitHub theme. -->
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset=".github/assets/readme-header-on-dark.svg" />
-  <img alt="Sidevoice — Give your coding agent a voice. Keep the conversation." src=".github/assets/readme-header.svg" width="750" />
+  <img alt="Sidevoice — Give your coding agent a voice. Keep talking." src=".github/assets/readme-header.svg" width="750" />
 </picture>
 
 <p>
@@ -13,7 +13,7 @@
 
 # sidevoice-voice
 
-Reading your coding agent's plans, diffs and summaries all day is tiring. **Sidevoice** turns the conversation you
+Reading your coding agent's plans, diffs and summaries all day is tiring. **Sidevoice** turns the exchange you
 already have with your agent into a voice call. The agent keeps its context and keeps writing as usual; it also
 speaks its replies, and you answer by voice and can interrupt it — from the sofa or on a walk, not only at your desk.
 
@@ -21,8 +21,7 @@ speaks its replies, and you answer by voice and can interrupt it — from the so
 start and stop speaking, has what you said transcribed, and tells the app your turns as words. It says what the app
 asks it to, plays it, stops when you speak over it, and tells the app how much of it you heard. It runs models it does
 not know, through interfaces of its own the app fills (with
-[sidevoice-engine](https://github.com/sidevoice/sidevoice-engine)'s models, say), and knows nothing of the room:
-only the app talks to it, and the app carries what it hears to the room and what the room sends to it.
+[sidevoice-engine](https://github.com/sidevoice/sidevoice-engine)'s models, say), and carries no application routing identity. The app decides where words and playback reports go.
 
 ## How it fits
 
@@ -30,7 +29,7 @@ only the app talks to it, and the app carries what it hears to the room and what
 |---|---|
 | **sidevoice-voice** (this repository) | The call on the device: capture, echo cancellation, turns, transcription, speech, playback, barge-in, and what was heard. |
 | [sidevoice-engine](https://github.com/sidevoice/sidevoice-engine) | The models: the catalogue, which build fits here, and the backends that run them. The apps wire its models into this module's interfaces; this module does not depend on it. |
-| [sidevoice-core](https://github.com/sidevoice/sidevoice-core) | The room: the conversations, presence, routing to the agents, and the bookkeeping of what was heard. Text and events only, no audio. |
+| [sidevoice-core](https://github.com/sidevoice/sidevoice-core) | The service: sessions, presence, agent routing, and the bookkeeping of what was heard. Text and events only, no audio. |
 | [sidevoice-connector](https://github.com/sidevoice/sidevoice-connector) | What you install on the machine where your agents run. It gives them their voice tools and runs the core. |
 | [sidevoice-desktop](https://github.com/sidevoice/sidevoice-desktop) | The app you call from: it compiles this crate in, with native capture and playback. |
 | [sidevoice-web](https://github.com/sidevoice/sidevoice-web) | The call interface the app bundles; in a browser it runs this crate's WebAssembly build, `@sidevoice/voice`. |
@@ -100,7 +99,7 @@ through wasm-bindgen's structural imports (`src/models/web.rs`); the page wires 
 import init, { VoiceCall } from "@sidevoice/voice";
 
 await init();
-const models = { load: async () => ({ vad, transcriber, speaker /*, endOfTurn */ }) }; // the page's VoiceModels
+const models = { load: async () => ({ createVad: () => newDetector(), transcriber, speaker /*, endOfTurn */ }) }; // the page's VoiceModels
 const call = VoiceCall.create(models, config); // the same configuration, as JSON
 call.onEvent(({ type, data }) => { /* "turn", "state", "level", "playback-level", "error", "take" */ });
 call.start(); // loads the models, asks for the microphone, listens
@@ -123,7 +122,8 @@ Their failures are errors with stable codes: `microphone-denied`, `microphone-un
 - **The configuration** (`VoiceConfig`, read strictly from JSON) names no model: the `language` the transcriber is
   given, the speaker's `voice` and `speed`, what ends a turn (`end_of_turn`: `silence`, or `smart-turn`, which needs
   an `EndOfTurnModel`), the `patience` (`fast`, `normal`, `calm`), the grace before anything is said
-  (`audio_grace_ms`, 1 s), the listening bar, and how long the models stay loaded with the call stopped
+  (`audio_grace_ms`, 1 s), the listening bar, `barge_in_min_speech` (1.0 s of continuous qualified
+  capture while audio sounds), and how long the models stay loaded with the call stopped
   (`idle_unload_minutes`, 10; 0 drops them as it stops). A new configuration is in effect at once.
 - **`start` loads the models** if they are not loaded. They stay across stops, and are dropped once the call has been
   stopped for `idle_unload_minutes`; the next start loads them again, on the web as natively. `smart-turn` without an
@@ -141,77 +141,61 @@ Their failures are errors with stable codes: `microphone-denied`, `microphone-un
   detector gives no probability: there, a window's `speech` should be its own decision (the shortest confirmation and
   silence a detector allows), or the detector's timing adds to the call's.
 
-## The voice seam a page drives
+## Shared calls
 
-A page drives a call through one interface, `VoiceHost`, defined once in this package
-([`js/voice-host.d.ts`](js/voice-host.d.ts)) with the types it carries (`VoiceSettings`, `VoiceHostError`, and from
-[`js/voice-events.d.ts`](js/voice-events.d.ts) `VoiceTurnEvent`, `VoiceCallState`, `VoiceSaying`, `VoiceSayEvent`,
-`VoiceSayOutcome`, `VoiceTake`). The call behind it knows nothing of the room: the page translates both ways. It has two
-implementations:
+A `VoiceCall` owns turn segmentation, recognition, saying handles and playback state. Several calls can run at once
+without exchanging text or state. The app decides which call receives real microphone frames. A call that receives
+zeros keeps its own open turn and ends it through the ordinary VAD and patience rules; routing back before that
+endpoint continues the same turn. Routing never forces a transcript to finish. Continuous qualified speech still
+cuts that call's sounding and queued saying handles; each handle's `done` event and flat `outcome` promise report
+`heard`, `heard-up-to` or `not-played` with `reason` (`barge-in`, `cancelled`, `stopped` or `failed`) and `code` for a
+failure. There is no separate cut event.
 
-- **`createVoiceHost(source, options?)`** here (`js/voice-host.js`): the call in the page, on the page's models and the
-  browser's microphone and speaker (or `options.io`). `source` is the page's `VoiceModelSource`: `models(settings)`,
-  the `VoiceModels` (`js/voice-models.d.ts`) that fill the call's slots for the settings, or a refusal by `{code}`.
-  Which models there are, which fills each slot, how a setting names it and the keys any of them needs are the page's;
-  this package lists none and names none.
-- **The Sidevoice desktop app**, `window.__sidevoiceDesktop.host.voice` on macOS: the call run natively, with WebRTC
-  AEC3 (sidevoice-desktop's `docs/BRIDGE.md`, "The voice call").
+Natively, `SharedNativeAudio::new(devices)` owns one physical microphone, speaker, and AEC3 instance. `attach()`
+returns `(Box<dyn AudioIo>, InputPort)` for one call. `route_input(Some(&port)).await` acknowledges a next-frame
+switch, and `route_input(None).await` sends zeros to every started lane. All lanes receive the same 10 ms cadence;
+only the routed lane receives real samples. Their playback chunks, progress and levels are independent. The physical
+speaker receives their mixed output, which is the single AEC reference. The last active lane closes the devices.
+Apps that provide their own `AudioIo` can route frames themselves.
+
+`SharedModels::new(loader)` implements `VoiceModels` as a lightweight, restartable pool. The loader returns
+`SharedModelResources` (VAD factory, transcriber, speaker and optional end-of-turn model) when no live lease exists.
+Concurrent calls share one loaded choice and each gets a fresh `VadFactory::new_stream()` detector. The pool retains
+only a weak reference: after each stopped call's `idle_unload_minutes` and the final in-flight request, the weights
+are released; the next start loads them again. Shared STT, TTS and end-of-turn requests are serialized so a provider
+with non-reentrant inference is safe. Detector history, endpoint windows and request state remain call local.
+
+The browser host (`js/voice-host.d.ts`) owns the shared audio and model choices. The same host shape can be provided
+by a native app:
 
 ```js
-const voice = window.__sidevoiceDesktop?.host?.voice ?? createVoiceHost(source); // source: the page's models
-voice.onTurn((turn) => turn.phase === "finished" && sendWords(turn.turn_id, turn.text)); // the page's to send
-await voice.setSettings({ stt: { ...sttChoice, language: "es" }, tts: { ...ttsChoice, voice: "ef_dora" } }); // choices: the page's
-await voice.start();                                    // resolves once listening; rejects {code}
-const saying = voice.say("Hecho, ya está en la rama.", { language: "es" });
-saying.onEvent((step) => step.type === "progress" && highlight(step.sounding, step.heard_chars));
-const outcome = await saying.outcome; // heard, heard up to N characters, or not played; the page reports it
-// saying.cancel() stops it, when the page learns it is no longer to be said.
+import init, { createVoiceHost } from "@sidevoice/voice";
+await init();
+const host = createVoiceHost(source); // source.models(settings).load() returns createVad(), transcriber, speaker
+const first = host.createCall();
+const second = host.createCall();
+await Promise.all([first.setSettings(settings), second.setSettings(settings)]);
+first.onTurn((turn) => handleFirstTurn(turn));
+second.onTurn((turn) => handleSecondTurn(turn));
+await Promise.all([first.start(), second.start()]);
+await host.routeInput(first); // real frames to first, zeros to second; await the worklet acknowledgement
+await host.routeInput(second);
+await host.routeInput(null); // zeros to both
+await first.dispose();
+await second.dispose();
 ```
 
-What both promise, beyond the types:
+`createSharedWebAudioIo(options)` is the browser's shared audio factory. `attach()` returns `{io, input}`;
+`routeInput(input | null)` acknowledges a next-frame switch. One `getUserMedia` track and `AudioContext` serve
+all lanes; each lane has its own playback gain and telemetry processor, mixed at the context destination for the
+browser's AEC. Device selection and loss reporting live on the host. The low-level
+`VoiceCall.create(models, config, {io?})` and `createWebAudioIo` remain for one standalone call. Browser output
+selection depends on `AudioContext.setSinkId`; a non-default output can escape browser AEC on some systems.
 
-- **`start()`** resolves once the microphone and the speaker work: at the first state whose `listening` is not `idle`,
-  at once if the call listens already, and a second `start` while one is pending settles with it. It rejects with
-  `{code}`, and with `{code: "stopped"}` when `stop()` comes first; `smart-turn` without an end-of-turn model rejects
-  `end-of-turn-missing`. `stop()` is safe at any time, and a `start` right after it, awaited or not, starts the call
-  again. `mute` holds from the first call, even before `setSettings`. Settings that change the models give the call
-  the new models and configuration together (a live call restarts once); `setSettings` rejects with the model
-  source's `{code}` for settings it cannot fill.
-- **Turns** reach the listeners subscribed when they are emitted, in the order the call emitted them, with the state,
-  microphone and playback levels and errors; nothing is buffered. `playback-level` is a bare number from 0 to 1,
-  computed from audio rendered by the speaker after gain and fading, on the same detector windows as `level`
-  (normally 512 samples at 16 kHz, or 32 ms). It continues while the microphone is muted, is zero in silence,
-  and emits exact zero when playback ends or the call stops. `VoiceHost.onPlaybackLevel(listener)` subscribes to this
-  number; its unsubscribe removes only that listener, and subscriptions survive stop/start. Each turn has the call's
-  own `turn_id`: `started` comes before exactly one
-  `finished` (the words) or `cancelled`. A turn merged into the next is `cancelled` with `merged`, after that next
-  turn's `started`.
-  The state says `speaking` while the person speaks in an open turn, and `listening` again when they pause in it (their
-  speech stopped, as the detector decides it) or it ends; its end shows as `recognising` rises.
-- **A take** (`VoiceTake`) is what the microphone gave from the moment the call listened until that listening ended,
-  as the call heard it (16 kHz mono, after echo cancellation; silence while muted), with where each turn's speech
-  started, paused and was ended, in milliseconds from its first sample at the call's own positions in the audio. It is
-  kept only for a `start({take: true})`, at most two minutes of it, in memory, and handed to `onTake` once as that
-  listening ends: before `stop()` resolves, before the error that ended it, before a restart on other models listens
-  again. The call keeps no copy, and never records otherwise.
-- **`say(text, options?)`** answers a handle at once: its `id`, `cancel()`, `onEvent(listener)` for its steps in order
-  (`playing`, `progress` as each chunk starts and ends, then `done`), and `outcome`, a promise of how it ended: `heard`,
-  `heard-up-to` with `heard_chars`, or `not-played`, the reason being `cancelled`, `barge-in`, `stopped` or `failed`
-  with a code. What is said before `setSettings`, or with the call stopped, is `not-played` (`stopped`).
-- **Settings** are a choice per slot, `stt` and `tts`, with the patience, the end of turn and `idle_unload_minutes`
-  (how long the models stay loaded with the call stopped; 10 by default). Of a slot the call reads only the language
-  (`stt`) and the voice and speed (`tts`); everything else in it names the model as the page's source does, and goes to
-  the source as the page wrote it. A rejected `setSettings` changes nothing. A change to what chooses models (any other
-  field of a slot, or the end of turn) gives the call other models, which restarts it while it runs (the open turn
-  cancelled, what is being said stopped); the language, voice, speed, patience and idle minutes apply live.
-- **Audio devices.** `audioDevices()` lists the microphones and outputs (`{id, label}`; the system's default is the
-  choice `null`, not an entry) and which are chosen, and whether the output can be chosen here (`outputSelectable`:
-  in a browser, `AudioContext.setSinkId`). `setAudioDevices({input?, output?})` chooses either at any time: a call that
-  runs switches without ending (the new microphone open before the old one is let go), and the choice holds for every
-  call after. An output that cannot be chosen is refused (`audio-output-unselectable`), never pretended.
-  `onAudioDevices(listener)` hears the list each time it changes, and when a chosen device goes away: the default one
-  is in use from then, and that list says which was lost (`lost`). Only the default microphone going away ends a call
-  (`microphone-lost`).
+The per-call event sequence is `started {turn_id,started_at}` and exactly one
+`finished {turn_id,text,language?,started_at,ended_at,merged,timings}` or
+`cancelled {turn_id,merged}`. A saying handle's `playing` and `progress` precede its one terminal `done` event.
+The browser adapter flattens the serialized Rust stop reason in both `done` and `outcome`.
 
 ## Echo cancellation
 
@@ -227,8 +211,10 @@ The call cancels the echo of its own playback, never relying on the operating sy
   thread, never in a callback. A device that changes under a stream starts the canceller over; a chosen one that goes
   away gives way to the default one (said once, as `lost`, with the next list); the default one going away stops the
   call with `audio-device-unavailable`.
-- **In the browser**, the browser's own: the page's microphone asks `getUserMedia` for `echoCancellation`, and no
-  canceller is linked into the wasm32 build, so audio is never processed twice.
+- **In the browser**, the browser's own: the page's microphone always asks `getUserMedia` for
+  `echoCancellation`; a track explicitly reporting it disabled is rejected before capture starts. The browser uses
+  its rendered speaker output as the AEC reference. The playback worklet reports rendered level only; it never
+  decides speech. No canceller is linked into the wasm32 build, so audio is never processed twice.
 - **Windows** is out of the beta: the canceller's C++ does not build there yet.
 
 ## What the call does

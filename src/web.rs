@@ -1,7 +1,7 @@
 //! The bridge to JavaScript, only in the wasm32 build (the npm package): `VoiceCall.create(models, io, config)`, the
 //! same call as the Rust [`VoiceCall`](crate::VoiceCall), on the page's models and a JavaScript microphone and speaker.
 //!
-//! - `models` is the page's `VoiceModels` (`js/voice-models.d.ts`): `load()` answers `{vad, transcriber, speaker,
+//! - `models` is the page's `VoiceModels` (`js/voice-models.d.ts`): `load()` answers `{createVad(), transcriber, speaker,
 //!   endOfTurn?}`, objects with the methods of [`Vad`](crate::Vad), [`Transcriber`](crate::Transcriber),
 //!   [`Speaker`](crate::Speaker) and [`EndOfTurnModel`](crate::EndOfTurnModel).
 //! - `io` is an object with `start(sink)`, `play(utterance, chunk, samples, sampleRate)`, `stopPlayback()` and
@@ -31,6 +31,21 @@ use crate::say::{SayCancel, SayEvent, SayOptions, Saying};
 use crate::take::Take;
 use crate::voice_call::{StartOptions, VoiceCall};
 use crate::{VoiceConfig, VoiceEvent};
+
+/// The Rust event keeps `StopReason` as a nested field. The page's `VoiceSayEvent` and
+/// `VoiceSayOutcome` put its `reason` (and failure `code`) beside `status`.
+fn host_say_event_json(event: &SayEvent) -> String {
+    let mut value = serde_json::to_value(event).expect("say events serialize");
+    if let SayEvent::Done { .. } = event {
+        let outcome = value["outcome"]
+            .as_object_mut()
+            .expect("say outcome object");
+        if let Some(reason) = outcome.remove("reason") {
+            outcome.extend(reason.as_object().expect("stop reason object").clone());
+        }
+    }
+    serde_json::to_string(&value).expect("say events serialize")
+}
 
 /// One voice call, for JavaScript.
 #[wasm_bindgen(js_name = VoiceCall)]
@@ -156,14 +171,14 @@ impl WebSaying {
         let (id, cancel) = (saying.id().to_owned(), saying.canceller());
         spawn(async move {
             while let Some(event) = saying.next().await {
-                let json = serde_json::to_string(&event).expect("events serialize");
+                let json = host_say_event_json(&event);
                 let value = JSON::parse(&json).expect("JSON");
                 for listener in heard.borrow().iter() {
                     let _ = listener.call1(&JsValue::NULL, &value);
                 }
-                if let SayEvent::Done { outcome } = event {
-                    let json = serde_json::to_string(&outcome).expect("outcomes serialize");
-                    let _ = resolve.call1(&JsValue::NULL, &JSON::parse(&json).expect("JSON"));
+                if let SayEvent::Done { .. } = event {
+                    let outcome = Reflect::get(&value, &"outcome".into()).expect("done outcome");
+                    let _ = resolve.call1(&JsValue::NULL, &outcome);
                 }
             }
         });
@@ -172,6 +187,106 @@ impl WebSaying {
             cancel,
             listeners,
             outcome,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::say::{SayOutcome, StopReason};
+    use futures_channel::mpsc::unbounded;
+    use wasm_bindgen_futures::JsFuture;
+    use wasm_bindgen_test::wasm_bindgen_test as test;
+
+    #[test]
+    async fn real_say_serialization_reaches_the_flat_web_consumer() {
+        let cases = [
+            (SayOutcome::Heard, "heard", None, None, None),
+            (
+                SayOutcome::HeardUpTo {
+                    heard_chars: 2,
+                    reason: StopReason::Cancelled,
+                },
+                "heard-up-to",
+                Some(2),
+                Some("cancelled"),
+                None,
+            ),
+            (
+                SayOutcome::HeardUpTo {
+                    heard_chars: 2,
+                    reason: StopReason::BargeIn,
+                },
+                "heard-up-to",
+                Some(2),
+                Some("barge-in"),
+                None,
+            ),
+            (
+                SayOutcome::HeardUpTo {
+                    heard_chars: 2,
+                    reason: StopReason::Stopped,
+                },
+                "heard-up-to",
+                Some(2),
+                Some("stopped"),
+                None,
+            ),
+            (
+                SayOutcome::NotPlayed {
+                    reason: StopReason::Stopped,
+                },
+                "not-played",
+                None,
+                Some("stopped"),
+                None,
+            ),
+            (
+                SayOutcome::NotPlayed {
+                    reason: StopReason::Failed {
+                        code: "speech-failed".into(),
+                    },
+                },
+                "not-played",
+                None,
+                Some("failed"),
+                Some("speech-failed"),
+            ),
+        ];
+        // Send real Rust outcomes through WebSaying's serializer, event listener, and
+        // promise. Read only the fields in the page's flat VoiceSayOutcome contract.
+        for (outcome, status, heard_chars, reason, code) in cases {
+            let (messages, _message_receiver) = unbounded();
+            let (send_event, receive_event) = unbounded();
+            let saying = Saying::new("test".into(), messages, receive_event);
+            let web = WebSaying::new(saying);
+            let observed = Rc::new(RefCell::new(None));
+            let received = Rc::clone(&observed);
+            let listener = Closure::<dyn FnMut(JsValue)>::new(move |step| {
+                *received.borrow_mut() = Some(step);
+            });
+            web.on_event(listener.as_ref().unchecked_ref::<Function>().clone());
+            send_event
+                .unbounded_send(SayEvent::Done { outcome })
+                .expect("send done");
+            let promised = JsFuture::from(web.outcome())
+                .await
+                .expect("outcome promise");
+            let step = observed.borrow().clone().expect("done listener");
+            let event_outcome = Reflect::get(&step, &"outcome".into()).expect("done outcome");
+            for web_outcome in [event_outcome, promised] {
+                let field =
+                    |name: &str| Reflect::get(&web_outcome, &name.into()).expect("web field");
+                assert_eq!(field("status").as_string().as_deref(), Some(status));
+                assert_eq!(
+                    field("heard_chars").as_f64().map(|n| n as usize),
+                    heard_chars
+                );
+                assert_eq!(field("reason").as_string().as_deref(), reason);
+                assert_eq!(field("code").as_string().as_deref(), code);
+                assert!(field("reason").is_undefined() || field("reason").as_string().is_some());
+            }
         }
     }
 }

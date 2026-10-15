@@ -1,5 +1,5 @@
 // What a call tells the page, and what becomes of what it is asked to say: the JSON of the crate's VoiceEvent,
-// SayEvent and SayOutcome (src/event.rs, src/say.rs). The call knows nothing of the room; the page translates.
+// SayEvent and SayOutcome (src/event.rs, src/say.rs). The call exposes only its own events and handle outcomes.
 
 /** A step of a turn of the person's speech, under the call's own `turn_id` (the same in every step). */
 export type VoiceTurnEvent =

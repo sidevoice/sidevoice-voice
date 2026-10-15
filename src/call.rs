@@ -20,7 +20,7 @@ use crate::event::{
     CallState, Listening, Microphone, TurnEvent, TurnTimings, VoiceError, VoiceEvent,
 };
 use crate::playback::{Action, Playback};
-use crate::recognition::{accepted, Job, Outcome, Recognition};
+use crate::recognition::{accepted, Job, Outcome, Pending, Recognition};
 use crate::say::{SayEvent, SayOutcome, StopReason};
 use crate::take::{TakePause, TakeTurn};
 use crate::turns::{duration_ms, Segment, Segmentation, Segmenter, SILENCE_STOP_MS};
@@ -65,6 +65,8 @@ pub(crate) enum Input {
     ChunkStarted { utterance: String, chunk: usize },
     /// The output played a chunk's last sample.
     ChunkPlayed { utterance: String, chunk: usize },
+    /// The output stream has ended after its last rendered sample.
+    PlaybackEnded,
     /// Whether the microphone is muted: an open turn ends with what was said.
     Mute(bool),
     /// Whether the microphone's device gives no audio for now (not the person's mute).
@@ -155,6 +157,8 @@ pub(crate) struct Call {
     next_turn: usize,
     recognition: Recognition,
     playback: Playback,
+    /// A chunk ended while its utterance still has audio; the next chunk may be contiguous.
+    continuing_chunk: Option<String>,
     /// Nothing starts to be said before this time (the grace after a turn).
     quiet_until: u64,
     /// Ids cancelled before the call heard of them: said later, they never play.
@@ -183,6 +187,7 @@ impl Call {
             next_turn: 0,
             recognition: Recognition::default(),
             playback: Playback::default(),
+            continuing_chunk: None,
             quiet_until: 0,
             cancelled: VecDeque::new(),
             state: None,
@@ -217,6 +222,7 @@ impl Call {
             Input::Transcribed { turn, result } => self.transcribed(now, turn, result, &mut out),
             Input::Say { id, text, language } => self.say(id, &text, language, &mut out),
             Input::CancelSay(id) => {
+                let was_sounding = self.playback.sounding();
                 let mut actions = Vec::new();
                 if !self.playback.cancel(&id, &mut actions) {
                     // Not here (yet): a cancel may overtake its own `say`, which then never plays.
@@ -226,33 +232,50 @@ impl Call {
                     }
                 }
                 self.act(actions, &mut out);
+                self.playback_boundary(was_sounding);
             }
             Input::Synthesized {
                 utterance,
                 chunk,
                 result,
             } => {
+                let was_sounding = self.playback.sounding();
                 let mut actions = Vec::new();
                 self.playback
                     .synthesized(&utterance, chunk, result, &mut actions);
                 self.act(actions, &mut out);
+                self.playback_boundary(was_sounding);
             }
             Input::ChunkStarted { utterance, chunk } => {
+                let was_sounding = self.playback.sounding();
+                let continuous =
+                    self.continuing_chunk.take().as_deref() == Some(utterance.as_str());
                 let mut actions = Vec::new();
                 self.playback.chunk_started(&utterance, chunk, &mut actions);
                 self.act(actions, &mut out);
+                if !continuous {
+                    self.playback_boundary(was_sounding);
+                }
             }
             Input::ChunkPlayed { utterance, chunk } => {
+                let was_sounding = self.playback.sounding();
                 let mut actions = Vec::new();
                 self.playback.chunk_played(&utterance, chunk, &mut actions);
                 self.act(actions, &mut out);
+                if was_sounding && !self.playback.sounding() && self.playback.busy() {
+                    self.continuing_chunk = Some(utterance);
+                } else {
+                    self.playback_boundary(was_sounding);
+                }
+            }
+            Input::PlaybackEnded => {
+                self.continuing_chunk = None;
+                self.segmenter.reset_candidate();
             }
             Input::Mute(muted) => {
                 self.muted = muted;
                 if muted {
-                    if let Some(segment) = self.segmenter.close(0) {
-                        self.segment(now, segment, &mut out);
-                    }
+                    self.segmenter.reset_candidate();
                 }
             }
             Input::MicrophoneMuted(muted) => self.microphone_muted = muted,
@@ -314,6 +337,9 @@ impl Call {
     fn window(&mut self, now: u64, pcm: &[f32], confidence: f32, out: &mut Vec<Effect>) {
         self.heard += pcm.len();
         if !self.started || self.muted {
+            if self.started && self.muted {
+                self.window_silence(now, pcm.len(), out);
+            }
             return;
         }
         let playing = self.playback.sounding();
@@ -324,6 +350,18 @@ impl Call {
             self.segment(now, segment, out);
         }
         out.push(Effect::Event(VoiceEvent::Level(self.segmenter.level())));
+    }
+
+    fn window_silence(&mut self, now: u64, samples: usize, out: &mut Vec<Effect>) {
+        let silence = vec![0.0; samples];
+        let paused = self.segmenter.paused();
+        if let Some(segment) = self
+            .segmenter
+            .window(now, &silence, 0.0, self.playback.sounding())
+        {
+            self.segment(now, segment, out);
+        }
+        self.mark_pause(paused);
     }
 
     /// What a segment does to the turns, where what was heard so far ends (a window's, the end of that window).
@@ -364,6 +402,7 @@ impl Call {
                 })));
                 let mut actions = Vec::new();
                 self.playback.interrupt(StopReason::BargeIn, &mut actions);
+                self.continuing_chunk = None;
                 self.act(actions, out);
             }
             Segment::Paused { pcm, pause } => {
@@ -491,12 +530,25 @@ impl Call {
         }
     }
 
+    fn finish_pending(&mut self, now: u64, pending: Pending, out: &mut Vec<Effect>) {
+        let (last, earlier) = pending.turns.split_last().expect("a held transcript");
+        let merged = !earlier.is_empty();
+        if let Some(first) = earlier.first().and_then(|first| self.turns.get(first)) {
+            let started = first.started_ms;
+            if let Some(turn) = self.turns.get_mut(last) {
+                turn.started_ms = started;
+            }
+        }
+        self.close_turn(now, *last, Some(pending.text), merged, out);
+    }
+
     fn stop(&mut self, now: u64, out: &mut Vec<Effect>) {
         self.cancel_input(now, out);
         // The next start hears a new stream: nothing of this one's volume or speech carries over.
         self.segmenter = Segmenter::new(segmentation(&self.config));
         let mut actions = Vec::new();
         self.playback.interrupt(StopReason::Stopped, &mut actions);
+        self.continuing_chunk = None;
         self.act(actions, out);
         self.started = false;
         self.microphone_muted = false;
@@ -513,21 +565,38 @@ impl Call {
                 self.cancelled.remove(index);
                 Some(StopReason::Cancelled)
             } else {
-                (!self.started).then_some(StopReason::Stopped)
+                if !self.started {
+                    Some(StopReason::Stopped)
+                } else if !self.quiet(self.segmenter.speaking()) {
+                    Some(StopReason::BargeIn)
+                } else {
+                    None
+                }
             };
         if let Some(reason) = refused {
-            out.push(Effect::Say {
-                id,
-                event: SayEvent::Done {
-                    outcome: SayOutcome::NotPlayed { reason },
-                },
-            });
+            self.act(
+                vec![Action::Say {
+                    utterance: id,
+                    event: SayEvent::Done {
+                        outcome: SayOutcome::NotPlayed { reason },
+                    },
+                }],
+                out,
+            );
             return;
         }
         let language = language.or_else(|| self.config.language.clone());
         let mut actions = Vec::new();
         self.playback.push(id, text, language, &mut actions);
         self.act(actions, out);
+    }
+
+    fn playback_boundary(&mut self, was_sounding: bool) {
+        if was_sounding != self.playback.sounding()
+            || (!self.playback.busy() && self.continuing_chunk.take().is_some())
+        {
+            self.segmenter.reset_candidate();
+        }
     }
 
     /// Whether nothing of the person's holds the playback back: the call listens and no turn is open, being
@@ -544,15 +613,7 @@ impl Call {
     fn settle(&mut self, now: u64, out: &mut Vec<Effect>) {
         let speaking = self.segmenter.speaking();
         if let Some(pending) = self.recognition.due(now, speaking) {
-            let (last, earlier) = pending.turns.split_last().expect("a held transcript");
-            let merged = !earlier.is_empty();
-            if let Some(first) = earlier.first().and_then(|first| self.turns.get(first)) {
-                let started = first.started_ms;
-                if let Some(turn) = self.turns.get_mut(last) {
-                    turn.started_ms = started;
-                }
-            }
-            self.close_turn(now, *last, Some(pending.text), merged, out);
+            self.finish_pending(now, pending, out);
         }
         if self.quiet(speaking) && now >= self.quiet_until && !self.playback.busy() {
             let mut actions = Vec::new();
@@ -625,7 +686,7 @@ impl Call {
     /// Turns the playback's actions into effects.
     fn act(&mut self, actions: Vec<Action>, out: &mut Vec<Effect>) {
         for action in actions {
-            out.push(match action {
+            let effect = match action {
                 Action::Synthesize {
                     utterance,
                     chunk,
@@ -654,7 +715,8 @@ impl Call {
                     event,
                 },
                 Action::Error(code) => Effect::Event(VoiceEvent::Error(VoiceError { code })),
-            });
+            };
+            out.push(effect);
         }
     }
 
@@ -684,5 +746,6 @@ fn segmentation(config: &VoiceConfig) -> Segmentation {
         ask: smart,
         quiet_bar: config.listening_bar.quiet,
         playing_bar: config.listening_bar.playing,
+        barge_in_min_ms: (config.barge_in_min_speech.seconds() * 1_000.0).ceil() as u32,
     }
 }

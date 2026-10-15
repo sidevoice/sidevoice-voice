@@ -13,6 +13,7 @@
 mod devices;
 mod output;
 mod pipeline;
+mod shared;
 
 #[cfg(test)]
 mod tests;
@@ -28,8 +29,9 @@ use rtrb::{Consumer, Producer, RingBuffer};
 
 use self::devices::{by_id, Kind};
 pub use self::devices::{AudioDevice, AudioDevices, LostDevices, NativeDevices};
-use self::output::{Counters, Output, Queue};
+use self::output::{Counters, Output, Queue, ReferenceSample, Schedule};
 use self::pipeline::Pipeline;
+pub use self::shared::{InputPort, SharedNativeAudio};
 use crate::audio::Resampler;
 use crate::io::{AudioIo, IoEvent, IoSink};
 
@@ -191,6 +193,8 @@ fn run(
     let mut queue = Queue::default();
     let mut heard = Vec::new();
     let mut played = Vec::new();
+    let mut played_audio = Vec::new();
+    let mut queued_presence = Vec::new();
     let mut speaker_switch = false;
     let mut ending: Option<u64> = None;
     let mut had_chunks = false;
@@ -261,21 +265,33 @@ fn run(
         queue.feed(&mut speaker.playback);
         drain(&mut speaker.reference, &mut played, 1);
         drained_reference += played.len() as u64;
+        played_audio.clear();
+        queued_presence.clear();
+        played_audio.extend(played.iter().map(|sample: &ReferenceSample| sample.value));
+        queued_presence.extend(
+            played
+                .iter()
+                .map(|sample| f32::from(u8::from(sample.queued))),
+        );
         drain(&mut microphone.capture, &mut heard, microphone.channels);
         if changed.swap(false, Ordering::AcqRel) {
             pipeline.reinitialize();
         }
-        let rendered = pipeline.render(&played);
+        let rendered = pipeline.render(&played_audio);
+        let presence = pipeline.render_presence(&queued_presence);
         if (had_chunks || ending.is_some()) && !rendered.is_empty() {
-            sink.send(IoEvent::Rendered(rendered));
+            sink.send_physical_rendered(rendered, presence);
         }
-        for frame in pipeline.capture(&heard) {
-            sink.send(IoEvent::Captured(frame.to_vec()));
-        }
+        let frames = pipeline.capture(&heard);
         let consumed = speaker.counters.consumed.load(Ordering::Acquire);
-        for event in queue.schedule.due(consumed) {
-            sink.send(event);
-        }
+        // The callback publishes its consumed count after writing the reference. Report every playback boundary
+        // visible at this snapshot before the capture from this tick can qualify a turn and freeze its extent.
+        send_capture_after_playback(
+            &mut queue.schedule,
+            consumed,
+            frames.into_iter().map(|frame| frame.to_vec()),
+            |event| sink.send(event),
+        );
         // `consumed` is published after the callback's reference writes. A callback may run between the drain above
         // and this load; wait until its published reference tail has crossed the worker before ending the meter.
         if playback_complete(
@@ -292,6 +308,20 @@ fn run(
             had_chunks = false;
         }
         thread::sleep(TICK);
+    }
+}
+
+fn send_capture_after_playback(
+    schedule: &mut Schedule,
+    consumed: u64,
+    frames: impl IntoIterator<Item = Vec<f32>>,
+    mut send: impl FnMut(IoEvent),
+) {
+    for event in schedule.due(consumed) {
+        send(event);
+    }
+    for frame in frames {
+        send(IoEvent::Captured(frame));
     }
 }
 
@@ -390,7 +420,7 @@ impl Microphone {
 struct Speaker {
     _stream: Stream,
     playback: Producer<f32>,
-    reference: Consumer<f32>,
+    reference: Consumer<ReferenceSample>,
     counters: Arc<Counters>,
     rate: u32,
     /// Whether the chosen device went away under it.
@@ -525,7 +555,7 @@ fn failure(
 
 /// Moves what `ring` holds in whole frames of `channels` interleaved samples into `out`, after clearing it. A frame
 /// the callback has only begun to write stays in the ring for the next time.
-fn drain(ring: &mut Consumer<f32>, out: &mut Vec<f32>, channels: usize) {
+fn drain<T: Clone>(ring: &mut Consumer<T>, out: &mut Vec<T>, channels: usize) {
     out.clear();
     let slots = ring.slots();
     if let Ok(chunk) = ring.read_chunk(slots - slots % channels.max(1)) {

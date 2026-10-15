@@ -23,11 +23,18 @@ const SMOKE_JS: &str = include_str!("../npm/smoke.mjs");
 /// The slots the smoke test's models fill, recorded each time the call loads them.
 const SMOKE_SLOTS: [&str; 3] = ["vad", "transcriber", "speaker"];
 /// The calls of the voice seam, `VoiceHost` (js/voice-host.d.ts), sorted.
-const SEAM: [&str; 15] = [
+const SEAM: [&str; 5] = [
     "audioDevices",
-    "cancelInput",
-    "mute",
+    "createCall",
     "onAudioDevices",
+    "routeInput",
+    "setAudioDevices",
+];
+const CALL_SEAM: [&str; 14] = [
+    "cancelInput",
+    "dispose",
+    "id",
+    "mute",
     "onError",
     "onLevel",
     "onPlaybackLevel",
@@ -35,7 +42,6 @@ const SEAM: [&str; 15] = [
     "onTake",
     "onTurn",
     "say",
-    "setAudioDevices",
     "setSettings",
     "start",
     "stop",
@@ -201,6 +207,7 @@ fn check_smoke(report: &Value) -> Result<()> {
         // Float32Array, handed over before the stop resolved; no turn in it.
         "take": [[16_000, "Float32Array", 1_760, 110, 0]],
         "seam": SEAM,
+        "callSeam": CALL_SEAM,
         "playbackLevels": [true, 0, true],
     });
     if *host != want {

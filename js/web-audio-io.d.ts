@@ -50,17 +50,12 @@ export interface WebAudioIoOptions {
    * choose; the default output otherwise. A non-default output may escape the browser's echo canceller.
    */
   outputDevice?: string;
-  /**
-   * Whether the browser cancels the echo of what the call plays out of the microphone (`getUserMedia`'s
-   * `echoCancellation`): on unless `false`. Off, the call hears its own replies; for trying what it does without.
-   */
-  echoCancellation?: boolean;
 }
 
 /**
  * The browser's microphone (`getUserMedia` with its echo cancellation, at 16 kHz mono) and speaker (Web Audio).
  * Failures reach `sink.failed` as `microphone-denied`, `microphone-unavailable`, `microphone-lost`,
- * `audio-capture-failed` or `audio-output-failed`. Its devices can be chosen at any time (`setInputDevice`,
+ * `audio-capture-failed`, `echo-cancellation-unavailable` or `audio-output-failed`. Its devices can be chosen at any time (`setInputDevice`,
  * `setOutputDevice`); a chosen microphone that goes away falls back to the default one (`onDeviceLost`).
  */
 export function createWebAudioIo(options?: WebAudioIoOptions): AudioIo;

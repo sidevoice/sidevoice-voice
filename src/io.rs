@@ -12,7 +12,9 @@ use crate::voice_call::Message;
 mod native;
 
 #[cfg(native)]
-pub use native::{AudioDevice, AudioDevices, LostDevices, NativeDevices, NativeIo};
+pub use native::{
+    AudioDevice, AudioDevices, InputPort, LostDevices, NativeDevices, NativeIo, SharedNativeAudio,
+};
 
 /// What the microphone and the speaker tell the call.
 #[derive(Debug, Clone, PartialEq)]
@@ -53,6 +55,8 @@ pub struct IoSink {
     pub(crate) messages: UnboundedSender<Message>,
     pub(crate) generation: u64,
     pub(crate) rendered: Arc<Mutex<RenderedMailbox>>,
+    #[cfg_attr(web, allow(dead_code))]
+    pub(crate) direct_rendered: bool,
 }
 
 /// Only the newest rendered frame waits while the call task is occupied. A replacement marks a discontinuity so
@@ -94,6 +98,15 @@ impl IoSink {
     pub fn send(&self, event: IoEvent) {
         match event {
             IoEvent::Rendered(samples) => {
+                #[cfg(native)]
+                if self.direct_rendered {
+                    let _ = self.messages.unbounded_send(Message::PhysicalRendered(
+                        self.generation,
+                        vec![true; samples.len()],
+                        samples,
+                    ));
+                    return;
+                }
                 let mut mailbox = self.rendered.lock().expect("rendered mailbox");
                 if self.generation < mailbox.generation {
                     return;
@@ -122,6 +135,22 @@ impl IoSink {
                     .messages
                     .unbounded_send(Message::Io(self.generation, other));
             }
+        }
+    }
+
+    /// The native callback's rendered samples and its aligned queued-playback markers. Private to the physical
+    /// backend: ordinary AudioIo implementers retain the public Rendered event.
+    #[cfg(native)]
+    pub(crate) fn send_physical_rendered(&self, samples: Vec<f32>, queued: Vec<bool>) {
+        debug_assert_eq!(samples.len(), queued.len());
+        if self.direct_rendered {
+            let _ = self.messages.unbounded_send(Message::PhysicalRendered(
+                self.generation,
+                queued,
+                samples,
+            ));
+        } else {
+            self.send(IoEvent::Rendered(samples));
         }
     }
 }
@@ -160,6 +189,7 @@ mod tests {
             messages,
             generation: 1,
             rendered: Arc::clone(&mailbox),
+            direct_rendered: false,
         };
         for _ in 0..100 {
             sink.send(IoEvent::Rendered(vec![0.8; 160]));

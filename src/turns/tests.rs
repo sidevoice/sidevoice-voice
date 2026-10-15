@@ -19,6 +19,7 @@ const SMART: Segmentation = Segmentation {
     ask: true,
     quiet_bar: 0.5,
     playing_bar: 0.8,
+    barge_in_min_ms: 1_000,
 };
 
 /// `silence` at normal patience: speech stops after 0.2 s, a pause ends the turn 2.5 s after that.
@@ -219,12 +220,119 @@ fn the_bar_rises_while_a_reply_plays() {
 
     let mut segmenter = Segmenter::new(SMART);
     let mut windows = times(Heard(tone(LOUD), 0.02), 32);
-    windows.extend(times(speech(LOUD), 12));
+    windows.extend(times(speech(LOUD), 32));
     let segments = hear(&mut segmenter, &windows, true);
     assert!(
-        matches!(segments[..], [(43, Segment::Started)]),
+        matches!(segments[..], [(63, Segment::Started)]),
         "{segments:?}"
     );
+}
+
+#[test]
+fn overlap_needs_the_first_full_threshold_window_and_discards_short_preroll() {
+    let mut segmenter = Segmenter::new(SMART);
+    hear(&mut segmenter, &times(Heard(tone(LOUD), 0.02), 32), true);
+    assert!(hear(&mut segmenter, &times(speech(LOUD), 31), true).is_empty());
+    assert_eq!(segmenter.start_run(), 0);
+    assert!(hear(&mut segmenter, &times(silence(), 1), true).is_empty());
+    assert!(hear(&mut segmenter, &times(speech(LOUD), 31), true).is_empty());
+    let started = hear(&mut segmenter, &times(speech(LOUD), 1), true);
+    assert!(
+        matches!(started[..], [(0, Segment::Started)]),
+        "{started:?}"
+    );
+    assert_eq!(segmenter.start_run(), 32 * WINDOW);
+    let Some(Segment::Ended(ended)) = segmenter.poll(AUDIO_IDLE_MS) else {
+        panic!("turn")
+    };
+    assert_eq!(
+        ended.pcm.len(),
+        32 * WINDOW,
+        "short overlap leaked into pre-roll"
+    );
+}
+
+#[test]
+fn overlap_resets_on_low_volume_and_when_output_stops() {
+    let mut segmenter = Segmenter::new(SMART);
+    hear(&mut segmenter, &times(Heard(tone(LOUD), 0.02), 32), true);
+    assert!(hear(&mut segmenter, &times(speech(LOUD), 20), true).is_empty());
+    assert!(hear(&mut segmenter, &times(Heard(tone(LOUD), 0.02), 1), true).is_empty());
+    assert!(hear(&mut segmenter, &times(speech(LOUD), 31), true).is_empty());
+    // A candidate heard while output sounded cannot finish under the ordinary 400 ms bar.
+    let mut segmenter = Segmenter::new(SMART);
+    hear(&mut segmenter, &times(Heard(tone(LOUD), 0.02), 32), true);
+    assert!(hear(&mut segmenter, &times(speech(LOUD), 20), true).is_empty());
+    assert!(hear(&mut segmenter, &times(speech(LOUD), 11), false).is_empty());
+    assert!(matches!(
+        hear(&mut segmenter, &times(speech(LOUD), 1), false)[..],
+        [(0, Segment::Started)]
+    ));
+}
+
+#[test]
+fn below_volume_windows_reset_an_overlap_candidate() {
+    let mut segmenter = Segmenter::new(SMART);
+    hear(&mut segmenter, &times(Heard(tone(LOUD), 0.02), 32), true);
+    assert!(hear(&mut segmenter, &times(speech(LOUD), 10), true).is_empty());
+    // Confidence remains high: the level alone falls below the raised bar.
+    assert!(hear(&mut segmenter, &times(speech(MURMUR), 13), true).is_empty());
+    assert_eq!(
+        segmenter.barge_run, 0,
+        "the raised volume bar reset the candidate"
+    );
+    assert!(
+        segmenter.recent.is_empty(),
+        "failed overlap must not enter pre-roll"
+    );
+    assert!(hear(&mut segmenter, &times(speech(LOUD), 1), true).is_empty());
+    assert!(hear(&mut segmenter, &times(speech(LOUD), 64), true)
+        .iter()
+        .any(|(_, event)| event == &Segment::Started));
+}
+
+#[test]
+fn raised_bar_rejects_speech_just_below_point_eight_and_accepts_above_it() {
+    for (amplitude, accepted) in [(0.044, false), (0.046, true)] {
+        let mut segmenter = Segmenter::new(SMART);
+        hear(
+            &mut segmenter,
+            &times(Heard(tone(amplitude), 0.02), 80),
+            true,
+        );
+        let events = hear(&mut segmenter, &times(speech(amplitude), 32), true);
+        assert_eq!(
+            events.iter().any(|(_, event)| event == &Segment::Started),
+            accepted,
+            "volume {} at the 0.8 bar: {events:?}",
+            amplitude
+        );
+    }
+}
+
+#[test]
+fn a_lone_short_word_in_silence_uses_the_normal_start_detector() {
+    let mut segmenter = Segmenter::new(SMART);
+    hear(&mut segmenter, &times(Heard(tone(LOUD), 0.02), 32), false);
+    assert!(matches!(
+        hear(&mut segmenter, &times(speech(LOUD), 12), false)[..],
+        [(11, Segment::Started)]
+    ));
+}
+
+#[test]
+fn configured_overlap_duration_counts_capture_samples() {
+    let mut segmenter = Segmenter::new(Segmentation {
+        barge_in_min_ms: 1_250,
+        ..SMART
+    });
+    hear(&mut segmenter, &times(Heard(tone(LOUD), 0.02), 32), true);
+    assert!(hear(&mut segmenter, &times(speech(LOUD), 39), true).is_empty());
+    assert!(matches!(
+        hear(&mut segmenter, &times(speech(LOUD), 1), true)[..],
+        [(0, Segment::Started)]
+    ));
+    assert_eq!(segmenter.start_run(), 40 * WINDOW);
 }
 
 #[test]

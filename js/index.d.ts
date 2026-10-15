@@ -5,6 +5,8 @@ import type { VoiceCallEvent, VoiceSaying, VoiceSayOptions } from "./voice-event
 export { default, initSync, IoSink } from "../dist/sidevoice_voice.js";
 export type { InitInput, InitOutput, SyncInitInput } from "../dist/sidevoice_voice.js";
 export { createWebAudioIo } from "./web-audio-io.js";
+export { createSharedWebAudioIo } from "./shared-web-audio-io.js";
+export type { SharedWebAudioIo, InputPort } from "./shared-web-audio-io.js";
 export type { AudioIo, AudioIoSink, WebAudioIoOptions } from "./web-audio-io.js";
 export type {
   VoiceAudio,
@@ -17,7 +19,7 @@ export type {
   VoiceVadFrame,
 } from "./voice-models.js";
 
-/** One voice call: it tells the page its events and says what the page asks it to. It knows nothing of the room. */
+/** One voice call: it tells the page its events and says what the page asks it to. It carries no application routing metadata. */
 export interface VoiceCall {
   /** Hears every event from now on: turns, state, level, errors. */
   onEvent(listener: (event: VoiceCallEvent) => void): void;
@@ -32,7 +34,7 @@ export interface VoiceCall {
   setModels(models: VoiceModels, config: object): void;
   /** Says `text` after whatever is being said; the handle tells how it goes and cancels it. */
   say(text: string, options?: VoiceSayOptions): VoiceSaying;
-  /** Mutes or unmutes the microphone; muting ends the open turn with what was said. */
+  /** Mutes or unmutes the microphone; muted input counts as silence and closes a turn normally. */
   mute(muted: boolean): void;
   /** Cancels what the person said that is not told yet. */
   cancelInput(): void;
@@ -70,6 +72,7 @@ export type {
   VoiceAudioDevice,
   VoiceAudioDevices,
   VoiceHost,
+  VoiceCallHost,
   VoiceHostError,
   VoiceHostOptions,
   VoiceModelSource,

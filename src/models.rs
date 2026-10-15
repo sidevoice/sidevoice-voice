@@ -3,13 +3,18 @@
 //! through [`VoiceModels`], which the call asks to load on start and drops once the call has been stopped for its idle
 //! minutes. Which model fills each slot, and where it runs, is the app's: nothing here names one. Failures are stable
 //! codes.
+#![cfg_attr(web, allow(clippy::arc_with_non_send_sync))]
+// The public model interfaces use Arc on both targets. Browser models are intentionally local to its event loop.
 //!
 //! In the wasm32 build the app's models are JavaScript objects with the same methods (`web`, and
 //! `js/voice-models.d.ts`).
 
 mod web;
 
-use std::sync::Arc;
+#[cfg(test)]
+mod tests;
+
+use std::sync::{Arc, Mutex, Weak};
 
 use async_trait::async_trait;
 
@@ -24,6 +29,147 @@ pub(crate) use web::JsVoiceModels;
 pub trait VoiceModels: MaybeSend + MaybeSync {
     /// The models, loaded and ready; a stable code when one cannot be.
     async fn load(&self) -> Result<Models, String>;
+}
+
+/// Creates a fresh detector stream from one loaded detector model. Its weights may be shared, but a stream's
+/// recurrent/window state belongs to one call.
+#[cfg_attr(native, async_trait)]
+#[cfg_attr(web, async_trait(?Send))]
+pub trait VadFactory: MaybeSend + MaybeSync {
+    async fn new_stream(&self) -> Result<Box<dyn Vad>, String>;
+}
+
+/// Loads a model choice when no live or idle call still owns its previous resources.
+#[cfg_attr(native, async_trait)]
+#[cfg_attr(web, async_trait(?Send))]
+pub trait SharedModelLoader: MaybeSend + MaybeSync {
+    async fn load(&self) -> Result<SharedModelResources, String>;
+}
+
+/// One loaded choice. Its resources remain alive only while call leases or in-flight requests hold them.
+pub struct SharedModelResources {
+    pub vad: Arc<dyn VadFactory>,
+    pub transcriber: Arc<dyn Transcriber>,
+    pub speaker: Arc<dyn Speaker>,
+    pub end_of_turn: Option<Arc<dyn EndOfTurnModel>>,
+}
+
+struct ResourceLease {
+    models: SharedModelResources,
+    transcriber: LoadLock,
+    speaker: LoadLock,
+    end_of_turn: LoadLock,
+}
+
+#[cfg(native)]
+type LoadLock = tokio::sync::Mutex<()>;
+#[cfg(web)]
+type LoadLock = futures_util::lock::Mutex<()>;
+
+/// A lightweight, restartable provider. It keeps only a weak pool entry; the call's loaded `Models` and any
+/// in-flight request own the strong lease. The final idle-unload releases the resources without dropping call handles.
+pub struct SharedModels {
+    loader: Arc<dyn SharedModelLoader>,
+    cached: Mutex<Weak<ResourceLease>>,
+    loading: LoadLock,
+}
+
+impl SharedModels {
+    #[must_use]
+    pub fn new(loader: Arc<dyn SharedModelLoader>) -> Self {
+        Self {
+            loader,
+            cached: Mutex::new(Weak::new()),
+            loading: LoadLock::new(()),
+        }
+    }
+}
+
+#[cfg_attr(native, async_trait)]
+#[cfg_attr(web, async_trait(?Send))]
+impl VoiceModels for SharedModels {
+    async fn load(&self) -> Result<Models, String> {
+        let _loading = self.loading.lock().await;
+        let cached = self.cached.lock().expect("shared model pool").upgrade();
+        let lease = match cached {
+            Some(lease) => lease,
+            None => {
+                let lease = Arc::new(ResourceLease {
+                    models: self.loader.load().await?,
+                    transcriber: LoadLock::new(()),
+                    speaker: LoadLock::new(()),
+                    end_of_turn: LoadLock::new(()),
+                });
+                *self.cached.lock().expect("shared model pool") = Arc::downgrade(&lease);
+                lease
+            }
+        };
+        let vad = lease.models.vad.new_stream().await?;
+        let has_end_of_turn = lease.models.end_of_turn.is_some();
+        Ok(Models {
+            vad,
+            transcriber: Arc::new(LeasedTranscriber(Arc::clone(&lease))),
+            speaker: Arc::new(LeasedSpeaker(Arc::clone(&lease))),
+            end_of_turn: has_end_of_turn
+                .then(|| Arc::new(LeasedEndOfTurn(lease)) as Arc<dyn EndOfTurnModel>),
+        })
+    }
+}
+
+struct LeasedTranscriber(Arc<ResourceLease>);
+struct LeasedSpeaker(Arc<ResourceLease>);
+struct LeasedEndOfTurn(Arc<ResourceLease>);
+
+#[cfg_attr(native, async_trait)]
+#[cfg_attr(web, async_trait(?Send))]
+impl Transcriber for LeasedTranscriber {
+    async fn transcribe(
+        &self,
+        pcm: Vec<f32>,
+        sample_rate: u32,
+        language: Option<String>,
+    ) -> Result<String, String> {
+        let _request = self.0.transcriber.lock().await;
+        self.0
+            .models
+            .transcriber
+            .transcribe(pcm, sample_rate, language)
+            .await
+    }
+}
+
+#[cfg_attr(native, async_trait)]
+#[cfg_attr(web, async_trait(?Send))]
+impl Speaker for LeasedSpeaker {
+    async fn speak(
+        &self,
+        text: String,
+        voice: Option<String>,
+        language: Option<String>,
+        speed: f32,
+    ) -> Result<(Vec<f32>, u32), String> {
+        let _request = self.0.speaker.lock().await;
+        self.0
+            .models
+            .speaker
+            .speak(text, voice, language, speed)
+            .await
+    }
+}
+
+#[cfg_attr(native, async_trait)]
+#[cfg_attr(web, async_trait(?Send))]
+impl EndOfTurnModel for LeasedEndOfTurn {
+    async fn end_of_turn(&self, pcm: Vec<f32>, sample_rate: u32) -> Result<f32, String> {
+        let _request = self.0.end_of_turn.lock().await;
+        self.0
+            .models
+            .end_of_turn
+            .as_ref()
+            .expect("leased end-of-turn model")
+            .end_of_turn(pcm, sample_rate)
+            .await
+    }
 }
 
 /// The models of one call.

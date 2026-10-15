@@ -50,15 +50,17 @@ export interface VoiceEndOfTurn {
   endOfTurn(samples: Float32Array, sampleRate: number): number | Promise<number>;
 }
 
-/** Where a call's models come from: `load()` as the call starts; what it answered is dropped once the call has been
- *  stopped for its `idle_unload_minutes`, and loaded again by the next start. */
+/** A lightweight loader, safe to retain after its resources are evicted. `load()` runs on the next start when the
+ *  last call lease has expired. Keep loaded weights in its answer, not in this loader. */
 export interface VoiceModels {
   load(): VoiceLoadedModels | Promise<VoiceLoadedModels>;
 }
 
-/** The models of one call. Without `endOfTurn`, `smart-turn` refuses to start (`end-of-turn-missing`). */
+/** Loaded model resources leased by active calls and their idle-unload timers. `createVad` gives each call a fresh
+ *  detector stream. Without `endOfTurn`, `smart-turn` refuses to start (`end-of-turn-missing`). */
 export interface VoiceLoadedModels {
-  vad: VoiceVad;
+  /** A fresh detector stream for every call; loaded weights may be shared. */
+  createVad(): VoiceVad | Promise<VoiceVad>;
   transcriber: VoiceTranscriber;
   speaker: VoiceSpeaker;
   endOfTurn?: VoiceEndOfTurn;

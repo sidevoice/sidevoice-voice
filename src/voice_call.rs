@@ -18,6 +18,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures_channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
+#[cfg(native)]
+use futures_channel::oneshot;
 use futures_util::future::{abortable, ready, select, AbortHandle, Either};
 use futures_util::{stream, Stream, StreamExt};
 
@@ -77,9 +79,14 @@ pub(crate) enum Message {
     CancelSay(String),
     Mute(bool),
     CancelInput,
+    /// The shared native input router applies this after preceding captured frames.
+    #[cfg(native)]
+    SharedRoute(u64, oneshot::Sender<Result<(), String>>),
     Models(Arc<dyn VoiceModels>, Box<VoiceConfig>),
     Io(u64, IoEvent),
     Rendered(u64),
+    #[cfg(native)]
+    PhysicalRendered(u64, Vec<bool>, Vec<f32>),
     EndOfTurn {
         turn: usize,
         pause: u32,
@@ -432,6 +439,10 @@ impl Driver {
                 self.input(Input::Mute(muted));
             }
             Message::CancelInput => self.input(Input::Cancel),
+            #[cfg(native)]
+            Message::SharedRoute(_, _) => {}
+            #[cfg(native)]
+            Message::PhysicalRendered(_, _, _) => {}
             Message::Io(generation, _) if generation != self.generation => {}
             Message::Rendered(generation) => {
                 let frame = self
@@ -464,7 +475,10 @@ impl Driver {
             Message::Io(_, IoEvent::Rendered(pcm)) => {
                 self.accept_rendered(&pcm);
             }
-            Message::Io(_, IoEvent::PlaybackEnded) => self.reset_playback(),
+            Message::Io(_, IoEvent::PlaybackEnded) => {
+                self.input(Input::PlaybackEnded);
+                self.reset_playback();
+            }
             Message::Io(_, IoEvent::ChunkStarted { utterance, chunk }) => {
                 self.input(Input::ChunkStarted { utterance, chunk });
             }
@@ -549,6 +563,7 @@ impl Driver {
             messages: self.messages.clone(),
             generation: self.generation,
             rendered: Arc::clone(&self.rendered_mailbox),
+            direct_rendered: false,
         };
         if let Err(code) = self.io.start(sink) {
             self.error(code);

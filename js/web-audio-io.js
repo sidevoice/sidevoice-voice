@@ -39,11 +39,11 @@ const CAPTURE = {
  * A non-default output may escape the browser's echo canceller, which takes its reference from what it plays out:
  * whether it does on each browser is an open point of sidevoice-core#89, to be checked before the web beta.
  *
- * `options.echoCancellation: false` turns the browser's echo canceller off (on by default), to hear what the call
- * does without it; noise suppression and gain control stay as they are.
+ * Capture always requests browser echo cancellation. The browser supplies its own rendered output as the reference;
+ * the playback worklet's rendered samples are telemetry only and never used to detect speech.
  */
 export function createWebAudioIo(options = {}) {
-  const { echoCancellation = true, onDeviceLost } = options;
+  const { onDeviceLost } = options;
   // The chosen devices' ids; null is the system's default.
   let inputDevice = options.inputDevice || null;
   let outputDevice = options.outputDevice || null;
@@ -146,10 +146,16 @@ export function createWebAudioIo(options = {}) {
     if (!navigator.mediaDevices?.getUserMedia) {
       throw Object.assign(new Error("no getUserMedia"), { code: "microphone-unavailable" });
     }
-    const audio = { ...CAPTURE, echoCancellation: echoCancellation !== false, ...(id ? { deviceId: { exact: id } } : {}) };
+    const audio = { ...CAPTURE, ...(id ? { deviceId: { exact: id } } : {}) };
     try {
-      return await navigator.mediaDevices.getUserMedia({ audio });
+      const media = await navigator.mediaDevices.getUserMedia({ audio });
+      if (media.getAudioTracks().some((track) => track.getSettings?.().echoCancellation === false)) {
+        media.getTracks().forEach((track) => track.stop());
+        throw Object.assign(new Error("echo cancellation unavailable"), { code: "echo-cancellation-unavailable" });
+      }
+      return media;
     } catch (error) {
+      if (error?.code === "echo-cancellation-unavailable") throw error;
       const denied = error?.name === "NotAllowedError" || error?.name === "SecurityError";
       throw Object.assign(new Error(error?.message || "getUserMedia"), { code: denied ? "microphone-denied" : "microphone-unavailable" });
     }

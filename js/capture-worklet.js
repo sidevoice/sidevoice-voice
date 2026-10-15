@@ -46,6 +46,23 @@ class CaptureProcessor extends AudioWorkletProcessor {
     this.previous = 0;
     this.frame = new Float32Array(FRAME);
     this.filled = 0;
+    this.route = null;
+    this.pendingRoutes = [];
+    this.port.onmessage = ({ data }) => {
+      if (data?.type === "route") {
+        this.pendingRoutes.push(data.generation);
+        if (this.filled === 0) this.applyRoutes();
+      }
+    };
+  }
+
+  // A route begins only after the preceding 160-sample frame is complete. The acknowledgement follows all captured
+  // frames from the old route on the same port, so the main thread can keep their original owner.
+  applyRoutes() {
+    for (const generation of this.pendingRoutes.splice(0)) {
+      this.route = generation;
+      this.port.postMessage({ type: "routed", generation });
+    }
   }
 
   process(inputs) {
@@ -80,9 +97,10 @@ class CaptureProcessor extends AudioWorkletProcessor {
   push(sample) {
     this.frame[this.filled++] = sample;
     if (this.filled === FRAME) {
-      this.port.postMessage(this.frame, [this.frame.buffer]);
+      this.port.postMessage(this.route === null ? this.frame : { type: "captured", generation: this.route, samples: this.frame }, [this.frame.buffer]);
       this.frame = new Float32Array(FRAME);
       this.filled = 0;
+      this.applyRoutes();
     }
   }
 }

@@ -1,6 +1,6 @@
 use serde_json::json;
 
-use super::{EndOfTurn, Patience, VoiceConfig};
+use super::{BargeInMinSpeech, EndOfTurn, Patience, VoiceConfig};
 
 #[cfg(web)]
 use wasm_bindgen_test::wasm_bindgen_test as test;
@@ -18,6 +18,7 @@ fn a_configuration_reads_with_its_defaults_and_names_no_model() {
     assert_eq!(config.audio_grace_ms, 1_000);
     assert_eq!(config.idle_unload_minutes, 10);
     assert_eq!(config.speed, 1.0);
+    assert_eq!(config.barge_in_min_speech.seconds(), 1.0);
     assert_eq!(
         (config.listening_bar.quiet, config.listening_bar.playing),
         (0.5, 0.8)
@@ -30,6 +31,19 @@ fn a_configuration_reads_with_its_defaults_and_names_no_model() {
         serde_json::from_value::<VoiceConfig>(json!({})).unwrap(),
         VoiceConfig::default()
     );
+}
+
+#[test]
+fn barge_in_duration_must_be_finite_and_positive() {
+    for value in [json!(0), json!(-1), json!(61), json!("NaN")] {
+        assert!(
+            serde_json::from_value::<VoiceConfig>(json!({"barge_in_min_speech": value})).is_err()
+        );
+    }
+    let custom: VoiceConfig = serde_json::from_value(json!({"barge_in_min_speech": 1.25})).unwrap();
+    assert_eq!(custom.barge_in_min_speech.seconds(), 1.25);
+    assert!(BargeInMinSpeech::new(f32::NAN).is_err());
+    assert!(BargeInMinSpeech::new(f32::INFINITY).is_err());
 }
 
 #[test]
