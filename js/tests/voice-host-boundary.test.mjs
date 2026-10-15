@@ -15,7 +15,11 @@ class TestCall {
   static create() { return TestCall.last = new TestCall(); }
   onEvent(listener) { this.listener = listener; }
   mute() {}
-  async setCaptureBoundary(id) { this.boundaries = [...(this.boundaries ?? []), id]; this.boundary = id; }
+  async setCaptureBoundary(id) {
+    if (this.gate) await this.gate;
+    this.boundaries = [...(this.boundaries ?? []), id];
+    this.boundary = id;
+  }
   emit(phase, turn_id, text, capture_boundary_id = this.boundary) {
     this.listener({ type: "turn", data: { phase, turn_id, capture_boundary_id, ...(text ? { text } : {}) } });
   }
@@ -45,7 +49,15 @@ test("host forwards capture boundary and routes each terminal by its started tur
 
   // A is still in STT when the host changes focus. The terminal can follow B's start.
   call.emit("started", "a-stt");
-  await host.setCaptureBoundary("next-b");
+  let release;
+  call.gate = new Promise((resolve) => { release = resolve; });
+  let acknowledged = false;
+  const boundary = host.setCaptureBoundary("next-b").then(() => { acknowledged = true; });
+  await Promise.resolve();
+  assert.equal(acknowledged, false, "the host waits for the engine's boundary acknowledgement");
+  release();
+  await boundary;
+  delete call.gate;
   selected = "B";
   call.emit("started", "b-stt");
   call.emit("finished", "a-stt", "Private instruction for A.", "initial-a");
