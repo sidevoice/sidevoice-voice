@@ -65,6 +65,7 @@ test("two calls share loaded weights but get separate detector streams and audio
   await owner.routeInput(b);
   assert.equal(io.routed, io.attached[1].port);
   await a.stop();
+  assert.equal(loads, 1);
   assert.equal(io.attached[1].io.sink !== null, true);
   await a.dispose();
   assert.equal(io.attached[0].io.disposed, true);

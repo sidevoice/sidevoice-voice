@@ -97,7 +97,7 @@ fn a_smoke_report_must_show_a_running_call() {
             "outputSelectable": true, "heard": ["muted", "ready", "unmuted", "muted", "audio-capture-failed"],
         },
         "host": {
-            "missing": "settings-missing", "unknown": "model-unknown", "reloaded": 0,
+            "missing": "settings-missing", "unknown": "model-unknown", "reloaded": 1,
             "smartMissing": "end-of-turn-missing", "flags": ["muted"],
             "early": "not-played", "said": ["function", "heard"],
             "started": "resolved", "again": "resolved", "restarted": "resolved", "afterRestart": "listening",

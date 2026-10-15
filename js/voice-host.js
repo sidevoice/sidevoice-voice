@@ -30,6 +30,8 @@ export function createVoiceHost(source, options = {}) {
   const calls = new Map();
   const loads = new Map();
   const providers = new Map();
+  const users = new Map();
+  const idleTimers = new Map();
   let nextId = 0;
   const mediaDevices = () => globalThis.navigator?.mediaDevices;
   async function devices() {
@@ -73,6 +75,25 @@ export function createVoiceHost(source, options = {}) {
     }
     return loads.get(key);
   }
+  function retain(key, id) {
+    clearTimeout(idleTimers.get(key));
+    idleTimers.delete(key);
+    if (!users.has(key)) users.set(key, new Set());
+    users.get(key).add(id);
+  }
+  function release(key, id, minutes) {
+    if (!key) return;
+    users.get(key)?.delete(id);
+    if (users.get(key)?.size) return;
+    clearTimeout(idleTimers.get(key));
+    const evict = () => { if (!users.get(key)?.size) { loads.delete(key); providers.delete(key); users.delete(key); } idleTimers.delete(key); };
+    if (minutes <= 0) evict();
+    else {
+      const timer = setTimeout(evict, minutes * 60_000);
+      timer.unref?.();
+      idleTimers.set(key, timer);
+    }
+  }
   function createCall() {
     const id = `call-${++nextId}`;
     const { io, input: port } = audio.attach();
@@ -83,6 +104,7 @@ export function createVoiceHost(source, options = {}) {
     let stopping = 0;
     let taking = false;
     let muted = false;
+    let idleMinutes = 10;
     let disposed = false;
     let waiting = [];
     const answers = [];
@@ -96,6 +118,7 @@ export function createVoiceHost(source, options = {}) {
         else { listening = !idle; if (idle) active = false; else settle(null); }
       } else if (kind === "error" && stopping === 0 && !listening) {
         active = false;
+        release(chosen, id, idleMinutes);
         settle(fail(data.code));
       }
       for (const listener of listeners[kind] || []) { try { listener(data); } catch (_) { /* listener owns its error */ } }
@@ -123,19 +146,22 @@ export function createVoiceHost(source, options = {}) {
         if (!call) { call = WasmVoiceCall.create(models, io, config); call.onEvent(receive); call.mute(muted); }
         else if (models) call.setModels(models, config);
         else call.setConfig(config);
+        if (changed && active) { release(chosen, id, idleMinutes); retain(key, id); }
         chosen = key;
+        idleMinutes = settings.idle_unload_minutes ?? 10;
       },
       start(options = {}) {
         if (disposed) return Promise.reject(fail("stopped"));
         if (!call) return Promise.reject(fail("settings-missing", "set the voice settings first"));
         if (listening && stopping === 0) return Promise.resolve();
         const started = new Promise((resolve, reject) => waiting.push({ resolve, reject }));
-        if (!active) { active = true; taking = options?.take === true; call.start({ take: taking }); }
+        if (!active) { active = true; retain(chosen, id); taking = options?.take === true; call.start({ take: taking }); }
         return started;
       },
       async stop() {
         settle(fail("stopped"));
         if (!call) return;
+        release(chosen, id, idleMinutes);
         stopping++; active = false; listening = false;
         const kept = taking; taking = false;
         const answered = new Promise((resolve) => answers.push(resolve));
@@ -149,7 +175,6 @@ export function createVoiceHost(source, options = {}) {
         await hostCall.stop();
         io.dispose?.();
         calls.delete(id);
-        if (calls.size === 0) { loads.clear(); providers.clear(); }
       },
       say(text, options = {}) { return !disposed && call ? call.say(String(text), options) : notPlayed(); },
       mute(value) { muted = !!value; call?.mute(muted); },
