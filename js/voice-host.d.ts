@@ -38,8 +38,9 @@ export interface VoiceSettings {
     [choice: string]: unknown;
   };
   patience?: "fast" | "normal" | "calm";
-  /** `silence` by default; `smart-turn` needs `source` to give an end-of-turn model. */
-  end_of_turn?: "silence" | "smart-turn";
+  /** What ends a turn: `silence` by default; `smart-turn` needs `source` to give an end-of-turn model; with `manual`
+   *  no pause does: the turn goes on until the microphone is muted (`mute`), and is transcribed whole. */
+  end_of_turn?: "silence" | "smart-turn" | "manual";
   /** How long the models stay in memory with the call stopped, in minutes (10 by default; 0: they leave as it stops).
    *  The next `start` loads them again. */
   idle_unload_minutes?: number;

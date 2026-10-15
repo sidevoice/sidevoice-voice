@@ -15,7 +15,7 @@ const WINDOW: usize = 512;
 /// `smart-turn` at normal patience: speech stops after 0.9 s, a pause ends the turn 3 s after that.
 const SMART: Segmentation = Segmentation {
     stop_ms: 900,
-    end_ms: 3_000,
+    end_ms: Some(3_000),
     ask: true,
     quiet_bar: 0.5,
     playing_bar: 0.8,
@@ -24,9 +24,15 @@ const SMART: Segmentation = Segmentation {
 /// `silence` at normal patience: speech stops after 0.2 s, a pause ends the turn 2.5 s after that.
 const SILENCE: Segmentation = Segmentation {
     stop_ms: 200,
-    end_ms: 2_500,
+    end_ms: Some(2_500),
     ask: false,
     ..SMART
+};
+
+/// `manual`: speech stops after 0.2 s, and no pause ends the turn.
+const MANUAL: Segmentation = Segmentation {
+    end_ms: None,
+    ..SILENCE
 };
 
 /// Speech at a normal level: −23 LUFS, a volume of 0.87.
@@ -200,6 +206,26 @@ fn with_silence_a_pause_ends_the_turn_2_5_s_after_speech_stopped_and_asks_nothin
         panic!("{segments:?}")
     };
     assert_eq!(ended.silence_ms, 85 * 32);
+}
+
+#[test]
+fn with_manual_no_pause_ends_the_turn_and_closing_it_ends_it_with_all_that_was_said() {
+    let mut segmenter = speaking(MANUAL);
+    hear(&mut segmenter, &times(speech(LOUD), 60), false);
+    // Ten seconds without speech: a pause, and the turn goes on.
+    assert!(hear(&mut segmenter, &times(silence(), 313), false).is_empty());
+    assert!(segmenter.speaking() && segmenter.paused());
+    assert!(hear(&mut segmenter, &times(speech(LOUD), 30), false).is_empty());
+    assert!(segmenter.speaking() && !segmenter.paused());
+    let Some(Segment::Ended(ended)) = segmenter.close(0) else {
+        panic!("closed")
+    };
+    // The second before the window speech started with, the window, and all after it: the speech and the pause.
+    assert_eq!(
+        ended.pcm.len(),
+        PRE_ROLL + WINDOW + (60 + 313 + 30) * WINDOW
+    );
+    assert!(!segmenter.speaking());
 }
 
 #[test]

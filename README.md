@@ -121,10 +121,10 @@ Their failures are errors with stable codes: `microphone-denied`, `microphone-un
 `audio-capture-failed`, `audio-output-failed`.
 
 - **The configuration** (`VoiceConfig`, read strictly from JSON) names no model: the `language` the transcriber is
-  given, the speaker's `voice` and `speed`, what ends a turn (`end_of_turn`: `silence`, or `smart-turn`, which needs
-  an `EndOfTurnModel`), the `patience` (`fast`, `normal`, `calm`), the grace before anything is said
-  (`audio_grace_ms`, 1 s), the listening bar, and how long the models stay loaded with the call stopped
-  (`idle_unload_minutes`, 10; 0 drops them as it stops). A new configuration is in effect at once.
+  given, the speaker's `voice` and `speed`, what ends a turn (`end_of_turn`: `silence`; `smart-turn`, which needs
+  an `EndOfTurnModel`; or `manual`, where no pause does), the `patience` (`fast`, `normal`, `calm`), the grace before
+  anything is said (`audio_grace_ms`, 1 s), the listening bar, and how long the models stay loaded with the call
+  stopped (`idle_unload_minutes`, 10; 0 drops them as it stops). A new configuration is in effect at once.
 - **`start` loads the models** if they are not loaded. They stay across stops, and are dropped once the call has been
   stopped for `idle_unload_minutes`; the next start loads them again, on the web as natively. `smart-turn` without an
   end-of-turn model refuses to start with `end-of-turn-missing`. A model that cannot load, and every other failure a
@@ -241,12 +241,12 @@ time; a task around it (`src/voice_call.rs`) feeds it and does what it answers.
   and the volume clears the listening bar: the loudness of the last 400 ms (ITU-R BS.1770), from −110 LUFS (0) to −10
   LUFS (1), smoothed, at least 0.5 (−60 LUFS), and 0.8 (−30 LUFS) while something plays. Speech starts after 400 ms of
   such windows and stops after a stretch without any: 0.6, 0.9 or 1.3 s by patience with `smart-turn`, 0.2 s with
-  `silence`; a breath or a click shorter than that changes nothing. A turn opens where speech starts, with the second
-  of audio before it. Where speech stops a pause begins: with `smart-turn` the end-of-turn model is asked, at every
-  stop, about the turn so far (from 0.9 s before its speech started, its last 8 s); more than 0.5 ends the turn there,
-  and the pause ends it anyway 2.5, 3 or 4 s after the stop. With `silence` the pause ends it 2, 2.5 or 3.5 s after the
-  stop. Speech that starts again ends the pause. A turn also ends when its audio stops arriving for 5 s or the
-  microphone is muted, and keeps at most a minute.
+  `silence` and `manual`; a breath or a click shorter than that changes nothing. A turn opens where speech starts,
+  with the second of audio before it. Where speech stops a pause begins: with `smart-turn` the end-of-turn model is
+  asked, at every stop, about the turn so far (from 0.9 s before its speech started, its last 8 s); more than 0.5 ends
+  the turn there, and the pause ends it anyway 2.5, 3 or 4 s after the stop. With `silence` the pause ends it 2, 2.5
+  or 3.5 s after the stop; with `manual` no pause ends it. Speech that starts again ends the pause. A turn also ends
+  when its audio stops arriving for 5 s or the microphone is muted, and keeps at most a minute.
 - **Recognition.** Turns are transcribed in order, one at a time, at most eight waiting. A transcript is dropped
   when it is empty, or written in no Latin letter for a language that is; the turn is then
   `cancelled`. Otherwise it waits the merge window (none, 0.5 or 1.5 s by patience): a turn that follows within it

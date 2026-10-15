@@ -42,6 +42,8 @@ fn an_unknown_key_is_an_error() {
     );
     let smart: EndOfTurn = serde_json::from_value(json!("smart-turn")).unwrap();
     assert_eq!(smart, EndOfTurn::SmartTurn);
+    let manual: EndOfTurn = serde_json::from_value(json!("manual")).unwrap();
+    assert_eq!(manual, EndOfTurn::Manual);
 }
 
 #[test]

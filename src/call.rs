@@ -666,22 +666,22 @@ impl Call {
 }
 
 /// The numbers segmentation takes from a configuration: with `smart-turn`, the patience's stop and longest pause;
-/// with `silence`, a short stop and the patience's silence after it.
+/// with `silence`, a short stop and the patience's silence after it; with `manual`, a short stop and no pause that
+/// ends the turn.
 fn segmentation(config: &VoiceConfig) -> Segmentation {
     let patience = config.patience;
-    let smart = config.end_of_turn == EndOfTurn::SmartTurn;
+    let (stop_ms, end_ms) = match config.end_of_turn {
+        EndOfTurn::SmartTurn => (
+            patience.smart_turn_stop_ms(),
+            Some(patience.smart_turn_longest_ms()),
+        ),
+        EndOfTurn::Silence => (SILENCE_STOP_MS, Some(patience.silence_ms())),
+        EndOfTurn::Manual => (SILENCE_STOP_MS, None),
+    };
     Segmentation {
-        stop_ms: if smart {
-            patience.smart_turn_stop_ms()
-        } else {
-            SILENCE_STOP_MS
-        },
-        end_ms: if smart {
-            patience.smart_turn_longest_ms()
-        } else {
-            patience.silence_ms()
-        },
-        ask: smart,
+        stop_ms,
+        end_ms,
+        ask: config.end_of_turn == EndOfTurn::SmartTurn,
         quiet_bar: config.listening_bar.quiet,
         playing_bar: config.listening_bar.playing,
     }

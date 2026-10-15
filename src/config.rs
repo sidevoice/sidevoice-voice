@@ -64,6 +64,9 @@ pub enum EndOfTurn {
     /// The app's end-of-turn model ([`EndOfTurnModel`](crate::EndOfTurnModel)), asked at each pause; a pause as long
     /// as the patience's longest ends the turn anyway.
     SmartTurn,
+    /// No pause, however long: the turn ends only as the microphone is muted, or as its audio stops arriving or fills
+    /// it, with all that was said in it.
+    Manual,
 }
 
 /// How patient the call is with pauses: one word for a person to choose, which sets the numbers

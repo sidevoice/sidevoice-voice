@@ -8,8 +8,8 @@
 //! - A turn opens where speech starts, with the second of audio before it (the pre-roll).
 //! - Where speech stops inside a turn, a pause begins. With `smart-turn` the turn's audio so far is offered to an
 //!   end-of-turn model, at each stop; the turn ends when it says the turn is over, or once the pause has lasted
-//!   `end_ms` whatever it says. With `silence`, the pause ends the turn once it has lasted `end_ms`. Speech that starts
-//!   again ends the pause, and the turn goes on.
+//!   `end_ms` whatever it says. With `silence`, the pause ends the turn once it has lasted `end_ms`; with `manual`, no
+//!   pause ends it. Speech that starts again ends the pause, and the turn goes on.
 //! - A turn also ends when the audio stops arriving, and when it is closed or cancelled. It holds at most a minute of
 //!   audio: what comes after is not kept.
 
@@ -56,8 +56,8 @@ pub(crate) const AUDIO_IDLE_MS: u64 = 5_000;
 pub(crate) struct Segmentation {
     /// How long the detector must hear no speech before it says speech stopped, in milliseconds.
     pub(crate) stop_ms: u32,
-    /// How long a pause lasts, from that stop, before it ends the turn, in milliseconds.
-    pub(crate) end_ms: u32,
+    /// How long a pause lasts, from that stop, before it ends the turn, in milliseconds; `None`: no pause ends it.
+    pub(crate) end_ms: Option<u32>,
     /// Whether each stop offers the turn's audio to an end-of-turn model (`smart-turn`).
     pub(crate) ask: bool,
     /// The volume speech needs.
@@ -226,9 +226,9 @@ impl Segmenter {
                 }
             }
             None => {
-                if let Some(paused) = &mut open.paused {
+                if let (Some(paused), Some(end_ms)) = (&mut open.paused, self.numbers.end_ms) {
                     *paused += pcm.len() as u64;
-                    if *paused >= u64::from(self.numbers.end_ms) * PER_MS {
+                    if *paused >= u64::from(end_ms) * PER_MS {
                         let silence_ms = open.silent / PER_MS;
                         return Some(self.end(silence_ms));
                     }

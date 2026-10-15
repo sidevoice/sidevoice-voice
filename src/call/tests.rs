@@ -745,6 +745,37 @@ fn muting_ends_the_turn_and_cancelling_drops_it() {
 }
 
 #[test]
+fn with_manual_a_long_pause_ends_nothing_and_muting_ends_the_turn_with_all_of_it() {
+    let mut run = Run::new(VoiceConfig {
+        end_of_turn: EndOfTurn::Manual,
+        patience: Patience::Fast,
+        ..config()
+    });
+    run.hear(&speech());
+    run.hear(&silence(5_000));
+    run.hear(&clip(FLEURS_ES, 0.9));
+    run.hear(&silence(5_000));
+    let effects = run.take();
+    let turns = Run::turns(&effects);
+    assert_eq!(turns.len(), 1, "{turns:?}");
+    assert_eq!(turns[0].phase, TurnPhase::Started);
+    assert!(Run::transcribe(&effects).is_none(), "no pause ends it");
+    run.input(Input::Mute(true));
+    let (turn, samples) = Run::transcribe(&run.take()).expect("muting ends it");
+    // Both sentences and the pauses after each, in one turn.
+    let said = (speech().len() + clip(FLEURS_ES, 0.9).len()) / 16;
+    assert!(samples / 16 > said + 9_000, "{} ms", samples / 16);
+    run.transcribed(
+        turn,
+        "Mister Quilter is the apostle of the middle classes. Hola.",
+    );
+    let finished = Run::turns(&run.take());
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0].phase, TurnPhase::Finished);
+    assert_eq!(finished[0].turn_id, "c-turn-0");
+}
+
+#[test]
 fn a_microphone_whose_device_gives_no_audio_is_a_state_until_it_does_or_the_call_stops() {
     let states = |run: &mut Run| -> Vec<CallState> {
         run.take()
