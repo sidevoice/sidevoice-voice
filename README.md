@@ -209,7 +209,10 @@ What both promise, beyond the types:
 - **`say(text, options?)`** answers a handle at once: its `id`, `cancel()`, `onEvent(listener)` for its steps in order
   (`playing`, `progress` as each chunk starts and ends, then `done`), and `outcome`, a promise of how it ended: `heard`,
   `heard-up-to` with `heard_chars`, or `not-played`, the reason being `cancelled`, `barge-in`, `stopped` or `failed`
-  with a code. What is said before `setSettings`, or with the call stopped, is `not-played` (`stopped`).
+  with a code. In both the `done` step and the outcome promise, the browser and desktop hosts expose flat objects:
+  `{status: "heard"}`, `{status: "heard-up-to", heard_chars, reason}`, or `{status: "not-played", reason}`;
+  `failed` adds `code` beside `reason`. Rust's serialized `StopReason` is nested internally; each host flattens it at
+  its page boundary. What is said before `setSettings`, or with the call stopped, is `not-played` (`stopped`).
 - **Barge-in** waits for continuous detector speech at the raised 0.8 playback bar for
   `barge_in_min_speech` seconds. Playback stays at full gain until then. A shorter overlap is discarded, including
   its pre-roll, and creates no turn or transcription. A short word in silence follows the normal detector. A
