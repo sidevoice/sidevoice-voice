@@ -45,6 +45,7 @@ test("one physical capture routes the next frame to one lane and zeros to the ot
   const physical = browser();
   const audio = createSharedWebAudioIo();
   const a = audio.attach(); const b = audio.attach();
+  await assert.rejects(audio.routeInput(a.input), TypeError);
   const as = sink(); const bs = sink();
   a.io.start(as); b.io.start(bs);
   for (let i = 0; i < 5 && (!as.events.ready || !bs.events.ready); i++) await new Promise((resolve) => setTimeout(resolve, 0));

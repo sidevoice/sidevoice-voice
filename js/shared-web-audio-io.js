@@ -113,7 +113,7 @@ export function createSharedWebAudioIo(options = {}) {
     await opening;
   }
   function route(port) {
-    if (port !== null && !lanes.has(port)) return Promise.reject(new TypeError("an attached input port"));
+    if (port !== null && !lanes.get(port)?.sink) return Promise.reject(new TypeError("an active input port"));
     selected = port;
     if (!capture) return Promise.resolve();
     const serial = ++generation;
