@@ -11,7 +11,10 @@ use futures_util::StreamExt;
 use super::{Events, StartOptions, VoiceCall};
 use crate::config::{Patience, VoiceConfig};
 use crate::io::{AudioIo, IoEvent, IoSink};
-use crate::models::{EndOfTurnModel, Models, Speaker, Transcriber, Vad, VadFrame, VoiceModels};
+use crate::models::{
+    EndOfTurnModel, Models, SharedModelLoader, SharedModelResources, SharedModels, Speaker,
+    Transcriber, Vad, VadFactory, VadFrame, VoiceModels,
+};
 use crate::say::{SayEvent, SayOptions, SayOutcome};
 use crate::test_support::{clip, config, silence, EnergyVad, QUILTER, WINDOW};
 use crate::TurnEvent;
@@ -414,6 +417,106 @@ fn idle_models_leave_memory_and_come_back_on_the_next_start() {
             (loads.load(Ordering::SeqCst), alive.load(Ordering::SeqCst)),
             (2, 1),
             "loaded again"
+        );
+    });
+}
+
+struct LeaseLoader {
+    loads: Arc<AtomicUsize>,
+    drops: Arc<AtomicUsize>,
+}
+
+struct LeaseText(Arc<AtomicUsize>);
+
+impl Drop for LeaseText {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl Transcriber for LeaseText {
+    async fn transcribe(&self, _: Vec<f32>, _: u32, _: Option<String>) -> Result<String, String> {
+        Ok(String::new())
+    }
+}
+
+struct LeaseVadFactory;
+
+#[async_trait]
+impl VadFactory for LeaseVadFactory {
+    async fn new_stream(&self) -> Result<Box<dyn Vad>, String> {
+        Ok(Box::new(FakeDetector {
+            vad: EnergyVad::new(),
+            pending: Vec::new(),
+            end: 0,
+            alive: Arc::new(AtomicUsize::new(1)),
+            hang: Arc::new(AtomicBool::new(false)),
+        }))
+    }
+}
+
+#[async_trait]
+impl SharedModelLoader for LeaseLoader {
+    async fn load(&self) -> Result<SharedModelResources, String> {
+        self.loads.fetch_add(1, Ordering::SeqCst);
+        Ok(SharedModelResources {
+            vad: Arc::new(LeaseVadFactory),
+            transcriber: Arc::new(LeaseText(Arc::clone(&self.drops))),
+            speaker: Arc::new(FakeSpeaker),
+            end_of_turn: None,
+        })
+    }
+}
+
+#[test]
+fn two_cached_calls_release_shared_weights_after_the_last_idle_deadline() {
+    runtime().block_on(async {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let pool: Arc<dyn VoiceModels> = Arc::new(SharedModels::new(Arc::new(LeaseLoader {
+            loads: Arc::clone(&loads),
+            drops: Arc::clone(&drops),
+        })));
+        let config = VoiceConfig {
+            idle_unload_minutes: 0,
+            ..config()
+        };
+        let (a, mut a_events) = VoiceCall::new(
+            Arc::clone(&pool),
+            Box::new(FakeIo(Arc::default())),
+            config.clone(),
+        );
+        let (b, mut b_events) = VoiceCall::new(pool, Box::new(FakeIo(Arc::default())), config);
+        let listening = |event| match event {
+            VoiceEvent::State(state) if state.listening == crate::Listening::Listening => Some(()),
+            _ => None,
+        };
+        a.start(StartOptions::default());
+        b.start(StartOptions::default());
+        next(&mut a_events, listening).await;
+        next(&mut b_events, listening).await;
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+        a.stop();
+        next(&mut a_events, |event| match event {
+            VoiceEvent::State(state) if state.listening == crate::Listening::Idle => Some(()),
+            _ => None,
+        })
+        .await;
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            0,
+            "B still leases the weights"
+        );
+        b.stop();
+        until(|| drops.load(Ordering::SeqCst) == 1).await;
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+        b.start(StartOptions::default());
+        next(&mut b_events, listening).await;
+        assert_eq!(
+            loads.load(Ordering::SeqCst),
+            2,
+            "the retained call reloads after idle eviction"
         );
     });
 }

@@ -50,8 +50,8 @@ pub use io::{
 pub use io::{AudioIo, IoEvent, IoSink};
 pub use maybe_send::{MaybeSend, MaybeSync};
 pub use models::{
-    EndOfTurnModel, Models, SharedModels, Speaker, Transcriber, Vad, VadFactory, VadFrame,
-    VoiceModels,
+    EndOfTurnModel, Models, SharedModelLoader, SharedModelResources, SharedModels, Speaker,
+    Transcriber, Vad, VadFactory, VadFrame, VoiceModels,
 };
 pub use say::{SayCancel, SayEvent, SayOptions, SayOutcome, Saying, StopReason};
 pub use take::{Take, TakePause, TakeTurn};

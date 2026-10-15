@@ -132,8 +132,8 @@ export interface VoiceCallHost {
 
 /** The page's side of `createVoiceHost`: which models fill the call's slots. */
 export interface VoiceModelSource {
-  /** The models for `settings` (the voice activity detector, the transcriber, the speaker, and an end-of-turn
-   *  classifier for `smart-turn`), not loaded yet: the call loads them as it starts. Rejects `{code}` for settings it
+  /** A lightweight model loader for `settings`, not an owner of loaded weights. Its `load()` returns the detector
+   *  factory, transcriber, speaker, and optional end-of-turn classifier when a call starts. Rejects `{code}` for settings it
    *  cannot fill. Asked again only when what chooses models changes: a slot's fields other than its language, voice
    *  and speed, or the end of turn. */
   models(settings: VoiceSettings): VoiceModels | Promise<VoiceModels>;

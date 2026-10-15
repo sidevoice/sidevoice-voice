@@ -124,3 +124,50 @@ test("a second live call keeps shared weights through the first call's failure",
   await b.dispose();
   await c.dispose();
 });
+
+test("two idle calls evict one shared load and the next use reloads it", async () => {
+  let loads = 0;
+  const owner = createVoiceHost({ models: () => ({ load: async () => {
+    loads++;
+    return { createVad: () => ({}), transcriber: {}, speaker: {} };
+  } }) }, { io: audio() });
+  const a = owner.createCall(); const b = owner.createCall();
+  await Promise.all([a.setSettings({ ...settings, idle_unload_minutes: 0 }), b.setSettings({ ...settings, idle_unload_minutes: 0 })]);
+  await Promise.all([a.start(), b.start()]);
+  assert.equal(loads, 1);
+  await a.stop();
+  const c = owner.createCall();
+  await c.setSettings({ ...settings, idle_unload_minutes: 0 });
+  await c.start();
+  assert.equal(loads, 1, "B retains the shared choice");
+  await Promise.all([b.stop(), c.stop()]);
+  const d = owner.createCall();
+  await d.setSettings({ ...settings, idle_unload_minutes: 0 });
+  await d.start();
+  assert.equal(loads, 2, "the final idle lease evicted the choice");
+  await Promise.all([a.dispose(), b.dispose(), c.dispose(), d.dispose()]);
+});
+
+test("an active synthesis request keeps its shared choice while another call stops", async () => {
+  let loads = 0;
+  let finish;
+  const owner = createVoiceHost({ models: () => ({ load: async () => {
+    loads++;
+    return { createVad: () => ({}), transcriber: {}, speaker: {
+      speak: () => new Promise((resolve) => { finish = resolve; }),
+    } };
+  } }) }, { io: audio() });
+  const a = owner.createCall(); const b = owner.createCall();
+  await Promise.all([a.setSettings({ ...settings, idle_unload_minutes: 0 }), b.setSettings({ ...settings, idle_unload_minutes: 0 })]);
+  await Promise.all([a.start(), b.start()]);
+  const request = made.at(-1).loaded.speaker.speak("reply");
+  await a.stop();
+  const c = owner.createCall();
+  await c.setSettings({ ...settings, idle_unload_minutes: 0 });
+  await c.start();
+  assert.equal(loads, 1, "B's active request keeps the shared load");
+  finish({ samples: new Float32Array(0), sampleRate: 16000 });
+  assert.equal((await request).sampleRate, 16000);
+  await Promise.all([b.stop(), c.stop()]);
+  await Promise.all([a.dispose(), b.dispose(), c.dispose()]);
+});

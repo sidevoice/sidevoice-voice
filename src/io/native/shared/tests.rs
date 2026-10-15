@@ -281,10 +281,15 @@ fn rendered_levels_follow_partial_physical_consumption_and_never_anticipate_a_lo
             .iter()
             .all(|sample| *sample == 0.0));
         physical.send(IoEvent::Rendered(vec![0.9; 40]));
-        assert!(next_rendered(&mut restarted, &new_mailbox)
-            .await
+        let rendered = next_rendered(&mut restarted, &new_mailbox).await;
+        assert_eq!(rendered.len(), 40);
+        assert!(rendered[..39]
             .iter()
             .all(|sample| (*sample - 0.9).abs() < 0.001));
+        assert_eq!(
+            rendered[39], 0.0,
+            "the resampler has not emitted its final input sample"
+        );
         lane.stop();
     });
 }

@@ -315,6 +315,7 @@ impl State {
                     .parts
                     .iter()
                     .find(|part| part.lane == lane_id && part.incarnation == lane.incarnation);
+                let Some(part) = part else { continue };
                 let attributed = (0..count)
                     .map(|offset| {
                         let at = start + offset;
@@ -322,7 +323,7 @@ impl State {
                         if mixed.abs() <= 1.0e-6 {
                             0.0
                         } else {
-                            physical[offset] * part.map_or(0.0, |part| part.samples[at]) / mixed
+                            physical[offset] * part.samples[at] / mixed
                         }
                     })
                     .collect();

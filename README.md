@@ -158,10 +158,12 @@ only the routed lane receives real samples. Their playback chunks, progress and 
 speaker receives their mixed output, which is the single AEC reference. The last active lane closes the devices.
 Apps that provide their own `AudioIo` can route frames themselves.
 
-`SharedModels` implements `VoiceModels` using shared `Arc` handles for the transcriber, speaker and optional
-end-of-turn model. Its `VadFactory::new_stream()` creates a fresh detector stream for each call. Loaded weights may
-be shared; detector history, endpoint windows, transcription and synthesis requests remain call local. A provider
-whose inference engine cannot run concurrent requests must serialize them internally.
+`SharedModels::new(loader)` implements `VoiceModels` as a lightweight, restartable pool. The loader returns
+`SharedModelResources` (VAD factory, transcriber, speaker and optional end-of-turn model) when no live lease exists.
+Concurrent calls share one loaded choice and each gets a fresh `VadFactory::new_stream()` detector. The pool retains
+only a weak reference: after each stopped call's `idle_unload_minutes` and the final in-flight request, the weights
+are released; the next start loads them again. Shared STT, TTS and end-of-turn requests are serialized so a provider
+with non-reentrant inference is safe. Detector history, endpoint windows and request state remain call local.
 
 The browser host (`js/voice-host.d.ts`) owns the shared audio and model choices. The same host shape can be provided
 by a native app:
