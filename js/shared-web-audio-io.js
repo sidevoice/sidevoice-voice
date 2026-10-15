@@ -90,7 +90,10 @@ export function createSharedWebAudioIo(options = {}) {
       if (opened !== session) return;
       if (data?.type === "routed") {
         const pending = pendingRoutes.get(data.generation);
-        if (pending) { selected = pending.target; pending.resolve(); pendingRoutes.delete(data.generation); }
+        if (pending) {
+          selected = pending.target; pending.resolve(); pendingRoutes.delete(data.generation);
+          for (const past of routes.keys()) if (past < data.generation) routes.delete(past);
+        }
         return;
       }
       if (data?.type !== "captured") return;

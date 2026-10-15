@@ -55,6 +55,7 @@ pub struct IoSink {
     pub(crate) messages: UnboundedSender<Message>,
     pub(crate) generation: u64,
     pub(crate) rendered: Arc<Mutex<RenderedMailbox>>,
+    pub(crate) direct_rendered: bool,
 }
 
 /// Only the newest rendered frame waits while the call task is occupied. A replacement marks a discontinuity so
@@ -96,6 +97,13 @@ impl IoSink {
     pub fn send(&self, event: IoEvent) {
         match event {
             IoEvent::Rendered(samples) => {
+                #[cfg(native)]
+                if self.direct_rendered {
+                    let _ = self
+                        .messages
+                        .unbounded_send(Message::PhysicalRendered(self.generation, samples));
+                    return;
+                }
                 let mut mailbox = self.rendered.lock().expect("rendered mailbox");
                 if self.generation < mailbox.generation {
                     return;
@@ -162,6 +170,7 @@ mod tests {
             messages,
             generation: 1,
             rendered: Arc::clone(&mailbox),
+            direct_rendered: false,
         };
         for _ in 0..100 {
             sink.send(IoEvent::Rendered(vec![0.8; 160]));

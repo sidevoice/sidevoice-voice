@@ -85,6 +85,8 @@ pub(crate) enum Message {
     Models(Arc<dyn VoiceModels>, Box<VoiceConfig>),
     Io(u64, IoEvent),
     Rendered(u64),
+    #[cfg(native)]
+    PhysicalRendered(u64, Vec<f32>),
     EndOfTurn {
         turn: usize,
         pause: u32,
@@ -439,6 +441,8 @@ impl Driver {
             Message::CancelInput => self.input(Input::Cancel),
             #[cfg(native)]
             Message::SharedRoute(_, _) => {}
+            #[cfg(native)]
+            Message::PhysicalRendered(_, _) => {}
             Message::Io(generation, _) if generation != self.generation => {}
             Message::Rendered(generation) => {
                 let frame = self
@@ -559,6 +563,7 @@ impl Driver {
             messages: self.messages.clone(),
             generation: self.generation,
             rendered: Arc::clone(&self.rendered_mailbox),
+            direct_rendered: false,
         };
         if let Err(code) = self.io.start(sink) {
             self.error(code);

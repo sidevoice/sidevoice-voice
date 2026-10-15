@@ -50,12 +50,15 @@ struct State {
     routed: Option<u64>,
     lanes: BTreeMap<u64, Lane>,
     frames: HashMap<String, MixedFrame>,
+    frame_order: VecDeque<String>,
+    rendered_pending: VecDeque<f32>,
 }
 
 struct Lane {
     sink: Option<IoSink>,
     queued: VecDeque<Chunk>,
     stopping: bool,
+    incarnation: u64,
 }
 
 struct Chunk {
@@ -67,6 +70,7 @@ struct Chunk {
 
 struct Part {
     lane: u64,
+    incarnation: u64,
     utterance: String,
     chunk: usize,
     samples: Vec<f32>,
@@ -76,6 +80,10 @@ struct Part {
 
 struct MixedFrame {
     parts: Vec<Part>,
+    mixed: Vec<f32>,
+    rendered: usize,
+    started: bool,
+    played: bool,
 }
 
 struct LaneIo {
@@ -103,6 +111,8 @@ impl SharedNativeAudio {
                 routed: None,
                 lanes: BTreeMap::new(),
                 frames: HashMap::new(),
+                frame_order: VecDeque::new(),
+                rendered_pending: VecDeque::new(),
             }),
             messages,
             rendered,
@@ -130,6 +140,7 @@ impl SharedNativeAudio {
                 sink: None,
                 queued: VecDeque::new(),
                 stopping: false,
+                incarnation: 0,
             },
         );
         (
@@ -170,12 +181,14 @@ impl AudioIo for LaneIo {
             return Err("audio-lane-gone".into());
         };
         lane.sink = Some(sink.clone());
+        lane.incarnation = lane.incarnation.wrapping_add(1);
         if !state.running {
             state.generation += 1;
             let physical_sink = IoSink {
                 messages: self.inner.messages.clone(),
                 generation: state.generation,
                 rendered: Arc::clone(&self.inner.rendered),
+                direct_rendered: true,
             };
             if let Err(code) = state.physical.start(physical_sink) {
                 state.lanes.get_mut(&self.id).expect("lane").sink = None;
@@ -228,6 +241,7 @@ impl AudioIo for LaneIo {
         let mut state = self.inner.state.lock().expect("shared audio");
         if let Some(lane) = state.lanes.get_mut(&self.id) {
             lane.sink = None;
+            lane.incarnation = lane.incarnation.wrapping_add(1);
             lane.queued.clear();
             lane.stopping = false;
         }
@@ -239,6 +253,8 @@ impl AudioIo for LaneIo {
             state.running = false;
             state.generation += 1;
             state.frames.clear();
+            state.frame_order.clear();
+            state.rendered_pending.clear();
         }
     }
 }
@@ -256,6 +272,92 @@ impl Drop for LaneIo {
 }
 
 impl State {
+    /// Attribute only the physical samples actually consumed by the output. The physical backend reports rendered
+    /// samples before progress in a tick, so hold them until its first chunk-start marker arrives.
+    fn rendered(&mut self, samples: Vec<f32>) {
+        if self.frame_order.is_empty() {
+            return;
+        }
+        if !self
+            .frame_order
+            .front()
+            .and_then(|id| self.frames.get(id))
+            .is_some_and(|frame| frame.started)
+        {
+            let first = samples
+                .iter()
+                .position(|sample| sample.abs() > 1.0e-6)
+                .unwrap_or(samples.len());
+            self.rendered_pending
+                .extend(samples.into_iter().skip(first));
+        } else {
+            self.rendered_pending.extend(samples);
+        }
+        self.drain_rendered();
+    }
+
+    fn drain_rendered(&mut self) {
+        while let Some(id) = self.frame_order.front().cloned() {
+            let Some(frame) = self.frames.get_mut(&id) else {
+                self.frame_order.pop_front();
+                continue;
+            };
+            if !frame.started || self.rendered_pending.is_empty() {
+                break;
+            }
+            let start = frame.rendered;
+            let count = (FRAME - start).min(self.rendered_pending.len());
+            let physical: Vec<f32> = self.rendered_pending.drain(..count).collect();
+            frame.rendered += count;
+            for (&lane_id, lane) in &self.lanes {
+                let Some(sink) = &lane.sink else { continue };
+                let part = frame
+                    .parts
+                    .iter()
+                    .find(|part| part.lane == lane_id && part.incarnation == lane.incarnation);
+                let attributed = (0..count)
+                    .map(|offset| {
+                        let at = start + offset;
+                        let mixed = frame.mixed[at];
+                        if mixed.abs() <= 1.0e-6 {
+                            0.0
+                        } else {
+                            physical[offset] * part.map_or(0.0, |part| part.samples[at]) / mixed
+                        }
+                    })
+                    .collect();
+                sink.send(IoEvent::Rendered(attributed));
+            }
+            if frame.rendered == FRAME {
+                let played = frame.played;
+                self.frame_order.pop_front();
+                if played {
+                    self.frames.remove(&id);
+                    self.finish_stops();
+                    self.prime();
+                }
+            }
+        }
+    }
+
+    fn finish_stops(&mut self) {
+        for (&id, lane) in &mut self.lanes {
+            if lane.stopping
+                && !self.frames.values().any(|frame| {
+                    frame
+                        .parts
+                        .iter()
+                        .any(|part| part.lane == id && part.incarnation == lane.incarnation)
+                })
+            {
+                lane.stopping = false;
+                if let Some(sink) = &lane.sink {
+                    sink.send(IoEvent::PlaybackEnded);
+                }
+            }
+        }
+    }
+
     fn prime(&mut self) {
         while self.running && self.frames.len() < MIX_AHEAD {
             let mut parts: Vec<Part> = self
@@ -271,6 +373,7 @@ impl State {
                     let last = current.cursor == current.samples.len();
                     let part = Part {
                         lane: id,
+                        incarnation: lane.incarnation,
                         utterance: current.utterance.clone(),
                         chunk: current.chunk,
                         samples,
@@ -302,7 +405,17 @@ impl State {
             }
             let id = format!("shared-frame-{}", self.next_frame);
             self.next_frame += 1;
-            self.frames.insert(id.clone(), MixedFrame { parts });
+            self.frames.insert(
+                id.clone(),
+                MixedFrame {
+                    parts,
+                    mixed: mixed.clone(),
+                    rendered: 0,
+                    started: false,
+                    played: false,
+                },
+            );
+            self.frame_order.push_back(id.clone());
             self.physical.play(&id, 0, mixed, RATE);
         }
     }
@@ -322,63 +435,61 @@ impl State {
                     }
                 }
             }
-            IoEvent::Rendered(_) => {} // The mixed output is metered separately for every lane.
+            IoEvent::Rendered(samples) => self.rendered(samples),
             IoEvent::PlaybackEnded => {
-                if self.frames.is_empty() {
-                    for lane in self.lanes.values() {
-                        if let Some(sink) = &lane.sink {
-                            sink.send(IoEvent::PlaybackEnded);
-                        }
+                self.frames.clear();
+                self.frame_order.clear();
+                self.rendered_pending.clear();
+                for lane in self.lanes.values_mut() {
+                    lane.stopping = false;
+                    if let Some(sink) = &lane.sink {
+                        sink.send(IoEvent::PlaybackEnded);
                     }
                 }
+                self.prime();
             }
             IoEvent::ChunkStarted { utterance, .. } => {
-                if let Some(frame) = self.frames.get(&utterance) {
+                if let Some(frame) = self.frames.get_mut(&utterance) {
+                    frame.started = true;
                     for (&id, lane) in &self.lanes {
                         let Some(sink) = &lane.sink else { continue };
-                        let part = frame.parts.iter().find(|part| part.lane == id);
+                        let part = frame
+                            .parts
+                            .iter()
+                            .find(|part| part.lane == id && part.incarnation == lane.incarnation);
                         if let Some(part) = part.filter(|part| part.first) {
                             sink.send(IoEvent::ChunkStarted {
                                 utterance: part.utterance.clone(),
                                 chunk: part.chunk,
                             });
                         }
-                        sink.send(IoEvent::Rendered(
-                            part.map_or_else(|| vec![0.0; FRAME], |part| part.samples.clone()),
-                        ));
                     }
                 }
+                self.drain_rendered();
             }
             IoEvent::ChunkPlayed { utterance, .. } => {
-                if let Some(frame) = self.frames.remove(&utterance) {
-                    for part in frame.parts {
+                if let Some(frame) = self.frames.get_mut(&utterance) {
+                    frame.played = true;
+                    for part in &frame.parts {
                         if part.last {
                             if let Some(sink) = self
                                 .lanes
                                 .get(&part.lane)
+                                .filter(|lane| lane.incarnation == part.incarnation)
                                 .and_then(|lane| lane.sink.as_ref())
                             {
                                 sink.send(IoEvent::ChunkPlayed {
-                                    utterance: part.utterance,
+                                    utterance: part.utterance.clone(),
                                     chunk: part.chunk,
                                 });
                             }
                         }
                     }
-                    for (&id, lane) in &mut self.lanes {
-                        if lane.stopping
-                            && !self
-                                .frames
-                                .values()
-                                .any(|frame| frame.parts.iter().any(|part| part.lane == id))
-                        {
-                            lane.stopping = false;
-                            if let Some(sink) = &lane.sink {
-                                sink.send(IoEvent::PlaybackEnded);
-                            }
-                        }
+                    if frame.rendered == FRAME {
+                        self.frames.remove(&utterance);
+                        self.finish_stops();
+                        self.prime();
                     }
-                    self.prime();
                 }
             }
             IoEvent::MicrophoneMuted(muted) => {
@@ -391,6 +502,8 @@ impl State {
             IoEvent::Failed(code) => {
                 self.running = false;
                 self.frames.clear();
+                self.frame_order.clear();
+                self.rendered_pending.clear();
                 self.routed = None;
                 for lane in self.lanes.values_mut() {
                     if let Some(sink) = lane.sink.take() {
@@ -409,6 +522,9 @@ async fn dispatch(inner: Weak<Inner>, mut received: UnboundedReceiver<Message>) 
         let mut state = inner.state.lock().expect("shared audio");
         match message {
             Message::Io(generation, event) if generation == state.generation => state.event(event),
+            Message::PhysicalRendered(generation, samples) if generation == state.generation => {
+                state.rendered(samples)
+            }
             Message::SharedRoute(id, answer) => {
                 let result =
                     if id == 0 || state.lanes.get(&id).is_some_and(|lane| lane.sink.is_some()) {
