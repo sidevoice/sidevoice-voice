@@ -2,7 +2,7 @@
 //! short mixed frames; its actual playback clock drives each lane's chunk and rendered reports.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use futures_channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures_channel::oneshot;
@@ -108,7 +108,7 @@ impl SharedNativeAudio {
             rendered,
             devices,
         });
-        spawn(dispatch(Arc::clone(&inner), received));
+        spawn(dispatch(Arc::downgrade(&inner), received));
         Self { inner }
     }
 
@@ -403,8 +403,9 @@ impl State {
     }
 }
 
-async fn dispatch(inner: Arc<Inner>, mut received: UnboundedReceiver<Message>) {
+async fn dispatch(inner: Weak<Inner>, mut received: UnboundedReceiver<Message>) {
     while let Some(message) = received.next().await {
+        let Some(inner) = inner.upgrade() else { break };
         let mut state = inner.state.lock().expect("shared audio");
         match message {
             Message::Io(generation, event) if generation == state.generation => state.event(event),

@@ -82,3 +82,26 @@ test("independent playback meters report only their own lane", async () => {
   assert.ok(Math.abs(bs.events.rendered.at(-1)[0] - 0.8) < 0.001);
   a.io.stop(); b.io.stop();
 });
+
+test("capture processor stamps its route before the next 10 ms frame", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const { runInNewContext } = await import("node:vm");
+  const source = await readFile(new URL("../capture-worklet.js", import.meta.url), "utf8");
+  const posted = [];
+  let Processor;
+  runInNewContext(source, {
+    sampleRate: 16000, Float32Array, Math,
+    AudioWorkletProcessor: class { constructor() { this.port = { postMessage: (message) => posted.push(message) }; } },
+    registerProcessor: (_name, type) => { Processor = type; },
+  });
+  const capture = new Processor();
+  capture.port.onmessage({ data: { type: "route", generation: 9 } });
+  assert.deepEqual(JSON.parse(JSON.stringify(posted)), [{ type: "routed", generation: 9 }]);
+  for (let i = 0; i < 3; i++) capture.process([[new Float32Array(128).fill(0.7)]]);
+  const first = posted.find((message) => message.type === "captured");
+  assert.equal(first.generation, 9);
+  assert.equal(first.samples.length, 160);
+  capture.port.onmessage({ data: { type: "route", generation: 10 } });
+  for (let i = 0; i < 2; i++) capture.process([[new Float32Array(128).fill(0.2)]]);
+  assert.ok(posted.some((message) => message.type === "captured" && message.generation === 10));
+});

@@ -65,6 +65,21 @@ async fn next_io(events: &mut UnboundedReceiver<Message>) -> IoEvent {
 }
 
 #[test]
+fn unused_shared_audio_does_not_keep_its_worker_or_devices_alive() {
+    runtime().block_on(async {
+        let recorded = Arc::new(Mutex::new(Recorded::default()));
+        let shared = SharedNativeAudio::with_physical(
+            NativeDevices::default(),
+            Box::new(Physical(recorded)),
+        );
+        let weak = Arc::downgrade(&shared.inner);
+        drop(shared);
+        tokio::task::yield_now().await;
+        assert!(weak.upgrade().is_none());
+    });
+}
+
+#[test]
 fn next_frame_goes_to_one_port_and_other_lanes_hear_silence() {
     runtime().block_on(async {
     let recorded = Arc::new(Mutex::new(Recorded::default()));
