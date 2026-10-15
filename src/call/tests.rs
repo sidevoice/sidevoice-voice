@@ -519,6 +519,32 @@ fn focus_boundary_during_merge_hold_finishes_a_before_b() {
 }
 
 #[test]
+fn focus_boundary_ends_open_audio_without_discarding_a_or_capturing_b() {
+    let mut run = Run::new(VoiceConfig {
+        patience: Patience::Calm,
+        ..config()
+    });
+    run.input(Input::SetCaptureBoundary("focus-a".into()));
+    run.hear(&speech());
+    let mut events = Run::turns(&run.take());
+    assert_eq!(events.len(), 1, "A started but has not ended");
+    run.input(Input::SetCaptureBoundary("focus-b".into()));
+    let effects = run.take();
+    let (first, _) = Run::transcribe(&effects).expect("A's captured audio is transcribed");
+    run.hear(&speech());
+    run.hear(&silence(3_800));
+    events.extend(Run::turns(&run.take()));
+    run.transcribed(first, "Private instruction for A.");
+    let effects = run.take();
+    events.extend(Run::turns(&effects));
+    let (second, _) = Run::transcribe(&effects).expect("B's separate audio is transcribed");
+    run.transcribed(second, "Instruction for B.");
+    run.wait(1_500);
+    events.extend(Run::turns(&run.take()));
+    assert_focus_routing(&events);
+}
+
+#[test]
 fn speech_over_a_reply_interrupts_it_and_drops_the_queue() {
     let mut run = Run::new(config());
     run.reply(

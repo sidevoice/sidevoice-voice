@@ -153,6 +153,7 @@ const until = async (done) => {
   for (let waited = 0; !done() && waited < 5000; waited += 10) await new Promise((r) => setTimeout(r, 10));
 };
 const host = { missing: await code(voice.start()) };
+voice.setCaptureBoundary("smoke-initial-focus");
 // Said before any settings: there is no call, so it is not played.
 host.early = (await voice.say("Too early.").outcome).status;
 // Muted before any settings: the call they create must start that way.
