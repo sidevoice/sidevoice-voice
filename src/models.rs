@@ -3,6 +3,8 @@
 //! through [`VoiceModels`], which the call asks to load on start and drops once the call has been stopped for its idle
 //! minutes. Which model fills each slot, and where it runs, is the app's: nothing here names one. Failures are stable
 //! codes.
+#![cfg_attr(web, allow(clippy::arc_with_non_send_sync))]
+// The public model interfaces use Arc on both targets. Browser models are intentionally local to its event loop.
 //!
 //! In the wasm32 build the app's models are JavaScript objects with the same methods (`web`, and
 //! `js/voice-models.d.ts`).

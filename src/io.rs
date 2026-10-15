@@ -55,6 +55,7 @@ pub struct IoSink {
     pub(crate) messages: UnboundedSender<Message>,
     pub(crate) generation: u64,
     pub(crate) rendered: Arc<Mutex<RenderedMailbox>>,
+    #[cfg_attr(web, allow(dead_code))]
     pub(crate) direct_rendered: bool,
 }
 
