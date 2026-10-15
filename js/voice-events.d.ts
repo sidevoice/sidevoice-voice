@@ -3,10 +3,11 @@
 
 /** A step of a turn of the person's speech, under the call's own `turn_id` (the same in every step). */
 export type VoiceTurnEvent =
-  | { phase: "started"; turn_id: string; /** Unix milliseconds. */ started_at: number }
+  | { phase: "started"; turn_id: string; capture_boundary_id: string; /** Unix milliseconds. */ started_at: number }
   | {
       phase: "finished";
       turn_id: string;
+      capture_boundary_id: string;
       /** What the person said. */
       text: string;
       language?: string;
@@ -17,7 +18,7 @@ export type VoiceTurnEvent =
       merged: boolean;
       timings: { audio_ms: number; endpoint_silence_ms: number; recognition_ms: number };
     }
-  | { phase: "cancelled"; turn_id: string; /** Joined into the next turn. */ merged: boolean };
+  | { phase: "cancelled"; turn_id: string; capture_boundary_id: string; /** Joined into the next turn. */ merged: boolean };
 
 /** Where the call is. */
 export interface VoiceCallState {

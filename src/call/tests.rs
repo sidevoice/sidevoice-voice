@@ -26,6 +26,7 @@ enum TurnPhase {
 #[derive(Debug, Clone)]
 struct Seen {
     turn_id: String,
+    capture_boundary_id: String,
     phase: TurnPhase,
     text: Option<String>,
     language: Option<String>,
@@ -135,9 +136,11 @@ impl Run {
                 Effect::Event(VoiceEvent::Turn(turn)) => Some(match turn.clone() {
                     TurnEvent::Started {
                         turn_id,
+                        capture_boundary_id,
                         started_at,
                     } => Seen {
                         turn_id,
+                        capture_boundary_id,
                         phase: TurnPhase::Started,
                         text: None,
                         language: None,
@@ -148,6 +151,7 @@ impl Run {
                     },
                     TurnEvent::Finished {
                         turn_id,
+                        capture_boundary_id,
                         text,
                         language,
                         started_at,
@@ -156,6 +160,7 @@ impl Run {
                         timings,
                     } => Seen {
                         turn_id,
+                        capture_boundary_id,
                         phase: TurnPhase::Finished,
                         text: Some(text),
                         language,
@@ -164,8 +169,13 @@ impl Run {
                         ended_at: Some(ended_at),
                         timings: Some(timings),
                     },
-                    TurnEvent::Cancelled { turn_id, merged } => Seen {
+                    TurnEvent::Cancelled {
                         turn_id,
+                        capture_boundary_id,
+                        merged,
+                    } => Seen {
+                        turn_id,
+                        capture_boundary_id,
                         phase: TurnPhase::Cancelled,
                         text: None,
                         language: None,
@@ -428,15 +438,21 @@ fn assert_focus_routing(events: &[Seen]) {
         .map(|turn| turn.turn_id.as_str())
         .collect();
     assert_eq!(starts, ["c-turn-0", "c-turn-1"]);
-    let target = |id: &str| match id {
-        "c-turn-0" => "A",
-        "c-turn-1" => "B",
+    let target = |id: &str, boundary: &str| match (id, boundary) {
+        ("c-turn-0", "focus-a") => "A",
+        ("c-turn-1", "focus-b") => "B",
         _ => panic!("unexpected turn {id}"),
     };
     let routed: Vec<_> = events
         .iter()
         .filter(|turn| turn.phase == TurnPhase::Finished)
-        .map(|turn| (target(&turn.turn_id), turn.text.as_deref(), turn.merged))
+        .map(|turn| {
+            (
+                target(&turn.turn_id, &turn.capture_boundary_id),
+                turn.text.as_deref(),
+                turn.merged,
+            )
+        })
         .collect();
     assert_eq!(
         routed,
@@ -454,12 +470,13 @@ fn focus_boundary_during_stt_keeps_both_targets_words() {
         patience: Patience::Calm,
         ..config()
     });
+    run.input(Input::SetCaptureBoundary("focus-a".into()));
     run.hear(&speech());
     run.hear(&silence(3_800));
     let mut events = Run::turns(&run.effects);
     let (first, _) = Run::transcribe(&run.take()).expect("A is in transcription");
 
-    run.input(Input::CaptureBoundary);
+    run.input(Input::SetCaptureBoundary("focus-b".into()));
     events.extend(Run::turns(&run.take()));
     run.hear(&speech());
     run.hear(&silence(3_800));
@@ -480,6 +497,7 @@ fn focus_boundary_during_merge_hold_finishes_a_before_b() {
         patience: Patience::Calm,
         ..config()
     });
+    run.input(Input::SetCaptureBoundary("focus-a".into()));
     run.hear(&speech());
     run.hear(&silence(3_800));
     let mut events = Run::turns(&run.effects);
@@ -487,7 +505,7 @@ fn focus_boundary_during_merge_hold_finishes_a_before_b() {
     run.transcribed(first, "Private instruction for A.");
     assert!(Run::turns(&run.take()).is_empty(), "A is held");
 
-    run.input(Input::CaptureBoundary);
+    run.input(Input::SetCaptureBoundary("focus-b".into()));
     events.extend(Run::turns(&run.take()));
     run.hear(&speech());
     run.hear(&silence(3_800));

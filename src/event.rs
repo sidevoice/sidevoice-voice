@@ -44,12 +44,15 @@ pub enum TurnEvent {
     /// The person started speaking.
     Started {
         turn_id: String,
+        /// Opaque host-supplied equality fence for the turn's capture target.
+        capture_boundary_id: String,
         /// When, in Unix milliseconds.
         started_at: u64,
     },
     /// The turn's transcript is final: what the person said.
     Finished {
         turn_id: String,
+        capture_boundary_id: String,
         text: String,
         /// The language the transcript is in, when the transcriber was told one.
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -64,7 +67,11 @@ pub enum TurnEvent {
     },
     /// Nothing comes of the turn: no words in it, the person cancelled it, or it was joined into the next one
     /// (`merged`).
-    Cancelled { turn_id: String, merged: bool },
+    Cancelled {
+        turn_id: String,
+        capture_boundary_id: String,
+        merged: bool,
+    },
 }
 
 /// How long a turn's parts took, in milliseconds.

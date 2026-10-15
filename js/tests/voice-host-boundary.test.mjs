@@ -15,9 +15,9 @@ class TestCall {
   static create() { return TestCall.last = new TestCall(); }
   onEvent(listener) { this.listener = listener; }
   mute() {}
-  captureBoundary() { this.boundaries = (this.boundaries ?? 0) + 1; }
-  emit(phase, turn_id, text) {
-    this.listener({ type: "turn", data: { phase, turn_id, ...(text ? { text } : {}) } });
+  setCaptureBoundary(id) { this.boundaries = [...(this.boundaries ?? []), id]; this.boundary = id; }
+  emit(phase, turn_id, text, capture_boundary_id = this.boundary) {
+    this.listener({ type: "turn", data: { phase, turn_id, capture_boundary_id, ...(text ? { text } : {}) } });
   }
 }
 
@@ -26,21 +26,29 @@ test("host forwards capture boundary and routes each terminal by its started tur
   const { createVoiceHost } = await import(`data:text/javascript,${encodeURIComponent(hostModule)}`);
   const host = createVoiceHost({ models: () => ({}) }, { io: {} });
   const focus = new Map();
+  const boundaries = new Map();
   const delivered = [];
   let selected = "A";
   host.onTurn((turn) => {
-    if (turn.phase === "started") focus.set(turn.turn_id, selected);
-    if (turn.phase === "finished") delivered.push([focus.get(turn.turn_id), turn.text]);
+    if (turn.phase === "started") {
+      focus.set(turn.turn_id, selected);
+      boundaries.set(turn.turn_id, turn.capture_boundary_id);
+    }
+    if (turn.phase === "finished") {
+      assert.equal(turn.capture_boundary_id, boundaries.get(turn.turn_id));
+      delivered.push([focus.get(turn.turn_id), turn.text]);
+    }
   });
+  host.setCaptureBoundary("initial-a");
   await host.setSettings({ stt: {}, tts: {} });
   const call = TestCall.last;
 
   // A is still in STT when the host changes focus. The terminal can follow B's start.
   call.emit("started", "a-stt");
-  host.captureBoundary();
+  host.setCaptureBoundary("next-b");
   selected = "B";
   call.emit("started", "b-stt");
-  call.emit("finished", "a-stt", "Private instruction for A.");
+  call.emit("finished", "a-stt", "Private instruction for A.", "initial-a");
   call.emit("finished", "b-stt", "Instruction for B.");
   assert.deepEqual(delivered, [
     ["A", "Private instruction for A."],
@@ -50,13 +58,14 @@ test("host forwards capture boundary and routes each terminal by its started tur
   // A's merge hold releases at the boundary before B starts.
   delivered.length = 0;
   selected = "A";
+  host.setCaptureBoundary("second-a");
   call.emit("started", "a-held");
-  host.captureBoundary();
-  call.emit("finished", "a-held", "Held words for A.");
+  host.setCaptureBoundary("second-b");
+  call.emit("finished", "a-held", "Held words for A.", "second-a");
   selected = "B";
   call.emit("started", "b-held");
   call.emit("finished", "b-held", "Words for B.");
-  assert.equal(call.boundaries, 2);
+  assert.deepEqual(call.boundaries, ["initial-a", "next-b", "second-a", "second-b"]);
   assert.deepEqual(delivered, [["A", "Held words for A."], ["B", "Words for B."]]);
   delete globalThis.__BoundaryTestCall;
 });

@@ -75,7 +75,7 @@ pub(crate) enum Input {
     /// The person cancels what they said that is not reported yet.
     Cancel,
     /// The host changed capture target; keep earlier turns but end their merge window.
-    CaptureBoundary,
+    SetCaptureBoundary(String),
     /// What the end-of-turn model said of a turn's pause: the probability that the turn is over, or the stable code
     /// of why there is none.
     EndOfTurn {
@@ -132,7 +132,7 @@ pub(crate) enum Effect {
 #[derive(Debug)]
 struct Turn {
     id: String,
-    boundary: u64,
+    capture_boundary_id: String,
     started_ms: u64,
     ended_ms: Option<u64>,
     audio_ms: u64,
@@ -160,7 +160,7 @@ pub(crate) struct Call {
     turns: HashMap<usize, Turn>,
     next_turn: usize,
     /// Opaque local merge generation; only the host decides when to advance it.
-    capture_boundary: u64,
+    capture_boundary_id: String,
     recognition: Recognition,
     playback: Playback,
     /// A chunk ended while its utterance still has audio; the next chunk may be contiguous.
@@ -191,7 +191,7 @@ impl Call {
             open: None,
             turns: HashMap::new(),
             next_turn: 0,
-            capture_boundary: 0,
+            capture_boundary_id: String::new(),
             recognition: Recognition::default(),
             playback: Playback::default(),
             continuing_chunk: None,
@@ -287,7 +287,7 @@ impl Call {
             }
             Input::MicrophoneMuted(muted) => self.microphone_muted = muted,
             Input::Cancel => self.cancel_input(now, &mut out),
-            Input::CaptureBoundary => self.capture_boundary(now, &mut out),
+            Input::SetCaptureBoundary(id) => self.set_capture_boundary(now, id, &mut out),
             Input::EndOfTurn {
                 turn,
                 pause,
@@ -395,7 +395,7 @@ impl Call {
                     number,
                     Turn {
                         id: id.clone(),
-                        boundary: self.capture_boundary,
+                        capture_boundary_id: self.capture_boundary_id.clone(),
                         started_ms: now,
                         ended_ms: None,
                         audio_ms: 0,
@@ -407,6 +407,7 @@ impl Call {
                 self.open = Some(number);
                 out.push(Effect::Event(VoiceEvent::Turn(TurnEvent::Started {
                     turn_id: id,
+                    capture_boundary_id: self.capture_boundary_id.clone(),
                     started_at: self.epoch_unix_ms + now,
                 })));
                 let mut actions = Vec::new();
@@ -514,7 +515,7 @@ impl Call {
                 let merge = u64::from(self.config.patience.merge_window_ms());
                 if merge == 0
                     || self.turns.get(&turn).is_some_and(|record| {
-                        record.boundary != self.capture_boundary
+                        record.capture_boundary_id != self.capture_boundary_id
                     })
                 {
                     self.close_turn(now, turn, Some(text), false, out);
@@ -543,11 +544,17 @@ impl Call {
         }
     }
 
-    fn capture_boundary(&mut self, now: u64, out: &mut Vec<Effect>) {
+    fn set_capture_boundary(&mut self, now: u64, id: String, out: &mut Vec<Effect>) {
+        if id == self.capture_boundary_id {
+            return;
+        }
+        if let Some(segment) = self.segmenter.capture_boundary() {
+            self.segment(now, segment, out);
+        }
         if let Some(pending) = self.recognition.take_pending() {
             self.finish_pending(now, pending, out);
         }
-        self.capture_boundary = self.capture_boundary.wrapping_add(1);
+        self.capture_boundary_id = id;
     }
 
     fn finish_pending(&mut self, now: u64, pending: Pending, out: &mut Vec<Effect>) {
@@ -682,6 +689,7 @@ impl Call {
                 let ended = turn.ended_ms.unwrap_or(now);
                 TurnEvent::Finished {
                     turn_id: turn.id,
+                    capture_boundary_id: turn.capture_boundary_id,
                     language: self.config.language.clone(),
                     text,
                     started_at: self.epoch_unix_ms + turn.started_ms,
@@ -696,6 +704,7 @@ impl Call {
             }
             None => TurnEvent::Cancelled {
                 turn_id: turn.id,
+                capture_boundary_id: turn.capture_boundary_id,
                 merged,
             },
         };

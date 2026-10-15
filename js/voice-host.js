@@ -62,6 +62,7 @@ export function createVoiceHost(source, options = {}) {
   let chosen = null;
   // What the page asked for before or after the call exists: every new call starts with it.
   let muted = false;
+  let captureBoundaryId = null;
   // The lifecycle: a start asked for and not ended (`active`), the call's last state not idle (`listening`), and a
   // the stops sent whose idle state has not come yet (`stopping`): until each comes, a state from before it is stale.
   let active = false;
@@ -174,6 +175,7 @@ export function createVoiceHost(source, options = {}) {
         call = WasmVoiceCall.create(models, io, config);
         call.onEvent(receive);
         call.mute(muted);
+        if (captureBoundaryId !== null) call.setCaptureBoundary(captureBoundaryId);
       } else if (models) {
         // Other models with the configuration they go with, together: a live call restarts once, on both.
         call.setModels(models, config);
@@ -215,7 +217,11 @@ export function createVoiceHost(source, options = {}) {
       withCall((c) => c.mute(muted));
     },
     cancelInput: () => withCall((c) => c.cancelInput()),
-    captureBoundary: () => withCall((c) => c.captureBoundary()),
+    setCaptureBoundary(id) {
+      if (typeof id !== "string" || !id) throw new TypeError("a nonempty capture boundary id");
+      captureBoundaryId = id;
+      withCall((c) => c.setCaptureBoundary(id));
+    },
     onTurn: on("turn"),
     onState: on("state"),
     onLevel: on("level"),
