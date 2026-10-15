@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.0](https://github.com/sidevoice/sidevoice-voice/compare/v0.4.0...v0.5.0) (2026-10-15)
+
+
+### Features
+
+* **call:** end the open turn now with endInput ([#35](https://github.com/sidevoice/sidevoice-voice/issues/35)) ([0a44c08](https://github.com/sidevoice/sidevoice-voice/commit/0a44c0820311ec562df26f100ff294d2a77d27ff))
+* **turns:** gate interruption on continuous speech ([#31](https://github.com/sidevoice/sidevoice-voice/issues/31)) ([f0b113d](https://github.com/sidevoice/sidevoice-voice/commit/f0b113d196816a2d6cbb5c8fe5c4384680f1c49c))
+
 ## [0.4.0](https://github.com/sidevoice/sidevoice-voice/compare/v0.3.1...v0.4.0) (2026-10-14)
 
 
