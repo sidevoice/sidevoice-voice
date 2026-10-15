@@ -67,6 +67,62 @@ test("one physical capture routes the next frame to one lane and zeros to the ot
   a.io.dispose(); b.io.dispose();
 });
 
+test("stopping a routed lane lets another call open, and restart requires a fresh route", async () => {
+  const physical = browser();
+  const audio = createSharedWebAudioIo();
+  const a = audio.attach(); const b = audio.attach();
+  const first = sink();
+  a.io.start(first);
+  for (let i = 0; i < 5 && !first.events.ready; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+  await audio.routeInput(a.input);
+  a.io.stop();
+  const second = sink();
+  b.io.start(second);
+  for (let i = 0; i < 5 && !second.events.ready; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(second.events.ready, 1);
+  assert.equal(physical.opens, 2);
+  const capture = physical.nodes.filter((node) => node.name === "sidevoice-capture").at(-1);
+  capture.port.onmessage({ data: { type: "captured", generation: 2, samples: new Float32Array(160).fill(0.8) } });
+  assert.equal(second.events.captured.at(-1)[0], 0);
+  const restarted = sink();
+  a.io.start(restarted);
+  for (let i = 0; i < 5 && !restarted.events.ready; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+  capture.port.onmessage({ data: { type: "captured", generation: 2, samples: new Float32Array(160).fill(0.8) } });
+  assert.equal(restarted.events.captured.at(-1)[0], 0);
+  await audio.routeInput(a.input);
+  capture.port.onmessage({ data: { type: "captured", generation: 4, samples: new Float32Array(160).fill(0.8) } });
+  assert.ok(Math.abs(restarted.events.captured.at(-1)[0] - 0.8) < 0.001);
+  a.io.stop(); b.io.stop();
+});
+
+test("posted old frames retain their lane until the route fence, including null and successive routes", async () => {
+  const physical = browser();
+  const audio = createSharedWebAudioIo();
+  const a = audio.attach(); const b = audio.attach();
+  const as = sink(); const bs = sink();
+  a.io.start(as); b.io.start(bs);
+  for (let i = 0; i < 5 && (!as.events.ready || !bs.events.ready); i++) await new Promise((resolve) => setTimeout(resolve, 0));
+  const capture = physical.nodes.find((node) => node.name === "sidevoice-capture");
+  await audio.routeInput(a.input);
+  const old = 2;
+  const toB = audio.routeInput(b.input);
+  capture.port.onmessage({ data: { type: "captured", generation: old, samples: new Float32Array(160).fill(0.4) } });
+  assert.ok(Math.abs(as.events.captured.at(-1)[0] - 0.4) < 0.001);
+  assert.equal(bs.events.captured.at(-1)[0], 0);
+  await toB;
+  const toNull = audio.routeInput(null);
+  const backToA = audio.routeInput(a.input);
+  capture.port.onmessage({ data: { type: "captured", generation: 3, samples: new Float32Array(160).fill(0.6) } });
+  assert.ok(Math.abs(bs.events.captured.at(-1)[0] - 0.6) < 0.001);
+  await Promise.all([toNull, backToA]);
+  capture.port.onmessage({ data: { type: "captured", generation: 4, samples: new Float32Array(160).fill(0.9) } });
+  assert.equal(as.events.captured.at(-1)[0], 0);
+  assert.equal(bs.events.captured.at(-1)[0], 0);
+  capture.port.onmessage({ data: { type: "captured", generation: 5, samples: new Float32Array(160).fill(0.7) } });
+  assert.ok(Math.abs(as.events.captured.at(-1)[0] - 0.7) < 0.001);
+  a.io.stop(); b.io.stop();
+});
+
 test("independent playback meters report only their own lane", async () => {
   const physical = browser();
   const audio = createSharedWebAudioIo();
@@ -105,8 +161,36 @@ test("capture processor stamps its route before the next 10 ms frame", async () 
   assert.equal(first.generation, 9);
   assert.equal(first.samples.length, 160);
   capture.port.onmessage({ data: { type: "route", generation: 10 } });
-  for (let i = 0; i < 2; i++) capture.process([[new Float32Array(128).fill(0.2)]]);
+  for (let i = 0; i < 4; i++) capture.process([[new Float32Array(128).fill(0.2)]]);
   assert.ok(posted.some((message) => message.type === "captured" && message.generation === 10));
+});
+
+test("capture worklet finishes the old frame before acknowledging a mid-frame route", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const { runInNewContext } = await import("node:vm");
+  const source = await readFile(new URL("../capture-worklet.js", import.meta.url), "utf8");
+  const posted = [];
+  let Processor;
+  runInNewContext(source, {
+    sampleRate: 16000, Float32Array, Math,
+    AudioWorkletProcessor: class { constructor() { this.port = { postMessage: (message) => posted.push(message) }; } },
+    registerProcessor: (_name, type) => { Processor = type; },
+  });
+  const capture = new Processor();
+  capture.port.onmessage({ data: { type: "route", generation: 1 } });
+  capture.process([[new Float32Array(128).fill(0.7)]]);
+  capture.port.onmessage({ data: { type: "route", generation: 2 } });
+  assert.equal(posted.some((message) => message.type === "routed" && message.generation === 2), false);
+  capture.process([[new Float32Array(128).fill(0.2)]]);
+  const first = posted.find((message) => message.type === "captured");
+  assert.equal(first.generation, 1);
+  assert.ok(first.samples.slice(0, 120).every((sample) => Math.abs(sample - 0.7) < 0.001));
+  assert.ok(posted.indexOf(first) < posted.findIndex((message) => message.type === "routed" && message.generation === 2));
+  capture.port.onmessage({ data: { type: "route", generation: 3 } });
+  capture.port.onmessage({ data: { type: "route", generation: 4 } });
+  for (let i = 0; i < 3; i++) capture.process([[new Float32Array(128).fill(0.3)]]);
+  const acks = posted.filter((message) => message.type === "routed").map((message) => message.generation);
+  assert.deepEqual(acks, [1, 2, 3, 4]);
 });
 
 test("a cut emits terminal zero before successor playback telemetry", async () => {

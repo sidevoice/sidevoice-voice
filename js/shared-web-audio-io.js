@@ -11,6 +11,7 @@ export function createSharedWebAudioIo(options = {}) {
   let selected = null;
   let generation = 0;
   let pendingRoutes = new Map();
+  let routes = new Map();
   let context = null;
   let stream = null;
   let microphone = null;
@@ -25,6 +26,8 @@ export function createSharedWebAudioIo(options = {}) {
     session++;
     for (const pending of pendingRoutes.values()) pending.reject(failure("stopped"));
     pendingRoutes = new Map();
+    routes = new Map();
+    selected = null;
     for (const track of stream?.getTracks() ?? []) { track.onended = track.onmute = track.onunmute = null; track.stop(); }
     stream = null;
     microphone?.disconnect(); microphone = null;
@@ -85,9 +88,13 @@ export function createSharedWebAudioIo(options = {}) {
     capture = new AudioWorkletNode(context, "sidevoice-capture");
     capture.port.onmessage = ({ data }) => {
       if (opened !== session) return;
-      if (data?.type === "routed") { pendingRoutes.get(data.generation)?.resolve(); pendingRoutes.delete(data.generation); return; }
+      if (data?.type === "routed") {
+        const pending = pendingRoutes.get(data.generation);
+        if (pending) { selected = pending.target; pending.resolve(); pendingRoutes.delete(data.generation); }
+        return;
+      }
       if (data?.type !== "captured") return;
-      const target = pendingRoutes.get(data.generation)?.target ?? (data.generation === generation ? selected : null);
+      const target = routes.get(data.generation) ?? null;
       for (const lane of lanes.values()) if (lane.sink) lane.sink.captured(lane.port === target ? data.samples : new Float32Array(FRAME));
     };
     capture.onprocessorerror = () => failAll("audio-capture-failed");
@@ -96,7 +103,7 @@ export function createSharedWebAudioIo(options = {}) {
     await context.resume();
     if (opened !== session) return;
     // The worklet acknowledges the initial route before any lane reports ready.
-    await route(selected);
+    await route(null);
   }
   async function ensureOpen() {
     if (opening) return opening;
@@ -114,9 +121,9 @@ export function createSharedWebAudioIo(options = {}) {
   }
   function route(port) {
     if (port !== null && !lanes.get(port)?.sink) return Promise.reject(new TypeError("an active input port"));
-    selected = port;
-    if (!capture) return Promise.resolve();
+    if (!capture) { selected = port; return Promise.resolve(); }
     const serial = ++generation;
+    routes.set(serial, port);
     return new Promise((resolve, reject) => {
       pendingRoutes.set(serial, { target: port, resolve, reject });
       capture.port.postMessage({ type: "route", generation: serial });
@@ -229,12 +236,22 @@ export function createSharedWebAudioIo(options = {}) {
         stop() {
           stopPlayback(lane);
           lane.sink = null;
+          let routeWasHere = selected === port;
+          if (routeWasHere) selected = null;
+          for (const [serial, target] of routes) if (target === port) routes.set(serial, null);
+          for (const [serial, pending] of pendingRoutes) {
+            if (pending.target === port) {
+              routeWasHere = true;
+              pending.reject(failure("stopped")); pendingRoutes.delete(serial);
+            }
+          }
           const meter = lane.meter;
           lane.gain?.disconnect();
           lane.gain = lane.meter = null;
           lane.active = null; lane.closing.clear(); lane.deferred = null; lane.rendering = false;
           setTimeout(() => { meter?.disconnect(); meter?.port.close(); }, FADE_SECONDS * 2000);
           if (![...lanes.values()].some((other) => other.sink)) releaseDevices();
+          else if (routeWasHere && capture) void route(null).catch(() => {});
         },
         dispose() {
           io.stop();

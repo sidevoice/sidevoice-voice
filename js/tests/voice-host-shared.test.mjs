@@ -81,3 +81,46 @@ test("calls reject routing to an alien or disposed handle", async () => {
   await a.dispose();
   await assert.rejects(one.routeInput(a), TypeError);
 });
+
+test("a running call's failure releases its model lease at idle", async () => {
+  let loads = 0;
+  const owner = createVoiceHost({ models: () => ({ load: async () => {
+    loads++;
+    return { createVad: () => ({}), transcriber: {}, speaker: {} };
+  } }) }, { io: audio() });
+  const a = owner.createCall();
+  await a.setSettings({ ...settings, idle_unload_minutes: 0 });
+  await a.start();
+  const nativeA = made.at(-1);
+  nativeA.listener({ type: "error", data: { code: "microphone-lost" } });
+  nativeA.listener({ type: "state", data: { listening: "idle" } });
+  const b = owner.createCall();
+  await b.setSettings({ ...settings, idle_unload_minutes: 0 });
+  await b.start();
+  assert.equal(loads, 2, "a failed call still held in the map does not pin the weights");
+  await b.stop();
+  await a.dispose();
+  await b.dispose();
+});
+
+test("a second live call keeps shared weights through the first call's failure", async () => {
+  let loads = 0;
+  const owner = createVoiceHost({ models: () => ({ load: async () => {
+    loads++;
+    return { createVad: () => ({}), transcriber: {}, speaker: {} };
+  } }) }, { io: audio() });
+  const a = owner.createCall();
+  const b = owner.createCall();
+  await Promise.all([a.setSettings({ ...settings, idle_unload_minutes: 0 }), b.setSettings({ ...settings, idle_unload_minutes: 0 })]);
+  await Promise.all([a.start(), b.start()]);
+  const nativeA = made.at(-2);
+  nativeA.listener({ type: "error", data: { code: "audio-output-failed" } });
+  nativeA.listener({ type: "state", data: { listening: "idle" } });
+  const c = owner.createCall();
+  await c.setSettings({ ...settings, idle_unload_minutes: 0 });
+  await c.start();
+  assert.equal(loads, 1);
+  await a.dispose();
+  await b.dispose();
+  await c.dispose();
+});

@@ -115,11 +115,14 @@ export function createVoiceHost(source, options = {}) {
       if (kind === "state") {
         const idle = data.listening === "idle";
         if (stopping > 0) { if (idle) { stopping--; answers.shift()?.(); } }
-        else { listening = !idle; if (idle) active = false; else settle(null); }
-      } else if (kind === "error" && stopping === 0 && !listening) {
-        active = false;
-        release(chosen, id, idleMinutes);
-        settle(fail(data.code));
+        else {
+          listening = !idle;
+          if (idle && active) { active = false; release(chosen, id, idleMinutes); }
+          if (!idle) settle(null);
+        }
+      } else if (kind === "error" && stopping === 0) {
+        if (active) { active = false; release(chosen, id, idleMinutes); }
+        if (!listening) settle(fail(data.code));
       }
       for (const listener of listeners[kind] || []) { try { listener(data); } catch (_) { /* listener owns its error */ } }
     }
