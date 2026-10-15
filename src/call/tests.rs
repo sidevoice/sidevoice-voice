@@ -1442,3 +1442,162 @@ fn a_start_with_no_take_keeps_no_marks() {
     run.hear(&silence(3_000));
     assert!(run.call.take_marks().is_empty());
 }
+
+#[test]
+fn end_input_closes_the_open_turn_now_and_reports_it_finished() {
+    let mut run = Run::new(config());
+    run.hear(&speech());
+    run.take();
+    run.input(Input::EndTurn);
+    let effects = run.take();
+    let (turn, samples) = Run::transcribe(&effects).expect("the open turn is transcribed at once");
+    assert_eq!(turn, 0);
+    assert!(
+        samples / 16 >= speech().len() / 16 / 2,
+        "{} ms",
+        samples / 16
+    );
+    assert!(Run::turns(&effects).is_empty(), "told once transcribed");
+    run.transcribed(turn, "Mister Quilter is the apostle");
+    run.wait(2_000);
+    let turns = Run::turns(&run.take());
+    assert_eq!(turns.len(), 1, "{turns:?}");
+    assert_eq!(turns[0].phase, TurnPhase::Finished);
+    assert_eq!(turns[0].turn_id, "c-turn-0");
+    assert_eq!(
+        turns[0].text.as_deref(),
+        Some("Mister Quilter is the apostle")
+    );
+}
+
+#[test]
+fn end_input_with_no_open_turn_does_nothing() {
+    let mut run = Run::new(config());
+    run.hear(&silence(500));
+    run.take();
+    run.input(Input::EndTurn);
+    assert!(Run::transcribe(&run.take()).is_none());
+    assert!(Run::turns(&run.take()).is_empty());
+
+    // Nor once the turn has ended by itself and waits for its words.
+    run.hear(&speech());
+    run.hear(&silence(3_000));
+    let (turn, _) = Run::transcribe(&run.take()).expect("the turn ended by itself");
+    run.input(Input::EndTurn);
+    let effects = run.take();
+    assert!(Run::transcribe(&effects).is_none());
+    assert!(Run::turns(&effects).is_empty());
+    run.transcribed(turn, "Mister Quilter");
+    run.wait(2_000);
+    let turns = Run::turns(&run.take());
+    assert_eq!(turns.len(), 1, "exactly one finished: {turns:?}");
+    assert_eq!(turns[0].phase, TurnPhase::Finished);
+}
+
+#[test]
+fn a_second_end_input_is_a_no_op() {
+    let mut run = Run::new(config());
+    run.hear(&speech());
+    run.take();
+    run.input(Input::EndTurn);
+    run.input(Input::EndTurn);
+    let effects = run.take();
+    let asked = effects
+        .iter()
+        .filter(|effect| matches!(effect, Effect::Transcribe { .. }))
+        .count();
+    assert_eq!(asked, 1);
+    run.transcribed(0, "Mister Quilter");
+    run.input(Input::EndTurn);
+    run.wait(2_000);
+    let finished = Run::turns(&run.take())
+        .into_iter()
+        .filter(|turn| turn.phase == TurnPhase::Finished)
+        .count();
+    assert_eq!(finished, 1);
+}
+
+#[test]
+fn end_input_closes_the_turn_of_a_muted_call_and_leaves_it_muted() {
+    let mut run = Run::new(config());
+    run.hear(&speech());
+    run.input(Input::Mute(true));
+    run.take();
+    run.input(Input::EndTurn);
+    let effects = run.take();
+    assert!(Run::transcribe(&effects).is_some());
+    assert!(
+        !effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Event(VoiceEvent::State(state)) if state.listening != Listening::Muted
+        )),
+        "the mute stays"
+    );
+    // Unmuted, the next utterance opens a fresh turn.
+    run.input(Input::Mute(false));
+    run.transcribed(0, "Mister Quilter");
+    run.wait(2_000);
+    run.take();
+    run.hear(&silence(500));
+    run.hear(&speech());
+    let turns = Run::turns(&run.take());
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].phase, TurnPhase::Started);
+    assert_eq!(turns[0].turn_id, "c-turn-1");
+}
+
+#[test]
+fn end_input_with_no_open_turn_leaves_a_reply_that_is_playing_alone() {
+    let mut run = Run::new(config());
+    run.reply("playing", "A reply that sounds.");
+    let effects = run.take();
+    assert_eq!(Run::synthesize(&effects).len(), 1, "admitted and asked");
+    run.sound("playing", 0);
+    run.take();
+    run.input(Input::EndTurn);
+    let effects = run.take();
+    assert!(!effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::StopPlayback)));
+    assert!(Run::outcomes(&effects).is_empty());
+    run.played("playing", 0);
+    assert_eq!(
+        Run::playbacks(&run.take())
+            .iter()
+            .map(|(id, status, _)| (id.as_str(), *status))
+            .collect::<Vec<_>>(),
+        [("playing", PlaybackStatus::Heard)]
+    );
+}
+
+#[test]
+fn after_end_input_a_reply_is_admitted_and_the_next_turn_ends_by_its_own_silence() {
+    let mut run = Run::new(config());
+    run.hear(&speech());
+    run.reply("early", "Refused while the person speaks.");
+    assert_eq!(
+        Run::outcomes(&run.take()),
+        [(
+            "early".into(),
+            SayOutcome::NotPlayed {
+                reason: StopReason::BargeIn
+            }
+        )]
+    );
+    run.input(Input::EndTurn);
+    run.take();
+    run.transcribed(0, "Mister Quilter");
+    run.wait(3_000);
+    run.take();
+    run.reply("later", "Said once the person is done.");
+    assert!(
+        !Run::synthesize(&run.take()).is_empty(),
+        "admitted after the turn, as ever"
+    );
+    // The next turn ends by its own silence, not at once.
+    run.hear(&speech());
+    assert!(Run::transcribe(&run.take()).is_none());
+    run.hear(&silence(3_000));
+    let (turn, _) = Run::transcribe(&run.take()).expect("ended by silence");
+    assert_eq!(turn, 1);
+}

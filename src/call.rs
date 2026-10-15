@@ -67,12 +67,14 @@ pub(crate) enum Input {
     ChunkPlayed { utterance: String, chunk: usize },
     /// The output stream has ended after its last rendered sample.
     PlaybackEnded,
-    /// Whether the microphone is muted: an open turn ends with what was said.
+    /// Whether the microphone is muted: muted windows are silence, and the open turn ends as ordinary silence ends it.
     Mute(bool),
     /// Whether the microphone's device gives no audio for now (not the person's mute).
     MicrophoneMuted(bool),
     /// The person cancels what they said that is not reported yet.
     Cancel,
+    /// Close the open turn now with what was captured so far; nothing when none is open.
+    EndTurn,
     /// What the end-of-turn model said of a turn's pause: the probability that the turn is over, or the stable code
     /// of why there is none.
     EndOfTurn {
@@ -280,6 +282,11 @@ impl Call {
             }
             Input::MicrophoneMuted(muted) => self.microphone_muted = muted,
             Input::Cancel => self.cancel_input(now, &mut out),
+            Input::EndTurn => {
+                if let Some(segment) = self.segmenter.end_now() {
+                    self.segment(now, segment, &mut out);
+                }
+            }
             Input::EndOfTurn {
                 turn,
                 pause,

@@ -24,6 +24,7 @@ class FakeCall {
   setConfig() {}
   setModels(models) { this.models = models; }
   cancelInput() {}
+  endInput() { this.ended = (this.ended ?? 0) + 1; return Promise.resolve(); }
   say() { return { id: "say", outcome: Promise.resolve({ status: "heard" }), cancel() {}, onEvent() {} }; }
 }
 globalThis.__made = made;
@@ -170,4 +171,23 @@ test("an active synthesis request keeps its shared choice while another call sto
   assert.equal((await request).sampleRate, 16000);
   await Promise.all([b.stop(), c.stop()]);
   await Promise.all([a.dispose(), b.dispose(), c.dispose()]);
+});
+
+test("endInput resolves at once before settings and reaches only its own call afterwards", async () => {
+  const owner = createVoiceHost({ models: async () => ({ load: async () => ({ createVad: () => ({}), transcriber: {}, speaker: {} }) }) }, { io: audio() });
+  const a = owner.createCall();
+  const b = owner.createCall();
+  await a.endInput();
+  await Promise.all([a.setSettings(settings), b.setSettings(settings)]);
+  await Promise.all([a.start(), b.start()]);
+  const nativeA = made.at(-2);
+  const nativeB = made.at(-1);
+  await a.endInput();
+  await a.endInput();
+  assert.equal(nativeA.ended, 2);
+  assert.equal(nativeB.ended, undefined);
+  assert.equal(await a.endInput(), undefined);
+  await a.dispose();
+  await b.dispose();
+  await a.endInput();
 });

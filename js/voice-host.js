@@ -180,6 +180,7 @@ export function createVoiceHost(source, options = {}) {
       say(text, options = {}) { return !disposed && call ? call.say(String(text), options) : notPlayed(); },
       mute(value) { muted = !!value; call?.mute(muted); },
       cancelInput() { call?.cancelInput(); },
+      async endInput() { await call?.endInput(); },
       onTurn: on("turn"), onState: on("state"), onLevel: on("level"), onPlaybackLevel: on("playback-level"), onError: on("error"), onTake: on("take"),
     });
     calls.set(id, { hostCall, port });

@@ -30,9 +30,10 @@ const SEAM: [&str; 5] = [
     "routeInput",
     "setAudioDevices",
 ];
-const CALL_SEAM: [&str; 14] = [
+const CALL_SEAM: [&str; 15] = [
     "cancelInput",
     "dispose",
+    "endInput",
     "id",
     "mute",
     "onError",
