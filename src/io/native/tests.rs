@@ -274,8 +274,14 @@ fn recorded_speaker_echo_cannot_start_a_turn_but_a_person_over_it_can() {
     fn scenario(person_peak: Option<f32>, person_ms: usize) -> Vec<Effect> {
         let reply = clip(QUILTER, 0.7);
         // A continuous voiced half-second from the recorded FLEURS person, repeated over the reply.
-        let person_clip = clip(FLEURS_ES, person_peak.unwrap_or(0.3));
-        let voiced = &person_clip[144 * WINDOW..160 * WINDOW];
+        // Scale this slice itself: its peak is only about a quarter of the full recording's peak.
+        let person_clip = clip(FLEURS_ES, 1.0);
+        let slice = &person_clip[144 * WINDOW..160 * WINDOW];
+        let slice_peak = slice.iter().fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+        let voiced: Vec<f32> = slice
+            .iter()
+            .map(|sample| sample * person_peak.unwrap_or(0.4) / slice_peak)
+            .collect();
         let mut call = Call::new(config(), "c".into(), 0);
         let mut effects = call.handle(0, Input::Start { take: false });
         effects.extend(call.handle(
@@ -365,12 +371,12 @@ fn recorded_speaker_echo_cannot_start_a_turn_but_a_person_over_it_can() {
         effect,
         Effect::Event(VoiceEvent::Turn(_)) | Effect::Transcribe { .. } | Effect::StopPlayback
     )));
-    let backchannel = scenario(Some(0.3), 400);
+    let backchannel = scenario(Some(0.4), 400);
     assert!(!backchannel.iter().any(|effect| matches!(
         effect,
         Effect::Event(VoiceEvent::Turn(_)) | Effect::Transcribe { .. } | Effect::StopPlayback
     )));
-    let person = scenario(Some(0.3), 4_000);
+    let person = scenario(Some(0.4), 4_000);
     assert!(person.iter().any(|effect| matches!(
         effect,
         Effect::Event(VoiceEvent::Turn(TurnEvent::Started { .. }))
