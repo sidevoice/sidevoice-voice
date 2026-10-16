@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/sidevoice/sidevoice-voice/compare/v0.5.0...v0.5.1) (2026-10-16)
+
+
+### Bug Fixes
+
+* **playback:** play the shared native output without seams, underrun endings or a late cut ([#42](https://github.com/sidevoice/sidevoice-voice/issues/42)) ([f49bf09](https://github.com/sidevoice/sidevoice-voice/commit/f49bf09e26eba63717e65a58810cd9cf450692d3))
+
 ## [0.5.0](https://github.com/sidevoice/sidevoice-voice/compare/v0.4.0...v0.5.0) (2026-10-15)
 
 
