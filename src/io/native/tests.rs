@@ -272,11 +272,19 @@ fn rendered_boundaries_precede_qualifying_capture_even_when_the_driver_is_delaye
 
 #[test]
 fn recorded_speaker_echo_cannot_start_a_turn_but_a_person_over_it_can() {
-    fn scenario(person: bool) -> Vec<Effect> {
+    fn scenario(person_peak: Option<f32>, person_ms: usize) -> Vec<Effect> {
         let reply = clip(QUILTER, 0.7);
-        // A continuous voiced half-second from the recorded FLEURS person, repeated and amplified over the reply.
-        let person_clip = clip(FLEURS_ES, 0.9);
-        let voiced = &person_clip[144 * WINDOW..160 * WINDOW];
+        // A continuous voiced half-second from the recorded FLEURS person, repeated over the reply.
+        // Scale this slice itself: its peak is only about a quarter of the full recording's peak.
+        let person_clip = clip(FLEURS_ES, 1.0);
+        let slice = &person_clip[144 * WINDOW..160 * WINDOW];
+        let slice_peak = slice
+            .iter()
+            .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+        let voiced: Vec<f32> = slice
+            .iter()
+            .map(|sample| sample * person_peak.unwrap_or(0.4) / slice_peak)
+            .collect();
         let mut call = Call::new(config(), "c".into(), 0);
         let mut effects = call.handle(0, Input::Start { take: false });
         effects.extend(call.handle(
@@ -324,8 +332,10 @@ fn recorded_speaker_echo_cannot_start_a_turn_but_a_person_over_it_can() {
                                 * gain
                         })
                         .sum::<f32>();
-                    let voice = if person && (16_000..5 * 16_000).contains(&i) {
-                        (voiced[(i - 16_000) % voiced.len()] * 3.0).clamp(-1.0, 1.0)
+                    let voice = if person_peak.is_some()
+                        && (16_000..16_000 + person_ms * 16).contains(&i)
+                    {
+                        voiced[(i - 16_000) % voiced.len()]
                     } else {
                         0.0
                     };
@@ -359,12 +369,17 @@ fn recorded_speaker_echo_cannot_start_a_turn_but_a_person_over_it_can() {
         }
         effects
     }
-    let alone = scenario(false);
+    let alone = scenario(None, 0);
     assert!(!alone.iter().any(|effect| matches!(
         effect,
         Effect::Event(VoiceEvent::Turn(_)) | Effect::Transcribe { .. } | Effect::StopPlayback
     )));
-    let person = scenario(true);
+    let backchannel = scenario(Some(0.4), 400);
+    assert!(!backchannel.iter().any(|effect| matches!(
+        effect,
+        Effect::Event(VoiceEvent::Turn(_)) | Effect::Transcribe { .. } | Effect::StopPlayback
+    )));
+    let person = scenario(Some(0.4), 4_000);
     assert!(person.iter().any(|effect| matches!(
         effect,
         Effect::Event(VoiceEvent::Turn(TurnEvent::Started { .. }))
