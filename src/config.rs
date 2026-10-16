@@ -142,7 +142,7 @@ impl Patience {
 pub struct ListeningBar {
     /// The bar while nothing plays: −60 LUFS by default.
     pub quiet: f32,
-    /// The bar while something plays, when it is higher: what a barge-in must clear, −30 LUFS by default.
+    /// The bar while something plays, when it is higher: what a barge-in must clear, −40 LUFS by default.
     pub playing: f32,
 }
 
@@ -150,7 +150,7 @@ impl Default for ListeningBar {
     fn default() -> Self {
         Self {
             quiet: 0.5,
-            playing: 0.8,
+            playing: 0.7,
         }
     }
 }

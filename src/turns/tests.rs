@@ -18,7 +18,7 @@ const SMART: Segmentation = Segmentation {
     end_ms: 3_000,
     ask: true,
     quiet_bar: 0.5,
-    playing_bar: 0.8,
+    playing_bar: 0.7,
     barge_in_min_ms: 1_000,
 };
 
@@ -276,7 +276,7 @@ fn below_volume_windows_reset_an_overlap_candidate() {
     hear(&mut segmenter, &times(Heard(tone(LOUD), 0.02), 32), true);
     assert!(hear(&mut segmenter, &times(speech(LOUD), 10), true).is_empty());
     // Confidence remains high: the level alone falls below the raised bar.
-    assert!(hear(&mut segmenter, &times(speech(MURMUR), 13), true).is_empty());
+    assert!(hear(&mut segmenter, &times(speech(MURMUR), 25), true).is_empty());
     assert_eq!(
         segmenter.barge_run, 0,
         "the raised volume bar reset the candidate"
@@ -292,8 +292,8 @@ fn below_volume_windows_reset_an_overlap_candidate() {
 }
 
 #[test]
-fn raised_bar_rejects_speech_just_below_point_eight_and_accepts_above_it() {
-    for (amplitude, accepted) in [(0.044, false), (0.046, true)] {
+fn raised_bar_rejects_speech_just_below_point_seven_and_accepts_above_it() {
+    for (amplitude, accepted) in [(0.013_8, false), (0.014_5, true)] {
         let mut segmenter = Segmenter::new(SMART);
         hear(
             &mut segmenter,
@@ -304,10 +304,26 @@ fn raised_bar_rejects_speech_just_below_point_eight_and_accepts_above_it() {
         assert_eq!(
             events.iter().any(|(_, event)| event == &Segment::Started),
             accepted,
-            "volume {} at the 0.8 bar: {events:?}",
+            "volume {} at the 0.7 bar: {events:?}",
             amplitude
         );
     }
+}
+
+#[test]
+fn attenuated_normal_speech_interrupts_but_echo_and_backchannels_do_not() {
+    // The same normal voice after a 14 dB double-talk loss is about −37 LUFS. The
+    // detector still recognizes it, but the old −30 LUFS floor discarded it.
+    let voice = 0.02;
+    let mut segmenter = Segmenter::new(SMART);
+    assert!(hear(&mut segmenter, &times(Heard(tone(LOUD), 0.02), 64), true).is_empty());
+    assert!(hear(&mut segmenter, &times(speech(voice), 12), true).is_empty());
+    assert!(hear(&mut segmenter, &times(Heard(tone(LOUD), 0.02), 1), true).is_empty());
+    assert!(hear(&mut segmenter, &times(speech(voice), 31), true).is_empty());
+    assert!(matches!(
+        hear(&mut segmenter, &times(speech(voice), 1), true)[..],
+        [(0, Segment::Started)]
+    ));
 }
 
 #[test]

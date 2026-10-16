@@ -21,7 +21,7 @@ fn a_configuration_reads_with_its_defaults_and_names_no_model() {
     assert_eq!(config.barge_in_min_speech.seconds(), 1.0);
     assert_eq!(
         (config.listening_bar.quiet, config.listening_bar.playing),
-        (0.5, 0.8)
+        (0.5, 0.7)
     );
     assert_eq!(
         (config.language.as_deref(), config.voice.as_deref()),

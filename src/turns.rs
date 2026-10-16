@@ -189,10 +189,7 @@ impl Segmenter {
         self.level.take(pcm);
         let volume = self.volume.take(pcm);
         let bar = if playing {
-            self.numbers
-                .quiet_bar
-                .max(self.numbers.playing_bar)
-                .max(0.8)
+            self.numbers.quiet_bar.max(self.numbers.playing_bar)
         } else {
             self.numbers.quiet_bar
         };
