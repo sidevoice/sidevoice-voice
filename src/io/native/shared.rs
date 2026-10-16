@@ -1,5 +1,10 @@
 //! Several call-local audio lanes over one microphone, speaker and echo canceller. The physical speaker receives
-//! short mixed frames; its actual playback clock drives each lane's chunk and rendered reports.
+//! short mixed frames, kept a few tens of milliseconds ahead of what it plays; its actual playback clock drives each
+//! lane's chunk and rendered reports.
+//!
+//! A lane's playback ends when everything it was given has played, never when the physical speaker momentarily runs
+//! dry: a frame sent is a frame reported. Stopping a lane cuts the speaker at once (with its short fade) and mixes
+//! what the other lanes had in flight again, so an interruption is never late by the lead.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, Weak};
@@ -16,7 +21,9 @@ use crate::voice_call::Message;
 
 const RATE: u32 = 16_000;
 const FRAME: usize = 160;
-const MIX_AHEAD: usize = 2;
+/// How many mixed 10 ms frames wait at the speaker ahead of what it plays: enough to ride out the audio thread's
+/// wake-ups and a busy dispatcher without running dry, and no more, since a stop cuts them all.
+const MIX_AHEAD: usize = 8;
 
 #[cfg(test)]
 mod tests;
@@ -49,7 +56,9 @@ struct State {
     next_frame: u64,
     routed: Option<u64>,
     lanes: BTreeMap<u64, Lane>,
+    /// The mixed frames sent to the speaker and not played yet.
     frames: HashMap<String, MixedFrame>,
+    /// The frames whose rendered samples are not all in yet, in order.
     frame_order: VecDeque<String>,
     rendered_pending: VecDeque<f32>,
 }
@@ -57,33 +66,56 @@ struct State {
 struct Lane {
     sink: Option<IoSink>,
     queued: VecDeque<Chunk>,
-    stopping: bool,
     incarnation: u64,
+    /// The lane's one resampler to the mixing rate, and the rate it takes: chunks follow each other without a seam.
+    resampler: Option<(u32, Resampler)>,
+    /// Whether it has played anything since its playback last ended.
+    sounding: bool,
 }
 
 struct Chunk {
     utterance: String,
     chunk: usize,
-    samples: Vec<f32>,
+    samples: Arc<[f32]>,
     cursor: usize,
+    /// Whether its start was already reported (a chunk mixed again after a stop of another lane).
+    announced: bool,
 }
 
+/// One lane's frame of a mix: its samples, cut from one chunk or running on into the next, so that chunks follow each
+/// other without a gap.
 struct Part {
     lane: u64,
     incarnation: u64,
+    samples: Vec<f32>,
+    pieces: Vec<Piece>,
+}
+
+/// The run of one chunk's samples in a part.
+struct Piece {
     utterance: String,
     chunk: usize,
-    samples: Vec<f32>,
+    /// The chunk it was cut from, and where.
+    source: Arc<[f32]>,
+    offset: usize,
     first: bool,
     last: bool,
 }
 
+impl Part {
+    /// Whether the chunk of `piece` ends before the part does: such an end is reported as the frame starts, so that
+    /// it comes before the next chunk's start.
+    fn ends_inside(&self, piece: usize) -> bool {
+        self.pieces[piece].last && piece + 1 < self.pieces.len()
+    }
+}
+
 struct MixedFrame {
+    seq: u64,
     parts: Vec<Part>,
     mixed: Vec<f32>,
     rendered: usize,
     started: bool,
-    played: bool,
 }
 
 struct LaneIo {
@@ -139,8 +171,9 @@ impl SharedNativeAudio {
             Lane {
                 sink: None,
                 queued: VecDeque::new(),
-                stopping: false,
                 incarnation: 0,
+                resampler: None,
+                sounding: false,
             },
         );
         (
@@ -154,7 +187,6 @@ impl SharedNativeAudio {
             },
         )
     }
-
     /// Applies a route after all already-reported physical frames. Every started lane continues receiving frames;
     /// only the selected lane receives the real samples. `None` gives every lane silence.
     pub async fn route_input(&self, target: Option<&InputPort>) -> Result<(), String> {
@@ -208,42 +240,52 @@ impl AudioIo for LaneIo {
         if lane.sink.is_none() {
             return;
         }
+        let resampler = match &mut lane.resampler {
+            Some((from, resampler)) if *from == sample_rate => resampler,
+            slot => {
+                &mut slot
+                    .insert((sample_rate, Resampler::new(sample_rate, RATE)))
+                    .1
+            }
+        };
         let mut resampled = Vec::new();
-        Resampler::new(sample_rate, RATE).process(&samples, &mut resampled);
-        lane.stopping = false;
+        resampler.process(&samples, &mut resampled);
         lane.queued.push_back(Chunk {
             utterance: utterance.to_owned(),
             chunk,
-            samples: resampled,
+            samples: resampled.into(),
             cursor: 0,
+            announced: false,
         });
         state.prime();
     }
 
     fn stop_playback(&mut self) {
         let mut state = self.inner.state.lock().expect("shared audio");
-        let pending = state
-            .frames
-            .values()
-            .any(|frame| frame.parts.iter().any(|part| part.lane == self.id));
-        if let Some(lane) = state.lanes.get_mut(&self.id) {
-            lane.queued.clear();
-            lane.stopping = pending;
-            if !pending {
-                if let Some(sink) = &lane.sink {
-                    sink.send(IoEvent::PlaybackEnded);
-                }
-            }
+        let Some(lane) = state.lanes.get_mut(&self.id) else {
+            return;
+        };
+        lane.queued.clear();
+        lane.resampler = None;
+        lane.sounding = false;
+        let sink = lane.sink.clone();
+        if state.in_flight(self.id) {
+            state.flush(self.id);
+        }
+        if let Some(sink) = sink {
+            sink.send(IoEvent::PlaybackEnded);
         }
     }
 
     fn stop(&mut self) {
         let mut state = self.inner.state.lock().expect("shared audio");
+        let in_flight = state.in_flight(self.id);
         if let Some(lane) = state.lanes.get_mut(&self.id) {
             lane.sink = None;
             lane.incarnation = lane.incarnation.wrapping_add(1);
             lane.queued.clear();
-            lane.stopping = false;
+            lane.resampler = None;
+            lane.sounding = false;
         }
         if state.routed == Some(self.id) {
             state.routed = None;
@@ -255,6 +297,8 @@ impl AudioIo for LaneIo {
             state.frames.clear();
             state.frame_order.clear();
             state.rendered_pending.clear();
+        } else if in_flight {
+            state.flush(self.id);
         }
     }
 }
@@ -289,6 +333,8 @@ impl State {
         self.drain_rendered();
     }
 
+    /// Hands the rendered samples to the lanes, frame after frame. A frame that played before all of its samples came
+    /// back leaves the rest to the next one; the meter is not worth holding a played frame for.
     fn drain_rendered(&mut self) {
         while let Some(id) = self.frame_order.front().cloned() {
             let Some(frame) = self.frames.get_mut(&id) else {
@@ -323,61 +369,146 @@ impl State {
                 sink.send(IoEvent::Rendered(attributed));
             }
             if frame.rendered == FRAME {
-                let played = frame.played;
                 self.frame_order.pop_front();
-                if played {
-                    self.frames.remove(&id);
-                    self.finish_stops();
-                    self.prime();
-                }
+            }
+        }
+        // Nothing left to attribute them to: what is left is the tail of frames that already played.
+        if self.frame_order.is_empty() {
+            self.rendered_pending.clear();
+        }
+    }
+
+    /// Whether the speaker holds anything of the lane `id`'s current incarnation.
+    fn in_flight(&self, id: u64) -> bool {
+        let Some(lane) = self.lanes.get(&id) else {
+            return false;
+        };
+        self.frames.values().any(|frame| {
+            frame
+                .parts
+                .iter()
+                .any(|part| part.lane == id && part.incarnation == lane.incarnation)
+        })
+    }
+
+    /// Ends the playback of every lane that played and has nothing left, queued or at the speaker.
+    fn end_idle_lanes(&mut self) {
+        let ended: Vec<u64> = self
+            .lanes
+            .iter()
+            .filter(|(&id, lane)| lane.sounding && lane.queued.is_empty() && !self.in_flight(id))
+            .map(|(&id, _)| id)
+            .collect();
+        for id in ended {
+            let lane = self.lanes.get_mut(&id).expect("lane");
+            lane.sounding = false;
+            if let Some(sink) = &lane.sink {
+                sink.send(IoEvent::PlaybackEnded);
             }
         }
     }
 
-    fn finish_stops(&mut self) {
-        for (&id, lane) in &mut self.lanes {
-            if lane.stopping
-                && !self.frames.values().any(|frame| {
-                    frame
-                        .parts
-                        .iter()
-                        .any(|part| part.lane == id && part.incarnation == lane.incarnation)
-                })
-            {
-                lane.stopping = false;
-                if let Some(sink) = &lane.sink {
-                    sink.send(IoEvent::PlaybackEnded);
+    /// Cuts the speaker (with its fade) and drops every frame it holds, then mixes again what the other lanes than
+    /// `except` had in them, from the start of the oldest frame that had not played: a few milliseconds of theirs may
+    /// sound twice, none is lost, and every chunk still starts and ends once.
+    fn flush(&mut self, except: u64) {
+        self.physical.stop_playback();
+        let mut frames: Vec<MixedFrame> = self.frames.drain().map(|(_, frame)| frame).collect();
+        frames.sort_by_key(|frame| frame.seq);
+        self.frame_order.clear();
+        self.rendered_pending.clear();
+        let mut restored: BTreeMap<u64, Vec<Chunk>> = BTreeMap::new();
+        for frame in frames {
+            for part in frame.parts {
+                let current = part.lane != except
+                    && self.lanes.get(&part.lane).is_some_and(|lane| {
+                        lane.sink.is_some() && lane.incarnation == part.incarnation
+                    });
+                if !current {
+                    continue;
+                }
+                let chunks = restored.entry(part.lane).or_default();
+                let reported: Vec<bool> = (0..part.pieces.len())
+                    .map(|piece| frame.started && part.ends_inside(piece))
+                    .collect();
+                for (piece, reported) in part.pieces.into_iter().zip(reported) {
+                    // Its end is already told: what little of it had not sounded counts as played.
+                    if reported
+                        || chunks
+                            .last()
+                            .is_some_and(|chunk| Arc::ptr_eq(&chunk.samples, &piece.source))
+                    {
+                        continue;
+                    }
+                    chunks.push(Chunk {
+                        utterance: piece.utterance,
+                        chunk: piece.chunk,
+                        samples: piece.source,
+                        cursor: piece.offset,
+                        announced: !piece.first || frame.started,
+                    });
                 }
             }
         }
+        for (id, chunks) in restored {
+            let lane = self.lanes.get_mut(&id).expect("lane");
+            let continues = lane
+                .queued
+                .front()
+                .zip(chunks.last())
+                .is_some_and(|(next, last)| Arc::ptr_eq(&next.samples, &last.samples));
+            if continues {
+                lane.queued.pop_front();
+            }
+            for chunk in chunks.into_iter().rev() {
+                lane.queued.push_front(chunk);
+            }
+        }
+        self.prime();
     }
 
+    /// Mixes and sends frames until the speaker holds [`MIX_AHEAD`] of them or no lane has more.
     fn prime(&mut self) {
         while self.running && self.frames.len() < MIX_AHEAD {
             let mut parts: Vec<Part> = self
                 .lanes
                 .iter_mut()
                 .filter_map(|(&id, lane)| {
-                    let current = lane.queued.front_mut()?;
-                    let first = current.cursor == 0;
-                    let end = (current.cursor + FRAME).min(current.samples.len());
-                    let mut samples = current.samples[current.cursor..end].to_vec();
+                    let mut samples = Vec::with_capacity(FRAME);
+                    let mut pieces = Vec::new();
+                    while samples.len() < FRAME {
+                        let Some(current) = lane.queued.front_mut() else {
+                            break;
+                        };
+                        let offset = current.cursor;
+                        let end = (offset + FRAME - samples.len()).min(current.samples.len());
+                        samples.extend_from_slice(&current.samples[offset..end]);
+                        current.cursor = end;
+                        let last = end == current.samples.len();
+                        pieces.push(Piece {
+                            utterance: current.utterance.clone(),
+                            chunk: current.chunk,
+                            source: Arc::clone(&current.samples),
+                            offset,
+                            first: offset == 0 && !current.announced,
+                            last,
+                        });
+                        if last {
+                            lane.queued.pop_front();
+                        }
+                    }
+                    if pieces.is_empty() {
+                        return None;
+                    }
+                    // Only a lane with nothing more queued leaves a gap.
                     samples.resize(FRAME, 0.0);
-                    current.cursor = end;
-                    let last = current.cursor == current.samples.len();
-                    let part = Part {
+                    lane.sounding = true;
+                    Some(Part {
                         lane: id,
                         incarnation: lane.incarnation,
-                        utterance: current.utterance.clone(),
-                        chunk: current.chunk,
                         samples,
-                        first,
-                        last,
-                    };
-                    if last {
-                        lane.queued.pop_front();
-                    }
-                    Some(part)
+                        pieces,
+                    })
                 })
                 .collect();
             if parts.is_empty() {
@@ -397,16 +528,17 @@ impl State {
                     part.samples[i] *= scale;
                 }
             }
-            let id = format!("shared-frame-{}", self.next_frame);
+            let seq = self.next_frame;
             self.next_frame += 1;
+            let id = format!("shared-frame-{seq}");
             self.frames.insert(
                 id.clone(),
                 MixedFrame {
+                    seq,
                     parts,
                     mixed: mixed.clone(),
                     rendered: 0,
                     started: false,
-                    played: false,
                 },
             );
             self.frame_order.push_back(id.clone());
@@ -433,18 +565,9 @@ impl State {
                 let queued = vec![true; samples.len()];
                 self.rendered(samples, queued);
             }
-            IoEvent::PlaybackEnded => {
-                self.frames.clear();
-                self.frame_order.clear();
-                self.rendered_pending.clear();
-                for lane in self.lanes.values_mut() {
-                    lane.stopping = false;
-                    if let Some(sink) = &lane.sink {
-                        sink.send(IoEvent::PlaybackEnded);
-                    }
-                }
-                self.prime();
-            }
+            // The speaker ran dry: between mixed frames that is an underrun, not an end. Every frame sent is still
+            // reported as it plays, and each lane ends once all it was given has played.
+            IoEvent::PlaybackEnded => {}
             IoEvent::ChunkStarted { utterance, .. } => {
                 if let Some(frame) = self.frames.get_mut(&utterance) {
                     frame.started = true;
@@ -454,39 +577,43 @@ impl State {
                             .parts
                             .iter()
                             .find(|part| part.lane == id && part.incarnation == lane.incarnation);
-                        if let Some(part) = part.filter(|part| part.first) {
-                            sink.send(IoEvent::ChunkStarted {
-                                utterance: part.utterance.clone(),
-                                chunk: part.chunk,
-                            });
+                        let Some(part) = part else { continue };
+                        for (index, piece) in part.pieces.iter().enumerate() {
+                            if piece.first {
+                                sink.send(IoEvent::ChunkStarted {
+                                    utterance: piece.utterance.clone(),
+                                    chunk: piece.chunk,
+                                });
+                            }
+                            if part.ends_inside(index) {
+                                sink.send(IoEvent::ChunkPlayed {
+                                    utterance: piece.utterance.clone(),
+                                    chunk: piece.chunk,
+                                });
+                            }
                         }
                     }
                 }
                 self.drain_rendered();
             }
             IoEvent::ChunkPlayed { utterance, .. } => {
-                if let Some(frame) = self.frames.get_mut(&utterance) {
-                    frame.played = true;
+                if let Some(frame) = self.frames.remove(&utterance) {
                     for part in &frame.parts {
-                        if part.last {
-                            if let Some(sink) = self
-                                .lanes
-                                .get(&part.lane)
-                                .filter(|lane| lane.incarnation == part.incarnation)
-                                .and_then(|lane| lane.sink.as_ref())
-                            {
-                                sink.send(IoEvent::ChunkPlayed {
-                                    utterance: part.utterance.clone(),
-                                    chunk: part.chunk,
-                                });
-                            }
+                        let ending = part.pieces.last().filter(|piece| piece.last);
+                        let sink = self
+                            .lanes
+                            .get(&part.lane)
+                            .filter(|lane| lane.incarnation == part.incarnation)
+                            .and_then(|lane| lane.sink.as_ref());
+                        if let Some((piece, sink)) = ending.zip(sink) {
+                            sink.send(IoEvent::ChunkPlayed {
+                                utterance: piece.utterance.clone(),
+                                chunk: piece.chunk,
+                            });
                         }
                     }
-                    if frame.rendered == FRAME {
-                        self.frames.remove(&utterance);
-                        self.finish_stops();
-                        self.prime();
-                    }
+                    self.end_idle_lanes();
+                    self.prime();
                 }
             }
             IoEvent::MicrophoneMuted(muted) => {
@@ -507,6 +634,8 @@ impl State {
                         sink.send(IoEvent::Failed(code.clone()));
                     }
                     lane.queued.clear();
+                    lane.resampler = None;
+                    lane.sounding = false;
                 }
             }
         }

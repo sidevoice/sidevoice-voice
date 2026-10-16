@@ -6,19 +6,21 @@
 //! The device callbacks only move samples through lock-free rings: the input's into the capture ring, and the
 //! output's from the playback ring, copying what it plays into the reference ring (`output`). One audio thread of
 //! the module owns the devices' streams, takes both rings in step through the echo canceller (`pipeline`), sends the
-//! clean 16 kHz frames to the call, feeds the chunks it is handed into the playback ring as room frees up, and tells
-//! the call when each chunk starts and ends at the speaker. No C++ runs in a device callback.
+//! clean 16 kHz frames to the call, resamples the chunks it is handed to the speaker's rate and feeds them into the
+//! playback ring as room frees up (`playout`), and tells the call when each chunk starts and ends at the speaker. No
+//! C++ runs in a device callback.
 #![cfg(native)]
 
 mod devices;
 mod output;
 mod pipeline;
+mod playout;
 mod shared;
 
 #[cfg(test)]
 mod tests;
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -29,10 +31,10 @@ use rtrb::{Consumer, Producer, RingBuffer};
 
 use self::devices::{by_id, Kind};
 pub use self::devices::{AudioDevice, AudioDevices, LostDevices, NativeDevices};
-use self::output::{Counters, Output, Queue, ReferenceSample, Schedule};
+use self::output::{Counters, Output, ReferenceSample};
 use self::pipeline::Pipeline;
+use self::playout::{Command, Playout};
 pub use self::shared::{InputPort, SharedNativeAudio};
-use crate::audio::Resampler;
 use crate::io::{AudioIo, IoEvent, IoSink};
 
 /// How long a stop fades out, in milliseconds.
@@ -56,20 +58,6 @@ struct Running {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     speaker: mpsc::Sender<Command>,
-    /// The speaker's rate: a switch to another speaker may change it.
-    output_rate: Arc<AtomicU32>,
-}
-
-/// What the audio thread is told to do with the speaker, in order.
-enum Command {
-    /// Queue a chunk, at the output's rate.
-    Play {
-        utterance: String,
-        chunk: usize,
-        samples: Vec<f32>,
-    },
-    /// Stop with a fade and drop what is queued.
-    Stop,
 }
 
 /// What the audio thread hands back once the devices are open, or why they are not.
@@ -98,16 +86,11 @@ impl AudioIo for NativeIo {
         let stop = Arc::new(AtomicBool::new(false));
         let (opened, open) = mpsc::channel::<Opened>();
         let (speaker, commands) = mpsc::channel::<Command>();
-        let output_rate = Arc::new(AtomicU32::new(0));
         let thread = {
-            let (stop, rate, devices) = (
-                Arc::clone(&stop),
-                Arc::clone(&output_rate),
-                self.devices.clone(),
-            );
+            let (stop, devices) = (Arc::clone(&stop), self.devices.clone());
             thread::Builder::new()
                 .name("sidevoice-voice-audio".into())
-                .spawn(move || run(&sink, &devices, &rate, &stop, &commands, &opened))
+                .spawn(move || run(&sink, &devices, &stop, &commands, &opened))
                 .map_err(|_| "audio-thread-failed".to_owned())?
         };
         open.recv()
@@ -116,7 +99,6 @@ impl AudioIo for NativeIo {
             stop,
             thread: Some(thread),
             speaker,
-            output_rate,
         });
         Ok(())
     }
@@ -125,13 +107,11 @@ impl AudioIo for NativeIo {
         let Some(running) = &mut self.running else {
             return;
         };
-        let mut resampled = Vec::with_capacity(samples.len());
-        let output_rate = running.output_rate.load(Ordering::Acquire);
-        Resampler::new(sample_rate, output_rate).process(&samples, &mut resampled);
         let _ = running.speaker.send(Command::Play {
             utterance: utterance.to_owned(),
             chunk,
-            samples: resampled,
+            samples,
+            sample_rate,
         });
     }
 
@@ -162,7 +142,6 @@ impl Drop for NativeIo {
 fn run(
     sink: &IoSink,
     devices: &NativeDevices,
-    output_rate: &AtomicU32,
     stop: &AtomicBool,
     commands: &mpsc::Receiver<Command>,
     opened: &mpsc::Sender<Opened>,
@@ -186,33 +165,15 @@ fn run(
             return;
         }
     };
-    output_rate.store(speaker.rate, Ordering::Release);
     let _ = opened.send(Ok(()));
     // Both streams play: the call listens from now.
     sink.send(IoEvent::Ready);
-    let mut queue = Queue::default();
+    let mut playout = Playout::new(speaker.rate);
     let mut heard = Vec::new();
-    let mut played = Vec::new();
-    let mut played_audio = Vec::new();
-    let mut queued_presence = Vec::new();
     let mut speaker_switch = false;
-    let mut ending: Option<u64> = None;
-    let mut had_chunks = false;
-    let mut drained_reference = 0_u64;
     while !stop.load(Ordering::Acquire) {
         for command in commands.try_iter() {
-            match command {
-                Command::Play {
-                    utterance,
-                    chunk,
-                    samples,
-                } => {
-                    had_chunks = true;
-                    ending = None;
-                    queue.play(utterance, chunk, samples);
-                }
-                Command::Stop => ending = Some(queue.stop(&speaker.counters)),
-            }
+            playout.command(command, &speaker.counters);
         }
         if devices.take_switch(Kind::Input) {
             match switched(
@@ -232,9 +193,9 @@ fn run(
         speaker_switch |= devices.take_switch(Kind::Output);
         // A speaker that went away plays nothing more: what it was left to play is over.
         let gone = speaker.gone.load(Ordering::Acquire);
-        if speaker_switch && (queue.is_idle() || gone) {
+        if speaker_switch && (playout.queue.is_idle() || gone) {
             speaker_switch = false;
-            for event in queue.abandon() {
+            for event in playout.queue.abandon() {
                 sink.send(event);
             }
             let reopened = Speaker::open(
@@ -252,90 +213,28 @@ fn run(
             });
             match reopened {
                 Ok((rebuilt, next)) => {
-                    (speaker, pipeline, queue) = (next, rebuilt, Queue::default());
-                    drained_reference = 0;
+                    (speaker, pipeline) = (next, rebuilt);
+                    playout = Playout::new(speaker.rate);
                     sink.send(IoEvent::PlaybackEnded);
-                    ending = None;
-                    had_chunks = false;
-                    output_rate.store(speaker.rate, Ordering::Release);
                 }
                 Err(code) => return sink.send(IoEvent::Failed(code)),
             }
         }
-        queue.feed(&mut speaker.playback);
-        drain(&mut speaker.reference, &mut played, 1);
-        drained_reference += played.len() as u64;
-        played_audio.clear();
-        queued_presence.clear();
-        played_audio.extend(played.iter().map(|sample: &ReferenceSample| sample.value));
-        queued_presence.extend(
-            played
-                .iter()
-                .map(|sample| f32::from(u8::from(sample.queued))),
-        );
+        playout.exchange(&mut speaker.playback, &mut speaker.reference);
         drain(&mut microphone.capture, &mut heard, microphone.channels);
         if changed.swap(false, Ordering::AcqRel) {
             pipeline.reinitialize();
         }
-        let rendered = pipeline.render(&played_audio);
-        let presence = pipeline.render_presence(&queued_presence);
-        if (had_chunks || ending.is_some()) && !rendered.is_empty() {
-            sink.send_physical_rendered(rendered, presence);
-        }
+        playout.render(&mut pipeline, sink);
         let frames = pipeline.capture(&heard);
-        let consumed = speaker.counters.consumed.load(Ordering::Acquire);
-        // The callback publishes its consumed count after writing the reference. Report every playback boundary
-        // visible at this snapshot before the capture from this tick can qualify a turn and freeze its extent.
-        send_capture_after_playback(
-            &mut queue.schedule,
-            consumed,
+        playout.report(
+            &speaker.counters,
             frames.into_iter().map(|frame| frame.to_vec()),
-            |event| sink.send(event),
+            &mut pipeline,
+            sink,
         );
-        // `consumed` is published after the callback's reference writes. A callback may run between the drain above
-        // and this load; wait until its published reference tail has crossed the worker before ending the meter.
-        if playback_complete(
-            ending,
-            had_chunks,
-            queue.is_idle(),
-            consumed,
-            speaker.counters.referenced.load(Ordering::Acquire),
-            drained_reference,
-        ) {
-            sink.send(IoEvent::PlaybackEnded);
-            pipeline.reset_playback_meter();
-            ending = None;
-            had_chunks = false;
-        }
         thread::sleep(TICK);
     }
-}
-
-fn send_capture_after_playback(
-    schedule: &mut Schedule,
-    consumed: u64,
-    frames: impl IntoIterator<Item = Vec<f32>>,
-    mut send: impl FnMut(IoEvent),
-) {
-    for event in schedule.due(consumed) {
-        send(event);
-    }
-    for frame in frames {
-        send(IoEvent::Captured(frame));
-    }
-}
-
-/// Completion is behind the callback's published reference tail, even if it ran after this tick's drain.
-fn playback_complete(
-    ending: Option<u64>,
-    had_chunks: bool,
-    idle: bool,
-    consumed: u64,
-    referenced: u64,
-    drained_reference: u64,
-) -> bool {
-    (ending.is_some_and(|end| consumed >= end) || (had_chunks && idle && ending.is_none()))
-        && drained_reference >= referenced
 }
 
 /// A new microphone, and the echo canceller made again for its rate and the speaker's.
