@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.2](https://github.com/sidevoice/sidevoice-voice/compare/v0.5.1...v0.5.2) (2026-10-16)
+
+
+### Bug Fixes
+
+* **turns:** barge-in at normal speaking volume on desktop ([#44](https://github.com/sidevoice/sidevoice-voice/issues/44)) ([4f102fb](https://github.com/sidevoice/sidevoice-voice/commit/4f102fb7b5315c574f42158b4248771828c237ec)), closes [#41](https://github.com/sidevoice/sidevoice-voice/issues/41)
+
 ## [0.5.1](https://github.com/sidevoice/sidevoice-voice/compare/v0.5.0...v0.5.1) (2026-10-16)
 
 
