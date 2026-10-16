@@ -156,7 +156,9 @@ Natively, `SharedNativeAudio::new(devices)` owns one physical microphone, speake
 returns `(Box<dyn AudioIo>, InputPort)` for one call. `route_input(Some(&port)).await` acknowledges a next-frame
 switch, and `route_input(None).await` sends zeros to every started lane. All lanes receive the same 10 ms cadence;
 only the routed lane receives real samples. Their playback chunks, progress and levels are independent. The physical
-speaker receives their mixed output, which is the single AEC reference. The last active lane closes the devices.
+speaker receives their mixed output, which is the single AEC reference, kept 80 ms ahead of what it plays; a lane's
+playback ends once all it was given has played, and stopping a lane cuts the speaker at once and mixes the other lanes'
+audio again. The last active lane closes the devices.
 Apps that provide their own `AudioIo` can route frames themselves.
 
 `SharedModels::new(loader)` implements `VoiceModels` as a lightweight, restartable pool. The loader returns
@@ -293,9 +295,10 @@ src/            the crate sidevoice-voice
                   models/web.rs, the page's JavaScript models through structural imports (wasm32)
   residency.rs    when idle models are dropped
   io.rs           AudioIo, the microphone and the speaker; io/native.rs, NativeIo (cpal), with io/native/output.rs
-                  (what the output callback plays, and where each chunk is), io/native/pipeline.rs (the capture
-                  through the echo canceller) and io/native/devices.rs (NativeDevices: which devices, listed and
-                  chosen)
+                  (what the output callback plays, and where each chunk is), io/native/playout.rs (the audio thread's
+                  speaker side: one resampler per stream, the playback ring, the meter and chunk reports),
+                  io/native/pipeline.rs (the capture through the echo canceller) and io/native/devices.rs
+                  (NativeDevices: which devices, listed and chosen)
   audio.rs        mono, resampling and 10 ms frames, natively
   echo.rs         echo cancellation: echo/native.rs (AEC3), echo/web.rs (the browser's)
   runtime.rs      spawning, sleeping and clocks; runtime/native.rs (Tokio), runtime/web.rs (the browser)

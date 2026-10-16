@@ -5,9 +5,10 @@ use std::sync::atomic::Ordering;
 
 use rtrb::RingBuffer;
 
+use super::drain;
 use super::output::{Counters, Output, Queue, ReferenceSample, Schedule};
 use super::pipeline::Pipeline;
-use super::{drain, playback_complete, send_capture_after_playback};
+use super::playout::{playback_complete, send_capture_after_playback};
 use crate::call::{Call, Effect, Input};
 use crate::event::{TurnEvent, VoiceEvent};
 use crate::io::IoEvent;

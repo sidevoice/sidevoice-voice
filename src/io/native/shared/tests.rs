@@ -1,4 +1,6 @@
-//! The physical backend is a fake; routing and mixing run through the public lane I/O and sinks.
+//! The physical backend is a fake (`Physical`), or a stand-in that plays as the native speaker does (`Device`): its
+//! own playout and output callback, at irregular callback sizes, starving when the test says so. Routing and mixing
+//! run through the public lane I/O and sinks.
 
 use std::sync::{Arc, Mutex};
 
@@ -6,6 +8,9 @@ use futures_channel::mpsc::{unbounded, UnboundedReceiver};
 use futures_util::StreamExt;
 
 use super::*;
+use crate::io::native::output::{Counters, Output, ReferenceSample};
+use crate::io::native::pipeline::Pipeline;
+use crate::io::native::playout::{Command, Playout};
 
 #[derive(Default)]
 struct Recorded {
@@ -147,7 +152,7 @@ fn two_lanes_mix_once_and_keep_their_own_progress_and_rendered_frames() {
         let mut state = shared.inner.state.lock().unwrap();
         for (id, name) in [(1, "one"), (2, "two")] {
             state.lanes.get_mut(&id).unwrap().queued.push_back(Chunk {
-                utterance: name.into(), chunk: 0, samples: vec![0.75; FRAME], cursor: 0,
+                utterance: name.into(), chunk: 0, samples: vec![0.75; FRAME].into(), cursor: 0, announced: false,
             });
         }
         state.prime();
@@ -187,20 +192,27 @@ fn a_delayed_mixed_frame_cannot_enter_a_restarted_lanes_sink() {
             let mut state = shared.inner.state.lock().unwrap();
             for (id, utterance) in [(1, "old-a"), (2, "live-b")] {
                 state.lanes.get_mut(&id).unwrap().queued.push_back(Chunk {
-                    utterance: utterance.into(), chunk: 0, samples: vec![0.4; FRAME], cursor: 0,
+                    utterance: utterance.into(), chunk: 0, samples: vec![0.4; FRAME].into(), cursor: 0, announced: false,
                 });
             }
             state.prime();
         }
-        let frame = recorded.lock().unwrap().played[0].0.clone();
+        let old = recorded.lock().unwrap().played[0].0.clone();
         a.stop();
+        // A's stop cut the shared frame; B's part of it is mixed again, alone.
+        let (frame, mixed) = recorded.lock().unwrap().played.last().unwrap().clone();
+        assert_ne!(frame, old);
+        assert!(mixed.iter().all(|sample| (*sample - 0.4).abs() < 0.001));
         let (new_sink, mut new_events) = lane_sink();
         a.start(new_sink).unwrap();
         assert!(matches!(next_io(&mut new_events).await, IoEvent::Ready));
         let physical = recorded.lock().unwrap().sink.as_ref().unwrap().clone();
+        // The cut frame's late reports reach nobody.
+        physical.send(IoEvent::ChunkStarted { utterance: old.clone(), chunk: 0 });
+        physical.send(IoEvent::ChunkPlayed { utterance: old, chunk: 0 });
         physical.send(IoEvent::ChunkStarted { utterance: frame.clone(), chunk: 0 });
         assert!(matches!(next_io(&mut b_events).await, IoEvent::ChunkStarted { utterance, .. } if utterance == "live-b"));
-        physical.send(IoEvent::Rendered(vec![0.8; FRAME]));
+        physical.send(IoEvent::Rendered(mixed));
         let b_mailbox = shared.inner.state.lock().unwrap().lanes.get(&2).unwrap().sink.as_ref().unwrap().rendered.clone();
         assert!(next_rendered(&mut b_events, &b_mailbox).await.iter().all(|sample| (*sample - 0.4).abs() < 0.001));
         physical.send(IoEvent::ChunkPlayed { utterance: frame, chunk: 0 });
@@ -347,5 +359,373 @@ fn rendered_before_start_preserves_a_queued_silent_prefix_and_its_peak() {
             FRAME
         );
         lane.stop();
+    });
+}
+
+/// The native speaker without a device: the audio thread's own playout (one resampler to 48 kHz, the playback ring,
+/// the meter and the chunk schedule) and the real output callback, which the test runs at the sizes it chooses.
+struct Device(Arc<Mutex<DeviceState>>);
+
+struct DeviceState {
+    sink: Option<IoSink>,
+    commands: VecDeque<Command>,
+    playout: Playout,
+    playback: rtrb::Producer<f32>,
+    output: Output,
+    counters: Counters,
+    pipeline: Pipeline,
+    /// What the callback copies, and the copy the playout drains.
+    taken: rtrb::Consumer<ReferenceSample>,
+    reference: rtrb::Producer<ReferenceSample>,
+    reference_out: rtrb::Consumer<ReferenceSample>,
+    /// Everything the speaker sounded.
+    heard: Vec<ReferenceSample>,
+}
+
+const DEVICE_RATE: u32 = 48_000;
+
+impl Device {
+    fn new() -> (Self, Arc<Mutex<DeviceState>>) {
+        let (playback, queued) = rtrb::RingBuffer::new(DEVICE_RATE as usize * 4);
+        let (copy, taken) = rtrb::RingBuffer::new(DEVICE_RATE as usize * 4);
+        let (reference, reference_out) = rtrb::RingBuffer::new(DEVICE_RATE as usize * 4);
+        let state = Arc::new(Mutex::new(DeviceState {
+            sink: None,
+            commands: VecDeque::new(),
+            playout: Playout::new(DEVICE_RATE),
+            playback,
+            output: Output::new(
+                queued,
+                copy,
+                (DEVICE_RATE * crate::io::native::FADE_MS / 1000) as usize,
+            ),
+            counters: Counters::default(),
+            pipeline: Pipeline::new(RATE, 1, DEVICE_RATE).unwrap(),
+            taken,
+            reference,
+            reference_out,
+            heard: Vec::new(),
+        }));
+        (Self(Arc::clone(&state)), state)
+    }
+}
+
+impl AudioIo for Device {
+    fn start(&mut self, sink: IoSink) -> Result<(), String> {
+        sink.send(IoEvent::Ready);
+        self.0.lock().unwrap().sink = Some(sink);
+        Ok(())
+    }
+    fn play(&mut self, utterance: &str, chunk: usize, samples: Vec<f32>, sample_rate: u32) {
+        self.0.lock().unwrap().commands.push_back(Command::Play {
+            utterance: utterance.into(),
+            chunk,
+            samples,
+            sample_rate,
+        });
+    }
+    fn stop_playback(&mut self) {
+        self.0.lock().unwrap().commands.push_back(Command::Stop);
+    }
+    fn stop(&mut self) {
+        self.0.lock().unwrap().sink = None;
+    }
+}
+
+impl DeviceState {
+    /// One output callback of `size` samples, then one wake of the audio thread.
+    fn step(&mut self, size: usize) {
+        for _ in 0..size {
+            self.output.next(&self.counters);
+        }
+        self.output.publish(&self.counters);
+        while let Ok(sample) = self.taken.pop() {
+            self.heard.push(sample);
+            self.reference.push(sample).unwrap();
+        }
+        let Some(sink) = self.sink.clone() else {
+            return;
+        };
+        for command in std::mem::take(&mut self.commands) {
+            self.playout.command(command, &self.counters);
+        }
+        self.playout
+            .exchange(&mut self.playback, &mut self.reference_out);
+        self.playout.render(&mut self.pipeline, &sink);
+        self.playout.report(
+            &self.counters,
+            std::iter::empty(),
+            &mut self.pipeline,
+            &sink,
+        );
+    }
+}
+
+/// Irregular callback sizes, as devices deliver them, cycling.
+const CALLBACKS: [usize; 7] = [512, 441, 1_024, 128, 480, 960, 37];
+
+fn current_thread() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap()
+}
+
+/// Lets the shared dispatcher take in everything the device reported.
+async fn settle() {
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// The progress events a lane received so far, without captures, meters or readiness.
+fn progress(events: &mut UnboundedReceiver<Message>, into: &mut Vec<IoEvent>) {
+    while let Ok(message) = events.try_recv() {
+        if let Message::Io(_, event) = message {
+            if matches!(
+                event,
+                IoEvent::ChunkStarted { .. } | IoEvent::ChunkPlayed { .. } | IoEvent::PlaybackEnded
+            ) {
+                into.push(event);
+            }
+        }
+    }
+}
+
+fn started(utterance: &str, chunk: usize) -> IoEvent {
+    IoEvent::ChunkStarted {
+        utterance: utterance.into(),
+        chunk,
+    }
+}
+
+fn played(utterance: &str, chunk: usize) -> IoEvent {
+    IoEvent::ChunkPlayed {
+        utterance: utterance.into(),
+        chunk,
+    }
+}
+
+fn sine(rate: u32, seconds: f32, frequency: f32, amplitude: f32) -> Vec<f32> {
+    (0..(rate as f32 * seconds) as usize)
+        .map(|i| amplitude * (std::f32::consts::TAU * frequency * i as f32 / rate as f32).sin())
+        .collect()
+}
+
+/// The span of `heard` from its first to its last queued sample.
+fn sounded(heard: &[ReferenceSample]) -> &[ReferenceSample] {
+    let first = heard
+        .iter()
+        .position(|sample| sample.queued)
+        .expect("something played");
+    let last = heard.iter().rposition(|sample| sample.queued).unwrap();
+    &heard[first..=last]
+}
+
+#[test]
+fn a_sine_passes_through_mixing_and_the_speakers_resampling_without_seams() {
+    current_thread().block_on(async {
+        let (device, state) = Device::new();
+        let shared = SharedNativeAudio::with_physical(NativeDevices::default(), Box::new(device));
+        let (mut lane, _) = shared.attach();
+        let (sink, mut events) = lane_sink();
+        lane.start(sink).unwrap();
+        // One second at 24 kHz, in chunks of uneven length, as a synthesizer hands them over.
+        let (frequency, amplitude) = (440.0, 0.5);
+        let speech = sine(24_000, 1.0, frequency, amplitude);
+        let mut at = 0;
+        for (chunk, length) in [4_800, 7_001, 3_333, 8_866].into_iter().enumerate() {
+            lane.play("sine", chunk, speech[at..at + length].to_vec(), 24_000);
+            at += length;
+        }
+        let mut seen = Vec::new();
+        for size in CALLBACKS.iter().cycle().take(400) {
+            state.lock().unwrap().step(*size);
+            settle().await;
+            progress(&mut events, &mut seen);
+        }
+        let expected: Vec<IoEvent> = (0..4)
+            .flat_map(|chunk| [started("sine", chunk), played("sine", chunk)])
+            .chain([IoEvent::PlaybackEnded])
+            .collect();
+        assert_eq!(seen, expected);
+
+        let heard = state.lock().unwrap().heard.clone();
+        let span = sounded(&heard);
+        assert!(
+            span.iter().all(|sample| sample.queued),
+            "the speaker never ran dry"
+        );
+        let length = span.len() as i64 - i64::from(DEVICE_RATE);
+        assert!(
+            length.abs() <= 6,
+            "a second in is a second out ({length} samples off)"
+        );
+        // Away from the edges (the low-pass settling), every step is a sine's step: no seam at any frame boundary.
+        let edge = DEVICE_RATE as usize / 50;
+        let middle: Vec<f32> = span[edge..span.len() - edge]
+            .iter()
+            .map(|sample| sample.value)
+            .collect();
+        let slope = std::f32::consts::TAU * frequency / DEVICE_RATE as f32 * amplitude;
+        let jump = middle
+            .windows(2)
+            .map(|pair| (pair[1] - pair[0]).abs())
+            .fold(0.0, f32::max);
+        assert!(
+            jump <= slope * 1.2,
+            "largest step {jump}, a sine's is {slope}"
+        );
+        // And it is the sine, at its frequency: the best-fitting 440 Hz sine leaves almost nothing.
+        let omega = std::f64::consts::TAU * f64::from(frequency) / f64::from(DEVICE_RATE);
+        let (mut sin, mut cos) = (0.0, 0.0);
+        for (i, &value) in middle.iter().enumerate() {
+            sin += f64::from(value) * (omega * i as f64).sin();
+            cos += f64::from(value) * (omega * i as f64).cos();
+        }
+        let (sin, cos) = (
+            2.0 * sin / middle.len() as f64,
+            2.0 * cos / middle.len() as f64,
+        );
+        let residual = (middle
+            .iter()
+            .enumerate()
+            .map(|(i, &value)| {
+                let fit = sin * (omega * i as f64).sin() + cos * (omega * i as f64).cos();
+                (f64::from(value) - fit).powi(2)
+            })
+            .sum::<f64>()
+            / middle.len() as f64)
+            .sqrt();
+        assert!(
+            residual < 0.01,
+            "residual {residual} against the fitted sine"
+        );
+        lane.stop();
+    });
+}
+
+#[test]
+fn a_starved_speaker_neither_ends_the_playback_nor_loses_a_chunks_reports() {
+    current_thread().block_on(async {
+        let (device, state) = Device::new();
+        let shared = SharedNativeAudio::with_physical(NativeDevices::default(), Box::new(device));
+        let (mut lane, _) = shared.attach();
+        let (sink, mut events) = lane_sink();
+        lane.start(sink).unwrap();
+        for chunk in 0..3 {
+            lane.play("long", chunk, sine(RATE, 0.3, 300.0, 0.4), RATE);
+        }
+        let mut seen = Vec::new();
+        for (step, size) in CALLBACKS.iter().cycle().take(600).enumerate() {
+            // Now and then the dispatcher falls behind while the device plays on, far past the lead.
+            {
+                let mut device = state.lock().unwrap();
+                device.step(*size);
+                if step % 25 == 10 {
+                    for _ in 0..6 {
+                        device.step(1_024);
+                    }
+                }
+            }
+            settle().await;
+            progress(&mut events, &mut seen);
+        }
+        let heard = state.lock().unwrap().heard.clone();
+        let span = sounded(&heard);
+        assert!(
+            span.iter().any(|sample| !sample.queued),
+            "the scenario starves the speaker"
+        );
+        let queued = span.iter().filter(|sample| sample.queued).count() as i64;
+        assert!(
+            (queued - i64::from(DEVICE_RATE) * 9 / 10).abs() <= 6,
+            "every sample given was played ({queued})"
+        );
+        let expected: Vec<IoEvent> = (0..3)
+            .flat_map(|chunk| [started("long", chunk), played("long", chunk)])
+            .chain([IoEvent::PlaybackEnded])
+            .collect();
+        assert_eq!(seen, expected);
+        lane.stop();
+    });
+}
+
+#[test]
+fn an_interruption_cuts_the_speaker_within_its_fade_despite_the_lead() {
+    current_thread().block_on(async {
+        let (device, state) = Device::new();
+        let shared = SharedNativeAudio::with_physical(NativeDevices::default(), Box::new(device));
+        let (mut lane, _) = shared.attach();
+        let (sink, mut events) = lane_sink();
+        lane.start(sink).unwrap();
+        lane.play("cut", 0, sine(RATE, 2.0, 300.0, 0.4), RATE);
+        let mut seen = Vec::new();
+        for _ in 0..30 {
+            state.lock().unwrap().step(480);
+            settle().await;
+        }
+        progress(&mut events, &mut seen);
+        assert_eq!(seen, [started("cut", 0)]);
+        let at = state.lock().unwrap().heard.len();
+        lane.stop_playback();
+        settle().await;
+        progress(&mut events, &mut seen);
+        assert_eq!(seen, [started("cut", 0), IoEvent::PlaybackEnded]);
+        for size in CALLBACKS.iter().cycle().take(40) {
+            state.lock().unwrap().step(*size);
+            settle().await;
+        }
+        // One callback still plays before the audio thread wakes to the stop, then the fade: about 40 ms in all.
+        let budget = CALLBACKS[0] + (DEVICE_RATE * crate::io::native::FADE_MS / 1000) as usize;
+        let heard = state.lock().unwrap().heard.clone();
+        assert!(heard[at..at + 480].iter().all(|sample| sample.queued));
+        let after = &heard[at + budget..];
+        assert!(after.len() > 4_000);
+        assert!(
+            after
+                .iter()
+                .all(|sample| sample.value == 0.0 && !sample.queued),
+            "silent once the fade is over"
+        );
+        progress(&mut events, &mut seen);
+        assert_eq!(seen.len(), 2, "nothing more is reported for what was cut");
+        lane.stop();
+    });
+}
+
+#[test]
+fn a_lane_that_is_interrupted_leaves_every_report_of_the_other_lane() {
+    current_thread().block_on(async {
+        let (device, state) = Device::new();
+        let shared = SharedNativeAudio::with_physical(NativeDevices::default(), Box::new(device));
+        let (mut a, _) = shared.attach();
+        let (mut b, _) = shared.attach();
+        let (a_sink, mut a_events) = lane_sink();
+        let (b_sink, mut b_events) = lane_sink();
+        a.start(a_sink).unwrap();
+        b.start(b_sink).unwrap();
+        a.play("a", 0, sine(RATE, 1.0, 300.0, 0.3), RATE);
+        for chunk in 0..3 {
+            b.play("b", chunk, sine(RATE, 0.2, 500.0, 0.3), RATE);
+        }
+        let (mut a_seen, mut b_seen) = (Vec::new(), Vec::new());
+        for (step, size) in CALLBACKS.iter().cycle().take(300).enumerate() {
+            if step == 20 {
+                a.stop_playback();
+            }
+            state.lock().unwrap().step(*size);
+            settle().await;
+            progress(&mut a_events, &mut a_seen);
+            progress(&mut b_events, &mut b_seen);
+        }
+        assert_eq!(a_seen, [started("a", 0), IoEvent::PlaybackEnded]);
+        let expected: Vec<IoEvent> = (0..3)
+            .flat_map(|chunk| [started("b", chunk), played("b", chunk)])
+            .chain([IoEvent::PlaybackEnded])
+            .collect();
+        assert_eq!(b_seen, expected);
+        a.stop();
+        b.stop();
     });
 }
