@@ -277,7 +277,9 @@ fn recorded_speaker_echo_cannot_start_a_turn_but_a_person_over_it_can() {
         // Scale this slice itself: its peak is only about a quarter of the full recording's peak.
         let person_clip = clip(FLEURS_ES, 1.0);
         let slice = &person_clip[144 * WINDOW..160 * WINDOW];
-        let slice_peak = slice.iter().fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+        let slice_peak = slice
+            .iter()
+            .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
         let voiced: Vec<f32> = slice
             .iter()
             .map(|sample| sample * person_peak.unwrap_or(0.4) / slice_peak)
