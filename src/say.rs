@@ -16,6 +16,9 @@ use crate::voice_call::Message;
 pub struct SayOptions {
     /// The language the text is written in, a BCP 47 tag; the configuration's when absent.
     pub language: Option<String>,
+    /// Opaque host key used only to correlate speaker evidence with its handle.
+    /// If absent, the call's own say id is used.
+    pub evidence_key: Option<String>,
 }
 
 /// One step of something being said. `Done` is the last.
@@ -115,6 +118,12 @@ impl Saying {
 }
 
 impl SayCancel {
+    /// The call's physical utterance id, for a source-level pending fence.
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
     /// Cancels it; once it has ended, nothing.
     pub fn cancel(&self) {
         let _ = self

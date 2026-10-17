@@ -3,7 +3,10 @@
 
 /** A step of a turn of the person's speech, under the call's own `turn_id` (the same in every step). */
 export type VoiceTurnEvent =
-  | { phase: "started"; turn_id: string; /** Unix milliseconds. */ started_at: number }
+  | { phase: "candidate"; candidate_id: string; /** First captured sample, Unix milliseconds. */ onset_at: number;
+      /** Speaker state captured before asynchronous VAD qualification. */ playback: VoicePlaybackCapture }
+  | { phase: "candidate-cancelled"; candidate_id: string }
+  | { phase: "started"; turn_id: string; candidate_id?: string; /** First captured speech sample, Unix milliseconds. */ started_at: number }
   | {
       phase: "finished";
       turn_id: string;
@@ -18,6 +21,25 @@ export type VoiceTurnEvent =
       timings: { audio_ms: number; endpoint_silence_ms: number; recognition_ms: number };
     }
   | { phase: "cancelled"; turn_id: string; /** Joined into the next turn. */ merged: boolean };
+
+export interface VoicePlaybackCapture {
+  /** False when there is no earlier microphone callback to bound this block. */
+  available: boolean;
+  /** Highest opaque host marker processed before these microphone samples. */
+  mark: number;
+  recent: VoiceSayCapture[];
+  last_played: VoiceSayCapture | null;
+  truncated: boolean;
+}
+
+export interface VoiceSayCapture {
+  say_id: string;
+  hearing: "complete" | "partial" | "not_played" | "unknown";
+  /** Completed chunk prefix in Unicode scalar values; null when sound began but no chunk completed. */
+  heard_chars: number | null;
+  /** Order in which this handle first sounded; null if it never did. */
+  played_order: number | null;
+}
 
 /** Where the call is. */
 export interface VoiceCallState {
@@ -114,6 +136,8 @@ export interface VoiceSaying {
   readonly id: string;
   /** Cancels it: the part not yet heard is dropped, and its outcome says `cancelled`. */
   cancel(): void;
+  /** Optional browser graph fence: cancel only while this saying has not begun output. Returns false if it may have started. */
+  cancelPending?(): boolean;
   /** Hears each of its steps from now on. */
   onEvent(listener: (event: VoiceSayEvent) => void): void;
   /** How it ended, once it has. */

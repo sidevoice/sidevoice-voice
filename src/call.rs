@@ -17,7 +17,8 @@ use std::collections::{HashMap, VecDeque};
 
 use crate::config::{EndOfTurn, VoiceConfig};
 use crate::event::{
-    CallState, Listening, Microphone, TurnEvent, TurnTimings, VoiceError, VoiceEvent,
+    CallState, CaptureHearing, Listening, Microphone, PlaybackCapture, SayCapture, TurnEvent,
+    TurnTimings, VoiceError, VoiceEvent,
 };
 use crate::playback::{Action, Playback};
 use crate::recognition::{accepted, Job, Outcome, Pending, Recognition};
@@ -34,6 +35,10 @@ pub(crate) enum Input {
     Stop,
     /// A new configuration.
     Config(Box<VoiceConfig>),
+    /// Opaque monotonic host marker; the next capture copies the latest processed value.
+    EvidenceMark(u64),
+    /// Host publication observed on the browser AudioContext graph clock.
+    EvidenceMarkAt(u64, u64),
     /// One detector window: 16 kHz mono samples after echo cancellation, whether the detector holds it for speech, and
     /// its probability that the window is speech. The probability decides; a detector that gives none is taken at its
     /// word, window by window.
@@ -41,6 +46,10 @@ pub(crate) enum Input {
         pcm: Vec<f32>,
         speech: bool,
         probability: Option<f32>,
+        /// Source-owned speaker evidence before these samples entered async VAD.
+        evidence: Option<PlaybackCapture>,
+        /// Unix time of the first captured sample; absent in direct state-machine drives.
+        captured_at: Option<u64>,
     },
     /// A turn's transcript, or the stable code of why there is none.
     Transcribed {
@@ -52,6 +61,7 @@ pub(crate) enum Input {
         id: String,
         text: String,
         language: Option<String>,
+        evidence_key: Option<String>,
     },
     /// Cancel what is said under `id`.
     CancelSay(String),
@@ -65,6 +75,12 @@ pub(crate) enum Input {
     ChunkStarted { utterance: String, chunk: usize },
     /// The output played a chunk's last sample.
     ChunkPlayed { utterance: String, chunk: usize },
+    #[cfg(any(web, test))]
+    ChunkPlayedAt {
+        utterance: String,
+        chunk: usize,
+        frame: u64,
+    },
     /// The output stream has ended after its last rendered sample.
     PlaybackEnded,
     /// Whether the microphone is muted: muted windows are silence, and the open turn ends as ordinary silence ends it.
@@ -140,6 +156,42 @@ struct Turn {
     mark: Option<usize>,
 }
 
+#[derive(Debug)]
+struct HeardSay {
+    id: String,
+    capture_id: String,
+    /// Latest ordered host publication when this say entered the actor. A
+    /// later mark's graph frame proves this say did not exist at an earlier
+    /// microphone cutoff, even if VAD delivers the callback afterwards.
+    observed_mark: u64,
+    chars: usize,
+    confirmed: usize,
+    playing: bool,
+    complete: bool,
+    played_order: u64,
+    completed_frames: Vec<(u64, usize)>,
+}
+
+impl HeardSay {
+    fn capture(&self) -> SayCapture {
+        let (hearing, heard_chars) = if self.complete {
+            (CaptureHearing::Complete, Some(self.chars))
+        } else if self.confirmed > 0 {
+            (CaptureHearing::Partial, Some(self.confirmed))
+        } else if self.playing {
+            (CaptureHearing::Unknown, None)
+        } else {
+            (CaptureHearing::NotPlayed, Some(0))
+        };
+        SayCapture {
+            say_id: self.capture_id.clone(),
+            hearing,
+            heard_chars,
+            played_order: (self.played_order > 0).then_some(self.played_order),
+        }
+    }
+}
+
 /// One call.
 #[derive(Debug)]
 pub(crate) struct Call {
@@ -159,6 +211,14 @@ pub(crate) struct Call {
     next_turn: usize,
     recognition: Recognition,
     playback: Playback,
+    heard_says: VecDeque<HeardSay>,
+    played_order: u64,
+    evidence_mark: u64,
+    timed_marks: VecDeque<(u64, u64)>,
+    source_timeline_overflow: bool,
+    next_candidate: u64,
+    candidate_id: Option<String>,
+    candidate_onset_at: Option<u64>,
     /// A chunk ended while its utterance still has audio; the next chunk may be contiguous.
     continuing_chunk: Option<String>,
     /// Nothing starts to be said before this time (the grace after a turn).
@@ -175,6 +235,117 @@ pub(crate) struct Call {
 }
 
 impl Call {
+    /// Capture speaker state at microphone ingress, before the VAD can delay its callback.
+    pub(crate) fn playback_capture(&self) -> PlaybackCapture {
+        const LIMIT: usize = 64;
+        let recent = self
+            .heard_says
+            .iter()
+            .rev()
+            .take(LIMIT)
+            .map(HeardSay::capture)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        let last_played = self
+            .heard_says
+            .iter()
+            .filter(|say| say.played_order > 0)
+            .max_by_key(|say| say.played_order)
+            .map(HeardSay::capture);
+        PlaybackCapture {
+            available: true,
+            mark: self.evidence_mark,
+            recent,
+            last_played,
+            truncated: self.heard_says.len() > LIMIT,
+        }
+    }
+
+    /// What actual, completed browser output can prove at a microphone graph frame.
+    /// This clock is AudioContext processing time, not calibrated hardware time.
+    pub(crate) fn playback_capture_at(&self, frame: u64) -> PlaybackCapture {
+        const LIMIT: usize = 64;
+        if self.source_timeline_overflow {
+            return PlaybackCapture::unknown();
+        }
+        let cutoff_mark = self
+            .timed_marks
+            .iter()
+            .filter(|(at, _)| *at <= frame)
+            .map(|(_, mark)| *mark)
+            .max()
+            .unwrap_or(0);
+        let capture = |say: &HeardSay| {
+            let confirmed = say
+                .completed_frames
+                .iter()
+                .filter(|(at, _)| *at <= frame)
+                .map(|(_, chars)| *chars)
+                .max()
+                .unwrap_or(0);
+            let last = say
+                .completed_frames
+                .iter()
+                .filter(|(at, _)| *at <= frame)
+                .map(|(at, _)| *at)
+                .max();
+            let hearing = if confirmed >= say.chars && say.chars > 0 {
+                CaptureHearing::Complete
+            } else if confirmed > 0 {
+                CaptureHearing::Partial
+            } else {
+                CaptureHearing::Unknown
+            };
+            SayCapture {
+                say_id: say.capture_id.clone(),
+                hearing,
+                heard_chars: (confirmed > 0).then_some(confirmed),
+                played_order: last,
+            }
+        };
+        let recent = self
+            .heard_says
+            .iter()
+            .filter(|say| say.observed_mark <= cutoff_mark)
+            .rev()
+            .take(LIMIT)
+            .map(&capture)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        let all = self
+            .heard_says
+            .iter()
+            .filter(|say| say.observed_mark <= cutoff_mark)
+            .map(&capture)
+            .collect::<Vec<_>>();
+        let uncertain = all
+            .iter()
+            .any(|say| say.hearing != CaptureHearing::Complete);
+        let last_played = if uncertain {
+            None
+        } else {
+            all.into_iter()
+                .filter(|say| say.played_order.is_some())
+                .max_by_key(|say| say.played_order)
+        };
+        PlaybackCapture {
+            available: !uncertain,
+            mark: cutoff_mark,
+            recent,
+            last_played,
+            truncated: self
+                .heard_says
+                .iter()
+                .filter(|say| say.observed_mark <= cutoff_mark)
+                .count()
+                > LIMIT,
+        }
+    }
+
     pub(crate) fn new(config: VoiceConfig, call_id: String, epoch_unix_ms: u64) -> Self {
         Self {
             segmenter: Segmenter::new(segmentation(&config)),
@@ -189,6 +360,14 @@ impl Call {
             next_turn: 0,
             recognition: Recognition::default(),
             playback: Playback::default(),
+            heard_says: VecDeque::new(),
+            played_order: 0,
+            timed_marks: VecDeque::new(),
+            source_timeline_overflow: false,
+            evidence_mark: 0,
+            next_candidate: 0,
+            candidate_id: None,
+            candidate_onset_at: None,
             continuing_chunk: None,
             quiet_until: 0,
             cancelled: VecDeque::new(),
@@ -207,22 +386,46 @@ impl Call {
                 self.started = true;
                 self.heard = 0;
                 self.marks = take.then(Vec::new);
+                self.timed_marks.clear();
+                // A pruned source identity or timeline cannot be reconstructed
+                // by restarting the same call, even if its graph clock resets.
+                for say in &mut self.heard_says {
+                    say.completed_frames.clear()
+                }
             }
             Input::Stop => self.stop(now, &mut out),
             Input::Config(config) => {
                 self.segmenter.set_numbers(segmentation(&config));
                 self.config = *config;
             }
+            Input::EvidenceMark(mark) => {
+                self.evidence_mark = self.evidence_mark.max(mark);
+            }
+            Input::EvidenceMarkAt(mark, frame) => {
+                self.evidence_mark = self.evidence_mark.max(mark);
+                self.timed_marks.push_back((frame, mark));
+                if self.timed_marks.len() > 2048 {
+                    self.source_timeline_overflow = true;
+                    self.timed_marks.clear()
+                }
+            }
             Input::Window {
                 pcm,
                 speech,
                 probability,
+                evidence,
+                captured_at,
             } => {
                 let confidence = probability.unwrap_or(if speech { 1.0 } else { 0.0 });
-                self.window(now, &pcm, confidence, &mut out);
+                self.window(now, &pcm, confidence, evidence, captured_at, &mut out);
             }
             Input::Transcribed { turn, result } => self.transcribed(now, turn, result, &mut out),
-            Input::Say { id, text, language } => self.say(id, &text, language, &mut out),
+            Input::Say {
+                id,
+                text,
+                language,
+                evidence_key,
+            } => self.say(id, &text, language, evidence_key, &mut out),
             Input::CancelSay(id) => {
                 let was_sounding = self.playback.sounding();
                 let mut actions = Vec::new();
@@ -234,7 +437,7 @@ impl Call {
                     }
                 }
                 self.act(actions, &mut out);
-                self.playback_boundary(was_sounding);
+                self.playback_boundary(was_sounding, &mut out);
             }
             Input::Synthesized {
                 utterance,
@@ -246,7 +449,7 @@ impl Call {
                 self.playback
                     .synthesized(&utterance, chunk, result, &mut actions);
                 self.act(actions, &mut out);
-                self.playback_boundary(was_sounding);
+                self.playback_boundary(was_sounding, &mut out);
             }
             Input::ChunkStarted { utterance, chunk } => {
                 let was_sounding = self.playback.sounding();
@@ -256,7 +459,7 @@ impl Call {
                 self.playback.chunk_started(&utterance, chunk, &mut actions);
                 self.act(actions, &mut out);
                 if !continuous {
-                    self.playback_boundary(was_sounding);
+                    self.playback_boundary(was_sounding, &mut out);
                 }
             }
             Input::ChunkPlayed { utterance, chunk } => {
@@ -267,7 +470,35 @@ impl Call {
                 if was_sounding && !self.playback.sounding() && self.playback.busy() {
                     self.continuing_chunk = Some(utterance);
                 } else {
-                    self.playback_boundary(was_sounding);
+                    self.playback_boundary(was_sounding, &mut out);
+                }
+            }
+            #[cfg(any(web, test))]
+            Input::ChunkPlayedAt {
+                utterance,
+                chunk,
+                frame,
+            } => {
+                let was_sounding = self.playback.sounding();
+                let mut actions = Vec::new();
+                self.playback.chunk_played(&utterance, chunk, &mut actions);
+                self.act(actions, &mut out);
+                if let Some(say) = self
+                    .heard_says
+                    .iter_mut()
+                    .rev()
+                    .find(|say| say.id == utterance)
+                {
+                    if say.completed_frames.len() < 256 {
+                        say.completed_frames.push((frame, say.confirmed))
+                    } else {
+                        self.source_timeline_overflow = true
+                    }
+                }
+                if was_sounding && !self.playback.sounding() && self.playback.busy() {
+                    self.continuing_chunk = Some(utterance);
+                } else {
+                    self.playback_boundary(was_sounding, &mut out);
                 }
             }
             Input::PlaybackEnded => {
@@ -277,6 +508,7 @@ impl Call {
             Input::Mute(muted) => {
                 self.muted = muted;
                 if muted {
+                    self.cancel_candidate(&mut out);
                     self.segmenter.reset_candidate();
                 }
             }
@@ -341,7 +573,15 @@ impl Call {
 
     /// One detector window: counted in what was heard whatever becomes of it, so that a take's positions follow its
     /// audio, muted windows included.
-    fn window(&mut self, now: u64, pcm: &[f32], confidence: f32, out: &mut Vec<Effect>) {
+    fn window(
+        &mut self,
+        now: u64,
+        pcm: &[f32],
+        confidence: f32,
+        evidence: Option<PlaybackCapture>,
+        captured_at: Option<u64>,
+        out: &mut Vec<Effect>,
+    ) {
         self.heard += pcm.len();
         if !self.started || self.muted {
             if self.started && self.muted {
@@ -352,6 +592,26 @@ impl Call {
         let playing = self.playback.sounding();
         let paused = self.segmenter.paused();
         let segment = self.segmenter.window(now, pcm, confidence, playing);
+        let (candidate_started, candidate_cancelled) = self.segmenter.candidate_transition();
+        if candidate_cancelled {
+            self.cancel_candidate(out);
+        }
+        if candidate_started && self.candidate_id.is_none() {
+            let id = format!("{}-candidate-{}", self.call_id, self.next_candidate);
+            self.next_candidate += 1;
+            self.candidate_id = Some(id.clone());
+            let onset_at = captured_at
+                .unwrap_or(self.epoch_unix_ms + now.saturating_sub(duration_ms(pcm.len())));
+            self.candidate_onset_at = Some(onset_at);
+            out.push(Effect::Event(VoiceEvent::Turn(TurnEvent::Candidate {
+                candidate_id: id,
+                onset_at,
+                playback: evidence.unwrap_or_else(PlaybackCapture::unknown),
+            })));
+        }
+        if segment.is_none() && !self.segmenter.candidate_active() {
+            self.cancel_candidate(out);
+        }
         self.mark_pause(paused);
         if let Some(segment) = segment {
             self.segment(now, segment, out);
@@ -368,7 +628,19 @@ impl Call {
         {
             self.segment(now, segment, out);
         }
+        if !self.segmenter.candidate_active() {
+            self.cancel_candidate(out);
+        }
         self.mark_pause(paused);
+    }
+
+    fn cancel_candidate(&mut self, out: &mut Vec<Effect>) {
+        self.candidate_onset_at = None;
+        if let Some(candidate_id) = self.candidate_id.take() {
+            out.push(Effect::Event(VoiceEvent::Turn(
+                TurnEvent::CandidateCancelled { candidate_id },
+            )));
+        }
     }
 
     /// What a segment does to the turns, where what was heard so far ends (a window's, the end of that window).
@@ -394,7 +666,10 @@ impl Call {
                     number,
                     Turn {
                         id: id.clone(),
-                        started_ms: now,
+                        started_ms: self
+                            .candidate_onset_at
+                            .unwrap_or(self.epoch_unix_ms + now)
+                            .saturating_sub(self.epoch_unix_ms),
                         ended_ms: None,
                         audio_ms: 0,
                         silence_ms: 0,
@@ -405,7 +680,11 @@ impl Call {
                 self.open = Some(number);
                 out.push(Effect::Event(VoiceEvent::Turn(TurnEvent::Started {
                     turn_id: id,
-                    started_at: self.epoch_unix_ms + now,
+                    candidate_id: self.candidate_id.take(),
+                    started_at: self
+                        .candidate_onset_at
+                        .take()
+                        .unwrap_or(self.epoch_unix_ms + now),
                 })));
                 let mut actions = Vec::new();
                 self.playback.interrupt(StopReason::BargeIn, &mut actions);
@@ -525,6 +804,7 @@ impl Call {
     }
 
     fn cancel_input(&mut self, now: u64, out: &mut Vec<Effect>) {
+        self.cancel_candidate(out);
         self.segmenter.cancel();
         let mut turns: Vec<usize> = self.open.take().into_iter().collect();
         turns.extend(self.recognition.clear());
@@ -550,6 +830,7 @@ impl Call {
     }
 
     fn stop(&mut self, now: u64, out: &mut Vec<Effect>) {
+        self.cancel_candidate(out);
         self.cancel_input(now, out);
         // The next start hears a new stream: nothing of this one's volume or speech carries over.
         self.segmenter = Segmenter::new(segmentation(&self.config));
@@ -566,7 +847,29 @@ impl Call {
     }
 
     /// Something to say: queued, or not played at all while the call is stopped.
-    fn say(&mut self, id: String, text: &str, language: Option<String>, out: &mut Vec<Effect>) {
+    fn say(
+        &mut self,
+        id: String,
+        text: &str,
+        language: Option<String>,
+        evidence_key: Option<String>,
+        out: &mut Vec<Effect>,
+    ) {
+        self.heard_says.push_back(HeardSay {
+            id: id.clone(),
+            chars: text.chars().count(),
+            confirmed: 0,
+            capture_id: evidence_key.unwrap_or_else(|| id.clone()),
+            observed_mark: self.evidence_mark,
+            playing: false,
+            complete: false,
+            played_order: 0,
+            completed_frames: Vec::new(),
+        });
+        if self.heard_says.len() > 256 {
+            self.heard_says.pop_front();
+            self.source_timeline_overflow = true;
+        }
         let refused =
             if let Some(index) = self.cancelled.iter().position(|cancelled| *cancelled == id) {
                 self.cancelled.remove(index);
@@ -598,7 +901,7 @@ impl Call {
         self.act(actions, out);
     }
 
-    fn playback_boundary(&mut self, was_sounding: bool) {
+    fn playback_boundary(&mut self, was_sounding: bool, _out: &mut Vec<Effect>) {
         if was_sounding != self.playback.sounding()
             || (!self.playback.busy() && self.continuing_chunk.take().is_some())
         {
@@ -717,10 +1020,39 @@ impl Call {
                     sample_rate,
                 },
                 Action::Stop => Effect::StopPlayback,
-                Action::Say { utterance, event } => Effect::Say {
-                    id: utterance,
-                    event,
-                },
+                Action::Say { utterance, event } => {
+                    if let Some(say) = self
+                        .heard_says
+                        .iter_mut()
+                        .rev()
+                        .find(|say| say.id == utterance)
+                    {
+                        match &event {
+                            SayEvent::Playing => {
+                                say.playing = true;
+                                self.played_order += 1;
+                                say.played_order = self.played_order;
+                            }
+                            SayEvent::Progress { heard_chars, .. } => {
+                                say.confirmed = say.confirmed.max(*heard_chars);
+                            }
+                            SayEvent::Done { outcome } => match outcome {
+                                SayOutcome::Heard => {
+                                    say.complete = true;
+                                    say.confirmed = say.chars;
+                                }
+                                SayOutcome::HeardUpTo { heard_chars, .. } => {
+                                    say.confirmed = say.confirmed.max(*heard_chars);
+                                }
+                                SayOutcome::NotPlayed { .. } => {}
+                            },
+                        }
+                    }
+                    Effect::Say {
+                        id: utterance,
+                        event,
+                    }
+                }
                 Action::Error(code) => Effect::Event(VoiceEvent::Error(VoiceError { code })),
             };
             out.push(effect);

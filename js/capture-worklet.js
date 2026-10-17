@@ -46,6 +46,7 @@ class CaptureProcessor extends AudioWorkletProcessor {
     this.previous = 0;
     this.frame = new Float32Array(FRAME);
     this.filled = 0;
+    this.firstFrame = 0;
     this.route = null;
     this.pendingRoutes = [];
     this.port.onmessage = ({ data }) => {
@@ -81,12 +82,13 @@ class CaptureProcessor extends AudioWorkletProcessor {
       filter.run(mono);
     }
     // Linear interpolation between `previous` (index -1) and the block's samples.
+    const blockFrame=typeof currentFrame==='number'?currentFrame:0;
     while (this.position < length - 1) {
       const at = this.position;
       const index = Math.floor(at);
       const before = index < 0 ? this.previous : mono[index];
       const after = mono[index + 1];
-      this.push(before + (after - before) * (at - index));
+      this.push(before + (after - before) * (at - index), Math.max(0, Math.floor(blockFrame + at)));
       this.position += this.step;
     }
     this.position -= length;
@@ -94,10 +96,13 @@ class CaptureProcessor extends AudioWorkletProcessor {
     return true;
   }
 
-  push(sample) {
+  push(sample, sourceFrame) {
+    if(this.filled===0)this.firstFrame=sourceFrame;
     this.frame[this.filled++] = sample;
     if (this.filled === FRAME) {
-      this.port.postMessage(this.route === null ? this.frame : { type: "captured", generation: this.route, samples: this.frame }, [this.frame.buffer]);
+      this.port.postMessage(this.route === null
+        ? { type: "captured", samples: this.frame, startFrame: this.firstFrame }
+        : { type: "captured", generation: this.route, samples: this.frame, startFrame: this.firstFrame }, [this.frame.buffer]);
       this.frame = new Float32Array(FRAME);
       this.filled = 0;
       this.applyRoutes();

@@ -30,9 +30,23 @@ pub enum VoiceEvent {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "phase", rename_all = "lowercase")]
 pub enum TurnEvent {
+    /// A qualified speech window began a tentative turn. It is not a user turn or a transcript.
+    Candidate {
+        candidate_id: String,
+        /// Approximate capture time of the first sample, in Unix milliseconds.
+        onset_at: u64,
+        /// Speaker state copied when those capture samples entered the call, before async VAD.
+        playback: PlaybackCapture,
+    },
+    /// The tentative run failed the existing turn qualification.
+    #[serde(rename = "candidate-cancelled")]
+    CandidateCancelled { candidate_id: String },
     /// The person started speaking.
     Started {
         turn_id: String,
+        /// The tentative run that opened this turn, when one was observed.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        candidate_id: Option<String>,
         /// When, in Unix milliseconds.
         started_at: u64,
     },
@@ -54,6 +68,49 @@ pub enum TurnEvent {
     /// Nothing comes of the turn: no words in it, the person cancelled it, or it was joined into the next one
     /// (`merged`).
     Cancelled { turn_id: String, merged: bool },
+}
+
+/// One say handle's confirmed speaker state at a capture boundary. Counts are Unicode scalars.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SayCapture {
+    pub say_id: String,
+    pub hearing: CaptureHearing,
+    pub heard_chars: Option<usize>,
+    /// Order in which a handle first began sound; absent when it never sounded.
+    pub played_order: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureHearing {
+    Complete,
+    Partial,
+    NotPlayed,
+    Unknown,
+}
+
+/// Bounded playback history at the source audio cutoff. Missing old handles are unknown.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PlaybackCapture {
+    /// False only when no preceding capture block can bound the sample onset.
+    pub available: bool,
+    /// Highest opaque host marker processed before these microphone samples.
+    pub mark: u64,
+    pub recent: Vec<SayCapture>,
+    pub last_played: Option<SayCapture>,
+    pub truncated: bool,
+}
+
+impl PlaybackCapture {
+    pub(crate) fn unknown() -> Self {
+        Self {
+            available: false,
+            mark: 0,
+            recent: Vec::new(),
+            last_played: None,
+            truncated: false,
+        }
+    }
 }
 
 /// How long a turn's parts took, in milliseconds.

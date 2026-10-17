@@ -120,6 +120,10 @@ pub(crate) struct Segmenter {
     was_playing: bool,
     /// Qualified capture samples in the current overlap candidate.
     barge_run: usize,
+    /// Tentative continuous speech before the existing qualification opens a turn.
+    candidate: bool,
+    candidate_started: bool,
+    candidate_cancelled: bool,
     /// The last audio heard, as much as an end-of-turn model is given: since the last turn ended, at most.
     recent: VecDeque<f32>,
     open: Option<Open>,
@@ -135,6 +139,9 @@ impl Segmenter {
             start_run: 0,
             was_playing: false,
             barge_run: 0,
+            candidate: false,
+            candidate_started: false,
+            candidate_cancelled: false,
             recent: VecDeque::with_capacity(END_OF_TURN_AUDIO),
             open: None,
         }
@@ -170,6 +177,16 @@ impl Segmenter {
         self.level.value()
     }
 
+    /// One-window transition only; reading this does not alter VAD qualification.
+    pub(crate) fn candidate_transition(&self) -> (bool, bool) {
+        (self.candidate_started, self.candidate_cancelled)
+    }
+
+    /// Whether a tentative run was cleared by an input/output boundary.
+    pub(crate) fn candidate_active(&self) -> bool {
+        self.candidate
+    }
+
     /// Takes one detector window at `now`: its samples and the detector's confidence that it is speech. `playing`
     /// says whether a reply is sounding, which raises the volume speech needs to the playing bar.
     pub(crate) fn window(
@@ -179,8 +196,14 @@ impl Segmenter {
         confidence: f32,
         playing: bool,
     ) -> Option<Segment> {
+        self.candidate_started = false;
+        self.candidate_cancelled = false;
         // A candidate heard over playback cannot become ordinary silence speech when that playback ends.
         if self.was_playing != playing && self.open.is_none() {
+            if self.candidate {
+                self.candidate_cancelled = true;
+                self.candidate = false;
+            }
             self.activity.reset();
             self.recent.clear();
             self.barge_run = 0;
@@ -194,6 +217,15 @@ impl Segmenter {
             self.numbers.quiet_bar
         };
         let speech = confidence >= CONFIDENCE && volume >= bar;
+        if self.open.is_none() {
+            if speech && !self.candidate {
+                self.candidate = true;
+                self.candidate_started = true;
+            } else if !speech && self.candidate {
+                self.candidate = false;
+                self.candidate_cancelled = true;
+            }
+        }
         let gated = playing && self.open.is_none();
         let change = if gated {
             self.barge_run = if speech {
@@ -214,6 +246,7 @@ impl Segmenter {
                 .take(speech, pcm.len(), START_MS, self.numbers.stop_ms)
         };
         if change == Some(Change::Started) {
+            self.candidate = false;
             self.start_run = if gated {
                 self.barge_run
             } else {
@@ -330,12 +363,14 @@ impl Segmenter {
         self.activity.reset();
         self.was_playing = false;
         self.barge_run = 0;
+        self.candidate = false;
     }
 
     /// Forget a tentative speech run when the input or output changes without a detector window.
     /// An already-open turn keeps its audio and can still finish normally.
     pub(crate) fn reset_candidate(&mut self) {
         if self.open.is_none() {
+            self.candidate = false;
             self.activity.reset();
             self.recent.clear();
             self.barge_run = 0;

@@ -98,7 +98,11 @@ export function createSharedWebAudioIo(options = {}) {
       }
       if (data?.type !== "captured") return;
       const target = routes.get(data.generation) ?? null;
-      for (const lane of lanes.values()) if (lane.sink) lane.sink.captured(lane.port === target ? data.samples : new Float32Array(FRAME));
+      for (const lane of lanes.values()) if (lane.sink) {
+        const samples=lane.port===target?data.samples:new Float32Array(FRAME);
+        if(Number.isSafeInteger(data.startFrame)&&lane.sink.capturedAt)lane.sink.capturedAt(samples,data.startFrame);
+        else lane.sink.captured(samples);
+      }
     };
     capture.onprocessorerror = () => failAll("audio-capture-failed");
     microphone.connect(capture).connect(context.destination);
@@ -179,6 +183,7 @@ export function createSharedWebAudioIo(options = {}) {
     lane.gain.gain.linearRampToValueAtTime(0, now + FADE_SECONDS);
     for (const source of lane.sources) { source.onended = null; source.stop(now + FADE_SECONDS); }
     lane.sources.clear();
+    lane.sourceTimes.clear();
     const old = lane.gain;
     closePlayback(lane, lane.active, now + FADE_SECONDS, FADE_SECONDS * 2000);
     setTimeout(() => old.disconnect(), FADE_SECONDS * 2000);
@@ -189,9 +194,23 @@ export function createSharedWebAudioIo(options = {}) {
     get outputSelectable() { return selectable(); },
     attach() {
       const port = Object.freeze({ id: ++nextPort });
-      const lane = { port, sink: null, meter: null, gain: null, sources: new Set(), queueEnd: 0, playback: 0,
+      const lane = { port, sink: null, meter: null, gain: null, sources: new Set(), sourceTimes: new Map(),
+        startedIds: new Set(), fencedIds: new Set(), fenceOverflow: false, queueEnd: 0, playback: 0,
         active: null, closing: new Map(), deferred: null, rendering: false };
       const io = {
+        // currentTime names the render quantum's start. Use the end as a
+        // conservative publication watermark for samples in this quantum.
+        clockFrame() {return context ? Math.floor(context.currentTime*context.sampleRate)+128 : null;},
+        // A room can retract only an utterance with no source already
+        // scheduled. A scheduled source may cross its start during this JS
+        // task, so it is conservatively treated as possibly active.
+        fencePending(utterance) {
+          if(!context || lane.fenceOverflow || lane.startedIds.has(utterance))return false;
+          if([...lane.sourceTimes.values()].some(id=>id===utterance))return false;
+          if(lane.fencedIds.size>=2048){lane.fenceOverflow=true;return false}
+          lane.fencedIds.add(utterance);
+          return true;
+        },
         start(sink) {
           lane.sink = sink;
           ensureOpen().then(() => {
@@ -202,6 +221,7 @@ export function createSharedWebAudioIo(options = {}) {
           }, (error) => { if (lane.sink === sink) sink.failed(error?.code || "audio-output-failed"); });
         },
         play(utterance, chunk, samples, sampleRate) {
+          if(lane.fencedIds.has(utterance))return;
           if (!lane.sink || !context || !lane.gain) return;
           if (!lane.rendering) {
             lane.playback++;
@@ -219,11 +239,19 @@ export function createSharedWebAudioIo(options = {}) {
           source.buffer = buffer; source.connect(lane.gain);
           const at = Math.max(context.currentTime, lane.queueEnd);
           lane.queueEnd = at + buffer.duration;
+          const endFrame=Math.ceil(lane.queueEnd*context.sampleRate);
           lane.sources.add(source);
+          lane.sourceTimes.set(source,utterance);
           source.onended = () => {
             lane.sources.delete(source);
+            lane.sourceTimes.delete(source);
+            if(!lane.fenceOverflow){lane.startedIds.add(utterance);
+              if(lane.startedIds.size>=2048){lane.fenceOverflow=true;lane.startedIds.clear()}}
             if (played !== lane.playback) return;
-            if (lane.sink) lane.sink.chunkPlayed(utterance, chunk);
+            if (lane.sink) {
+              if(lane.sink.chunkPlayedAt)lane.sink.chunkPlayedAt(utterance,chunk,endFrame);
+              else lane.sink.chunkPlayed(utterance,chunk);
+            }
             if (!lane.sources.size) { lane.playback++; closePlayback(lane, epoch, lane.queueEnd); }
           };
           source.start(at);
@@ -231,7 +259,9 @@ export function createSharedWebAudioIo(options = {}) {
             if (!lane.sink || !lane.sources.has(source)) return;
             const left = at - context.currentTime;
             if (left > 0) setTimeout(started, left * 1000);
-            else lane.sink.chunkStarted(utterance, chunk);
+            else {if(!lane.fenceOverflow){lane.startedIds.add(utterance);
+              if(lane.startedIds.size>=2048){lane.fenceOverflow=true;lane.startedIds.clear()}}
+              lane.sink.chunkStarted(utterance, chunk)}
           };
           started();
         },
@@ -252,6 +282,7 @@ export function createSharedWebAudioIo(options = {}) {
           lane.gain?.disconnect();
           lane.gain = lane.meter = null;
           lane.active = null; lane.closing.clear(); lane.deferred = null; lane.rendering = false;
+          lane.startedIds.clear();lane.fencedIds.clear();lane.fenceOverflow=false;
           setTimeout(() => { meter?.disconnect(); meter?.port.close(); }, FADE_SECONDS * 2000);
           if (![...lanes.values()].some((other) => other.sink)) releaseDevices();
           else if (routeWasHere && capture) void route(null).catch(() => {});

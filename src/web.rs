@@ -133,8 +133,38 @@ impl WebVoiceCall {
                 .ok()
                 .and_then(|language| language.as_string())
         };
-        let saying = self.call.say(text, SayOptions { language });
+        let saying = self.call.say(
+            text,
+            SayOptions {
+                language,
+                evidence_key: None,
+            },
+        );
         Ok(WebSaying::new(saying))
+    }
+
+    /// Ordered, opaque host marker included in later microphone evidence.
+    #[wasm_bindgen(js_name = markEvidence)]
+    pub fn mark_evidence(&self, mark: f64) {
+        if mark.is_finite()
+            && (0.0..=9_007_199_254_740_991.0).contains(&mark)
+            && mark.fract() == 0.0
+        {
+            self.call.mark_evidence(mark as u64);
+        }
+    }
+
+    #[wasm_bindgen(js_name = markEvidenceAt)]
+    pub fn mark_evidence_at(&self, mark: f64, frame: f64) {
+        if mark.is_finite()
+            && (0.0..=9_007_199_254_740_991.0).contains(&mark)
+            && mark.fract() == 0.0
+            && frame.is_finite()
+            && (0.0..=9_007_199_254_740_991.0).contains(&frame)
+            && frame.fract() == 0.0
+        {
+            self.call.mark_evidence_at(mark as u64, frame as u64);
+        }
     }
 
     /// Mutes or unmutes the microphone.
@@ -341,6 +371,18 @@ impl IoSink {
         self.send(IoEvent::Captured(samples));
     }
 
+    #[wasm_bindgen(js_name = capturedAt)]
+    pub fn captured_at(&self, samples: Vec<f32>, frame: f64) {
+        if frame.is_finite()
+            && (0.0..=9_007_199_254_740_991.0).contains(&frame)
+            && frame.fract() == 0.0
+        {
+            self.send(IoEvent::CapturedSource(samples, frame as u64));
+        } else {
+            self.send(IoEvent::Captured(samples));
+        }
+    }
+
     /// Rendered speaker samples, mono at 16 kHz after gain and fading.
     pub fn rendered(&self, samples: Vec<f32>) {
         self.send(IoEvent::Rendered(samples));
@@ -362,6 +404,22 @@ impl IoSink {
     #[wasm_bindgen(js_name = chunkPlayed)]
     pub fn chunk_played(&self, utterance: String, chunk: usize) {
         self.send(IoEvent::ChunkPlayed { utterance, chunk });
+    }
+
+    #[wasm_bindgen(js_name = chunkPlayedAt)]
+    pub fn chunk_played_at(&self, utterance: String, chunk: usize, frame: f64) {
+        if frame.is_finite()
+            && (0.0..=9_007_199_254_740_991.0).contains(&frame)
+            && frame.fract() == 0.0
+        {
+            self.send(IoEvent::ChunkPlayedAt {
+                utterance,
+                chunk,
+                frame: frame as u64,
+            });
+        } else {
+            self.send(IoEvent::ChunkPlayed { utterance, chunk });
+        }
     }
 
     /// Whether the microphone's device gives no audio for now (muted by the browser or the system, not by the

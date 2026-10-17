@@ -4,6 +4,8 @@ export interface AudioIoSink {
   ready(): void;
   /** Captured audio: 16 kHz mono samples, in order, after echo cancellation. */
   captured(samples: Float32Array): void;
+  /** Microphone block on the AudioContext graph clock. */
+  capturedAt?(samples: Float32Array, startFrame: number): void;
   /** Rendered speaker samples, mono at 16 kHz after gain and fading. */
   rendered(samples: Float32Array): void;
   /** The output finished, including its fade. */
@@ -12,6 +14,8 @@ export interface AudioIoSink {
   chunkStarted(utterance: string, chunk: number): void;
   /** The last sample of a chunk reached the speaker. */
   chunkPlayed(utterance: string, chunk: number): void;
+  /** Completion actually fired; scheduled final frame in the same graph clock. */
+  chunkPlayedAt?(utterance: string, chunk: number, endFrame: number): void;
   /** Whether the microphone's device gives no audio for now (muted by the browser or the system, not by the person). */
   microphoneMuted(muted: boolean): void;
   /** The microphone or the speaker failed, with a stable code; the call stops. */
@@ -20,6 +24,8 @@ export interface AudioIoSink {
 
 /** A microphone and speaker for one call. */
 export interface AudioIo {
+  /** Current AudioContext graph frame, or null before the context opens. */
+  clockFrame?(): number | null;
   /**
    * Starts opening the microphone and the speaker; reports to `sink`: `ready()` once both work (the call listens only
    * from then), or `failed(code)`. May throw an `Error` with a stable `code` when it cannot even begin.

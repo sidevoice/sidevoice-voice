@@ -41,7 +41,8 @@ mod test_support;
 pub use async_trait::async_trait;
 pub use config::{BargeInMinSpeech, EndOfTurn, ListeningBar, Patience, VoiceConfig};
 pub use event::{
-    CallState, Listening, Microphone, PlaybackState, TurnEvent, TurnTimings, VoiceError, VoiceEvent,
+    CallState, CaptureHearing, Listening, Microphone, PlaybackCapture, PlaybackState, SayCapture,
+    TurnEvent, TurnTimings, VoiceError, VoiceEvent,
 };
 #[cfg(native)]
 pub use io::{
