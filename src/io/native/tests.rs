@@ -213,6 +213,7 @@ fn rendered_boundaries_precede_qualifying_capture_even_when_the_driver_is_delaye
             id: "u".into(),
             text: text.into(),
             language: None,
+            evidence_key: None,
         },
     ));
     for chunk in 0..2 {
@@ -243,6 +244,8 @@ fn rendered_boundaries_precede_qualifying_capture_even_when_the_driver_is_delaye
                         pcm,
                         speech: captured > 32,
                         probability: Some(if captured > 32 { 0.9 } else { 0.02 }),
+                        evidence: None,
+                        captured_at: None,
                     },
                 ));
             }
@@ -293,6 +296,7 @@ fn recorded_speaker_echo_cannot_start_a_turn_but_a_person_over_it_can() {
                 id: "reply".into(),
                 text: "A recorded reply playing on the local speaker.".into(),
                 language: None,
+                evidence_key: None,
             },
         ));
         effects.extend(call.handle(
@@ -354,6 +358,8 @@ fn recorded_speaker_echo_cannot_start_a_turn_but_a_person_over_it_can() {
                         speech: vad.window(&pcm),
                         probability: Some(EnergyVad::probability(&pcm)),
                         pcm,
+                        evidence: None,
+                        captured_at: None,
                     },
                 ));
             }
@@ -377,8 +383,33 @@ fn recorded_speaker_echo_cannot_start_a_turn_but_a_person_over_it_can() {
     let backchannel = scenario(Some(0.4), 400);
     assert!(!backchannel.iter().any(|effect| matches!(
         effect,
-        Effect::Event(VoiceEvent::Turn(_)) | Effect::Transcribe { .. } | Effect::StopPlayback
+        Effect::Event(VoiceEvent::Turn(
+            TurnEvent::Started { .. } | TurnEvent::Finished { .. } | TurnEvent::Cancelled { .. }
+        )) | Effect::Transcribe { .. }
+            | Effect::StopPlayback
     )));
+    let candidates: Vec<_> = backchannel
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::Event(VoiceEvent::Turn(TurnEvent::Candidate { candidate_id, .. })) => {
+                Some(candidate_id.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    let discarded: Vec<_> = backchannel
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::Event(VoiceEvent::Turn(TurnEvent::CandidateCancelled { candidate_id })) => {
+                Some(candidate_id.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        candidates, discarded,
+        "each false backchannel candidate is discarded"
+    );
     let person = scenario(Some(0.4), 4_000);
     assert!(person.iter().any(|effect| matches!(
         effect,

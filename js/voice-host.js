@@ -177,7 +177,20 @@ export function createVoiceHost(source, options = {}) {
         io.dispose?.();
         calls.delete(id);
       },
-      say(text, options = {}) { return !disposed && call ? call.say(String(text), options) : notPlayed(); },
+      say(text, options = {}) {
+        if(disposed||!call)return notPlayed();
+        const saying=call.say(String(text),options);
+        return Object.freeze({id:saying.id,
+          cancel(){saying.cancel()},
+          cancelPending(){if(!io.fencePending?.(saying.id))return false;saying.cancel();return true},
+          onEvent(listener){saying.onEvent(listener)},get outcome(){return saying.outcome}});
+      },
+      markEvidence(mark) {
+        if(disposed||!call)return;
+        const frame=io.clockFrame?.();
+        if(Number.isSafeInteger(frame)&&call.markEvidenceAt)call.markEvidenceAt(mark,frame);
+        else call.markEvidence(mark);
+      },
       mute(value) { muted = !!value; call?.mute(muted); },
       cancelInput() { call?.cancelInput(); },
       async endInput() { await call?.endInput(); },

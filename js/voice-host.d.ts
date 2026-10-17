@@ -109,6 +109,8 @@ export interface VoiceCallHost {
    *  and how it ended, and cancels it. Before `setSettings`, or with the call stopped, its outcome is `not-played`
    *  (`stopped`). */
   say(text: string, options?: VoiceSayOptions): VoiceSaying;
+  /** Ordered opaque marker copied into later microphone evidence; it has no playback effect. */
+  markEvidence(mark: number): void;
   /** Mutes or unmutes the microphone; muting feeds silence and closes an open turn normally. Kept from the first call, even
    *  before `setSettings`. */
   mute(muted: boolean): void;

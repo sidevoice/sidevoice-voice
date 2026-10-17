@@ -57,6 +57,7 @@ fn lane_sink() -> (IoSink, UnboundedReceiver<Message>) {
             generation: 1,
             rendered: Arc::new(Mutex::new(RenderedMailbox::default())),
             direct_rendered: false,
+            capture: None,
         },
         received,
     )
@@ -98,6 +99,107 @@ fn unused_shared_audio_does_not_keep_its_worker_or_devices_alive() {
         drop(shared);
         tokio::task::yield_now().await;
         assert!(weak.upgrade().is_none());
+    });
+}
+
+#[test]
+fn pending_fence_is_atomic_with_mixing_and_preserves_delayed_physical_start() {
+    runtime().block_on(async {
+        let recorded = Arc::new(Mutex::new(Recorded::default()));
+        let shared = SharedNativeAudio::with_physical(
+            NativeDevices::default(),
+            Box::new(Physical(Arc::clone(&recorded))),
+        );
+        let (mut lane, port) = shared.attach();
+        let (sink, mut events) = lane_sink();
+        assert!(port.fence_pending("before-start"));
+        lane.start(sink).unwrap();
+        next_io(&mut events).await;
+        lane.play("before-start", 0, vec![0.4; FRAME], RATE);
+        assert!(
+            recorded.lock().unwrap().played.is_empty(),
+            "a source fence acknowledged before lane start remains in force"
+        );
+        assert!(port.fence_pending("synthesizing"));
+        lane.play("synthesizing", 0, vec![0.4; FRAME], RATE);
+        assert!(
+            recorded.lock().unwrap().played.is_empty(),
+            "future chunk cannot pass its fence"
+        );
+        {
+            let mut state = shared.inner.state.lock().unwrap();
+            state
+                .lanes
+                .get_mut(&port.id)
+                .unwrap()
+                .queued
+                .push_back(Chunk {
+                    utterance: "queued".into(),
+                    chunk: 0,
+                    samples: vec![0.4; FRAME].into(),
+                    cursor: 0,
+                    announced: false,
+                });
+        }
+        assert!(port.fence_pending("queued"));
+        assert!(shared
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .lanes
+            .get(&port.id)
+            .unwrap()
+            .queued
+            .is_empty());
+        lane.play("active", 0, vec![0.4; FRAME], RATE);
+        let frame = recorded.lock().unwrap().played[0].0.clone();
+        assert!(
+            !port.fence_pending("active"),
+            "a handed-off frame may already be audible"
+        );
+        let physical = recorded.lock().unwrap().sink.as_ref().unwrap().clone();
+        physical.send(IoEvent::ChunkStarted {
+            utterance: frame.clone(),
+            chunk: 0,
+        });
+        next_io(&mut events).await;
+        physical.send(IoEvent::ChunkPlayed {
+            utterance: frame,
+            chunk: 0,
+        });
+        next_io(&mut events).await;
+        assert!(
+            !port.fence_pending("active"),
+            "late actor receipt cannot erase actual start"
+        );
+        lane.stop();
+        assert!(
+            !port.fence_pending("active"),
+            "an IPC command delayed past stop cannot reclassify played sound as absent"
+        );
+    });
+}
+
+#[test]
+fn physical_handoff_remains_uncertain_after_stop_without_start_callback() {
+    runtime().block_on(async {
+        let recorded = Arc::new(Mutex::new(Recorded::default()));
+        let shared = SharedNativeAudio::with_physical(
+            NativeDevices::default(),
+            Box::new(Physical(Arc::clone(&recorded))),
+        );
+        let (mut lane, port) = shared.attach();
+        let (sink, mut events) = lane_sink();
+        lane.start(sink).unwrap();
+        next_io(&mut events).await;
+        lane.play("handoff-no-callback", 0, vec![0.4; FRAME], RATE);
+        assert_eq!(recorded.lock().unwrap().played.len(), 1);
+        lane.stop();
+        assert!(
+            !port.fence_pending("handoff-no-callback"),
+            "a lost start callback cannot turn a physical handoff into certified absence"
+        );
     });
 }
 

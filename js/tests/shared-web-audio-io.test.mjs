@@ -3,7 +3,7 @@ import test from "node:test";
 import { createSharedWebAudioIo } from "../shared-web-audio-io.js";
 
 function browser() {
-  const all = { opens: 0, closes: 0, tracks: 0, nodes: [] };
+  const all = { opens: 0, closes: 0, tracks: 0, nodes: [], sources: [] };
   const track = () => ({ getSettings: () => ({ echoCancellation: true }), stop: () => { all.tracks++; }, muted: false });
   Object.defineProperty(globalThis, "navigator", { configurable: true, value: { mediaDevices: {
     async getUserMedia() { all.opens++; const t = track(); return { getAudioTracks: () => [t], getTracks: () => [t] }; },
@@ -26,12 +26,53 @@ function browser() {
     createMediaStreamSource() { return { connect: (node) => node, disconnect() {} }; }
     createGain() { return { connect() {}, disconnect() {}, gain: { value: 1, setValueAtTime() {}, linearRampToValueAtTime() {} } }; }
     createBuffer(_channels, length, rate) { return { duration: length / rate, copyToChannel() {} }; }
-    createBufferSource() { return { connect() {}, start() {}, stop() {} }; }
+    createBufferSource() { const source = { connect() {}, start() {}, stop() {} }; all.sources.push(source); return source; }
     async resume() {}
     async close() { all.closes++; }
   };
   return all;
 }
+
+test("graph frames survive delayed delivery and only an ended source confirms a chunk", async () => {
+  const physical = browser();
+  const audio = createSharedWebAudioIo();
+  const lane = audio.attach();
+  const events = [];
+  const heard = sink();
+  heard.capturedAt = (_samples, frame) => events.push(["capture", frame]);
+  heard.chunkPlayedAt = (id, chunk, frame) => events.push(["completed", id, chunk, frame]);
+  lane.io.start(heard);
+  for (let i = 0; i < 5 && !heard.events.ready; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+  await audio.routeInput(lane.input);
+  assert.equal(lane.io.clockFrame(), 128, "publication mark is after the current render quantum");
+  lane.io.play("A", 0, new Float32Array(160), 16000);
+  assert.deepEqual(events, [], "scheduled output does not certify completed audio");
+  const capture = physical.nodes.find((node) => node.name === "sidevoice-capture");
+  capture.port.onmessage({data:{type:"captured",generation:2,samples:new Float32Array(160),startFrame:80}});
+  assert.deepEqual(events, [["capture",80]]);
+  physical.sources[0].onended();
+  assert.deepEqual(events, [["capture",80],["completed","A",0,160]]);
+  lane.io.stop();
+});
+
+test("pending fence suppresses unscheduled output and preserves every scheduled source", async () => {
+  const physical=browser();
+  const audio=createSharedWebAudioIo();
+  const lane=audio.attach(),heard=sink();
+  lane.io.start(heard);
+  for(let i=0;i<5&&!heard.events.ready;i++)await new Promise(resolve=>setTimeout(resolve,0));
+  assert.equal(lane.io.fencePending("not-scheduled"),true);
+  lane.io.play("not-scheduled",0,new Float32Array(160),16000);
+  assert.equal(physical.sources.length,0);
+  lane.io.play("active",0,new Float32Array(160),16000);
+  lane.io.play("scheduled",0,new Float32Array(160),16000);
+  assert.equal(lane.io.fencePending("active"),false);
+  assert.equal(lane.io.fencePending("scheduled"),false,
+    "a queued AudioBufferSource may start while the main thread is suspended");
+  physical.sources[0].onended();
+  assert.equal(lane.io.fencePending("active"),false,"a completed first chunk is still a started utterance");
+  lane.io.stop();
+});
 function sink() {
   const events = { captured: [], rendered: [], ended: 0, ready: 0, chunks: [] };
   return { events, ready() { events.ready++; }, captured(frame) { events.captured.push(frame); },

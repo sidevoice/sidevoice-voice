@@ -230,7 +230,12 @@ export function createWebAudioIo(options = {}) {
     }
     microphone = context.createMediaStreamSource(stream);
     capture = new AudioWorkletNode(context, "sidevoice-capture");
-    capture.port.onmessage = ({ data }) => current() && sink.captured(data);
+    capture.port.onmessage = ({ data }) => {
+      if(!current())return;
+      if(data?.type==='captured' && Number.isSafeInteger(data.startFrame) && sink.capturedAt)
+        sink.capturedAt(data.samples,data.startFrame);
+      else sink.captured(data?.samples??data);
+    };
     // A processor that throws posts nothing again: the capture is over, not quiet.
     capture.onprocessorerror = () => current() && fail("audio-capture-failed");
     // Connected through to the destination so that every browser runs it; it outputs silence.
@@ -282,6 +287,9 @@ export function createWebAudioIo(options = {}) {
   }
 
   return {
+    // currentTime names the render quantum's start. Mark its end so an app
+    // publication in the same quantum cannot be placed before a mic sample.
+    clockFrame() {return context ? Math.floor(context.currentTime*context.sampleRate)+128 : null;},
     /** Whether the output can be chosen in this browser (`AudioContext.setSinkId`). */
     get outputSelectable() {
       return outputSelectable();
@@ -373,11 +381,13 @@ export function createWebAudioIo(options = {}) {
       source.connect(output);
       const startAt = Math.max(context.currentTime, queueEnd);
       queueEnd = startAt + buffer.duration;
+      const endFrame = Math.ceil(queueEnd * context.sampleRate);
       sources.add(source);
       source.onended = () => {
         sources.delete(source);
         if (current()) {
-          sink.chunkPlayed(utterance, chunk);
+          if(sink.chunkPlayedAt)sink.chunkPlayedAt(utterance, chunk, endFrame);
+          else sink.chunkPlayed(utterance, chunk);
           if (sources.size === 0) {
             playback++;
             closePlayback(epoch, queueEnd);

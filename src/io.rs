@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use futures_channel::mpsc::UnboundedSender;
 
+use crate::event::PlaybackCapture;
 use crate::maybe_send::MaybeSend;
 use crate::voice_call::Message;
 
@@ -23,6 +24,12 @@ pub enum IoEvent {
     Ready,
     /// Captured audio: 16 kHz mono samples, in order, after echo cancellation.
     Captured(Vec<f32>),
+    /// Browser AudioContext frame of this block's first microphone sample.
+    #[cfg(web)]
+    CapturedSource(Vec<f32>, u64),
+    /// Native shared audio preserves the physical capture callback's source time across routing.
+    #[cfg(native)]
+    CapturedAt(Vec<f32>, u64),
     /// Rendered speaker samples, mono at 16 kHz, after gain and fading.
     Rendered(Vec<f32>),
     /// Playback ended; discard any smoothing tail and report exact silence.
@@ -41,6 +48,13 @@ pub enum IoEvent {
         /// The chunk's index in it.
         chunk: usize,
     },
+    /// A browser source actually ended; its planned final frame shares the capture worklet clock.
+    #[cfg(web)]
+    ChunkPlayedAt {
+        utterance: String,
+        chunk: usize,
+        frame: u64,
+    },
     /// Whether the microphone's device gives no audio for now (muted by the browser or the system, not by the person),
     /// each time that changes.
     MicrophoneMuted(bool),
@@ -57,6 +71,38 @@ pub struct IoSink {
     pub(crate) rendered: Arc<Mutex<RenderedMailbox>>,
     #[cfg_attr(web, allow(dead_code))]
     pub(crate) direct_rendered: bool,
+    /// A prior capture block's immutable speaker state, shared with the call actor.
+    pub(crate) capture: Option<Arc<Mutex<CaptureEvidence>>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct CaptureEvidence {
+    pub(crate) published: Arc<PlaybackCapture>,
+    previous: Option<Arc<PlaybackCapture>>,
+}
+
+impl CaptureEvidence {
+    pub(crate) fn new(initial: PlaybackCapture) -> Self {
+        let initial = Arc::new(initial);
+        Self {
+            published: initial,
+            previous: None,
+        }
+    }
+
+    fn ingress(&mut self) -> Arc<PlaybackCapture> {
+        let before = self
+            .previous
+            .clone()
+            .unwrap_or_else(|| Arc::new(PlaybackCapture::unknown()));
+        self.previous = Some(Arc::clone(&self.published));
+        before
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.published = Arc::new(PlaybackCapture::unknown());
+        self.previous = None;
+    }
 }
 
 /// Only the newest rendered frame waits while the call task is occupied. A replacement marks a discontinuity so
@@ -97,6 +143,19 @@ impl IoSink {
     /// Sends one event; once the call is gone, it goes nowhere.
     pub fn send(&self, event: IoEvent) {
         match event {
+            IoEvent::Captured(samples) => {
+                let at = crate::runtime::unix_ms()
+                    .saturating_sub(crate::turns::duration_ms(samples.len()));
+                self.send_capture(samples, at, None);
+            }
+            #[cfg(web)]
+            IoEvent::CapturedSource(samples, frame) => {
+                let at = crate::runtime::unix_ms()
+                    .saturating_sub(crate::turns::duration_ms(samples.len()));
+                self.send_capture(samples, at, Some(frame));
+            }
+            #[cfg(native)]
+            IoEvent::CapturedAt(samples, at) => self.send_capture(samples, at, None),
             IoEvent::Rendered(samples) => {
                 #[cfg(native)]
                 if self.direct_rendered {
@@ -135,6 +194,31 @@ impl IoSink {
                     .messages
                     .unbounded_send(Message::Io(self.generation, other));
             }
+        }
+    }
+
+    fn send_capture(&self, samples: Vec<f32>, at: u64, source_frame: Option<u64>) {
+        if let Some(capture) = &self.capture {
+            let evidence = capture.lock().expect("capture evidence").ingress();
+            let _ = self.messages.unbounded_send(Message::Captured(
+                self.generation,
+                samples,
+                evidence,
+                at,
+                source_frame,
+            ));
+        } else {
+            #[cfg(native)]
+            if self.direct_rendered {
+                let _ = self.messages.unbounded_send(Message::Io(
+                    self.generation,
+                    IoEvent::CapturedAt(samples, at),
+                ));
+                return;
+            }
+            let _ = self
+                .messages
+                .unbounded_send(Message::Io(self.generation, IoEvent::Captured(samples)));
         }
     }
 
@@ -177,9 +261,43 @@ pub trait AudioIo: MaybeSend {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use super::{IoEvent, IoSink, RenderedMailbox};
+    use super::{CaptureEvidence, IoEvent, IoSink, RenderedMailbox};
+    use crate::event::{CaptureHearing, PlaybackCapture, SayCapture};
     use crate::voice_call::Message;
     use futures_channel::mpsc::unbounded;
+
+    #[test]
+    fn ingress_keeps_a_prior_block_bound_when_actor_or_vad_is_late() {
+        let mut source = CaptureEvidence::new(PlaybackCapture {
+            available: true,
+            mark: 1,
+            recent: vec![],
+            last_played: None,
+            truncated: false,
+        });
+        let first = source.ingress();
+        assert!(!first.available);
+        // A speaker completion processed between microphone callbacks must not
+        // be claimed for the next block: its first speech sample may precede it.
+        source.published = Arc::new(PlaybackCapture {
+            available: true,
+            mark: 1,
+            recent: vec![SayCapture {
+                say_id: "A".into(),
+                hearing: CaptureHearing::Complete,
+                heard_chars: Some(3),
+                played_order: Some(1),
+            }],
+            last_played: None,
+            truncated: false,
+        });
+        let second = source.ingress();
+        assert!(second.available);
+        assert!(second.recent.is_empty());
+        let third = source.ingress();
+        assert_eq!(third.recent[0].heard_chars, Some(3));
+        assert!(second.recent.is_empty()); // immutable across delayed VAD
+    }
 
     #[test]
     fn stalled_consumer_gets_latest_silence_and_a_discontinuity() {
@@ -190,6 +308,7 @@ mod tests {
             generation: 1,
             rendered: Arc::clone(&mailbox),
             direct_rendered: false,
+            capture: None,
         };
         for _ in 0..100 {
             sink.send(IoEvent::Rendered(vec![0.8; 160]));

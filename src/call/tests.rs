@@ -79,6 +79,8 @@ impl Run {
                 pcm: window.to_vec(),
                 speech,
                 probability: Some(EnergyVad::probability(window)),
+                evidence: None,
+                captured_at: None,
             });
         }
     }
@@ -136,6 +138,7 @@ impl Run {
                     TurnEvent::Started {
                         turn_id,
                         started_at,
+                        ..
                     } => Seen {
                         turn_id,
                         phase: TurnPhase::Started,
@@ -174,6 +177,9 @@ impl Run {
                         ended_at: None,
                         timings: None,
                     },
+                    TurnEvent::Candidate { .. } | TurnEvent::CandidateCancelled { .. } => {
+                        return None
+                    }
                 }),
                 _ => None,
             })
@@ -274,6 +280,7 @@ impl Run {
             id: id.into(),
             text: text.into(),
             language: Some("en".into()),
+            evidence_key: None,
         });
     }
 
@@ -308,6 +315,188 @@ fn continuous_loud_speech(windows: usize) -> Vec<f32> {
             (0.3 * (2.0 * std::f64::consts::PI * 1_000.0 * sample as f64 / 16_000.0).sin()) as f32
         })
         .collect()
+}
+
+#[test]
+fn completed_chunk_inside_vad_delay_does_not_move_acoustic_cutoff() {
+    let mut run = Run::new(config());
+    run.reply("A", "Hello.");
+    run.sound("A", 0);
+    let captured = run.call.playback_capture_at(100);
+    assert!(
+        !captured.available,
+        "an output without a completed chunk has no exact last"
+    );
+    assert_eq!(
+        captured.recent[0].hearing,
+        crate::event::CaptureHearing::Unknown
+    );
+    // The speaker completion arrives before the asynchronous VAD hands the
+    // first already-captured speech window to the call.
+    run.input(Input::ChunkPlayedAt {
+        utterance: "A".into(),
+        chunk: 0,
+        frame: 200,
+    });
+    assert_eq!(
+        run.call.playback_capture_at(300).recent[0].hearing,
+        crate::event::CaptureHearing::Complete
+    );
+    for window in continuous_loud_speech(32).chunks(WINDOW) {
+        run.now += WINDOW_MS;
+        run.input(Input::Window {
+            pcm: window.to_vec(),
+            speech: true,
+            probability: Some(0.9),
+            evidence: Some(captured.clone()),
+            captured_at: Some(EPOCH + 32),
+        });
+    }
+    let effects = run.take();
+    let candidate = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::Event(VoiceEvent::Turn(TurnEvent::Candidate {
+                candidate_id,
+                onset_at,
+                playback,
+            })) => Some((candidate_id, onset_at, playback)),
+            _ => None,
+        })
+        .expect("first speech window has a candidate");
+    assert_eq!(*candidate.1, EPOCH + 32);
+    assert_eq!(
+        candidate.2.recent[0].hearing,
+        crate::event::CaptureHearing::Unknown
+    );
+    let started = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::Event(VoiceEvent::Turn(TurnEvent::Started {
+                candidate_id,
+                started_at,
+                ..
+            })) => Some((candidate_id, started_at)),
+            _ => None,
+        })
+        .expect("the ordinary 400 ms qualification still opens the turn");
+    assert_eq!(started.0.as_ref(), Some(candidate.0));
+    assert_eq!(*started.1, EPOCH + 32);
+}
+
+#[test]
+fn source_frames_reject_a_completion_after_the_microphone_frame_despite_late_delivery() {
+    let mut run = Run::new(config());
+    run.reply("A", "Hello.");
+    run.sound("A", 0);
+    run.input(Input::EvidenceMarkAt(1, 80));
+    run.input(Input::ChunkPlayedAt {
+        utterance: "A".into(),
+        chunk: 0,
+        frame: 200,
+    });
+    run.input(Input::EvidenceMarkAt(2, 250));
+    let earlier = run.call.playback_capture_at(100);
+    assert_eq!(earlier.mark, 1);
+    assert_eq!(
+        earlier.recent[0].hearing,
+        crate::event::CaptureHearing::Unknown
+    );
+    assert_eq!(earlier.last_played, None);
+    let later = run.call.playback_capture_at(300);
+    assert_eq!(later.mark, 2);
+    assert_eq!(
+        later.recent[0].hearing,
+        crate::event::CaptureHearing::Complete
+    );
+    assert_eq!(later.recent[0].heard_chars, Some(6));
+}
+
+#[test]
+fn a_completed_but_b_started_without_a_completed_chunk_has_no_exact_last_at_cutoff() {
+    let mut run = Run::new(config());
+    run.reply("A", "First");
+    run.sound("A", 0);
+    run.input(Input::ChunkPlayedAt {
+        utterance: "A".into(),
+        chunk: 0,
+        frame: 100,
+    });
+    run.reply("B", "Second");
+    run.sound("B", 0);
+    let cutoff = run.call.playback_capture_at(150);
+    assert!(
+        !cutoff.available,
+        "B may have sounded before its first completed chunk"
+    );
+    assert_eq!(
+        cutoff.last_played, None,
+        "A is not provably the last original"
+    );
+    assert_eq!(
+        cutoff.recent[0].hearing,
+        crate::event::CaptureHearing::Complete
+    );
+    assert_eq!(
+        cutoff.recent[1].hearing,
+        crate::event::CaptureHearing::Unknown
+    );
+    run.input(Input::ChunkPlayedAt {
+        utterance: "B".into(),
+        chunk: 0,
+        frame: 200,
+    });
+    let delayed_callback = run.call.playback_capture_at(150);
+    assert!(!delayed_callback.available);
+    assert_eq!(delayed_callback.last_played, None);
+    assert_eq!(
+        delayed_callback.recent[1].hearing,
+        crate::event::CaptureHearing::Unknown
+    );
+}
+
+#[test]
+fn a_completed_before_speech_survives_b_published_before_delayed_vad_callback() {
+    let mut run = Run::new(config());
+    run.input(Input::EvidenceMarkAt(1, 80));
+    run.reply("A", "First");
+    run.sound("A", 0);
+    run.input(Input::ChunkPlayedAt {
+        utterance: "A".into(),
+        chunk: 0,
+        frame: 100,
+    });
+    // The graph has already captured the person's first speech frame at 150.
+    // The actor processes B before async VAD reports that frame, but B's
+    // publication marker is on the same source clock after the cutoff.
+    run.input(Input::EvidenceMarkAt(2, 200));
+    run.reply("B", "Second");
+    run.sound("B", 0);
+    let cutoff = run.call.playback_capture_at(150);
+    assert!(cutoff.available);
+    assert_eq!(cutoff.mark, 1);
+    assert_eq!(cutoff.recent.len(), 1);
+    assert_eq!(cutoff.recent[0].say_id, "A");
+    assert_eq!(
+        cutoff.recent[0].hearing,
+        crate::event::CaptureHearing::Complete
+    );
+    assert_eq!(
+        cutoff.last_played.as_ref().map(|say| say.say_id.as_str()),
+        Some("A")
+    );
+}
+
+#[test]
+fn pruned_say_identity_keeps_source_knowledge_unknown_across_restart() {
+    let mut run = Run::new(config());
+    for index in 0..257 {
+        run.reply(&format!("reply-{index}"), "x");
+    }
+    assert!(!run.call.playback_capture_at(1).available);
+    run.input(Input::Stop);
+    run.input(Input::Start { take: false });
+    assert!(!run.call.playback_capture_at(1).available);
 }
 
 #[test]
@@ -647,6 +836,8 @@ fn mute_and_playback_restart_reset_only_a_tentative_overlap_without_capture() {
                 pcm: window.to_vec(),
                 speech: false,
                 probability: Some(0.02),
+                evidence: None,
+                captured_at: None,
             });
         }
         run.take();
@@ -698,6 +889,8 @@ fn continuous_sentence_chunks_preserve_overlap_but_a_real_output_end_resets_it()
                 pcm: window.to_vec(),
                 speech: false,
                 probability: Some(0.02),
+                evidence: None,
+                captured_at: None,
             });
         }
         run.hear(&continuous_loud_speech(20));
@@ -759,6 +952,8 @@ fn short_overlap_is_discarded_without_turn_transcription_or_playback_cut() {
             pcm: window.to_vec(),
             speech: false,
             probability: Some(0.02),
+            evidence: None,
+            captured_at: None,
         });
     }
     run.take();
@@ -768,17 +963,26 @@ fn short_overlap_is_discarded_without_turn_transcription_or_playback_cut() {
             pcm: window.to_vec(),
             speech: true,
             probability: Some(0.9),
+            evidence: None,
+            captured_at: None,
         });
     }
     let effects = run.take();
     assert!(Run::turns(&effects).is_empty());
     assert!(Run::transcribe(&effects).is_none());
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::Event(VoiceEvent::Turn(TurnEvent::Candidate { .. }))
+    )));
     assert!(!effects.contains(&Effect::StopPlayback));
     run.played("ack", 0);
-    assert_eq!(
-        Run::outcomes(&run.take()),
-        [("ack".into(), SayOutcome::Heard)]
-    );
+    run.hear(&silence(32));
+    let after = run.take();
+    assert!(after.iter().any(|effect| matches!(
+        effect,
+        Effect::Event(VoiceEvent::Turn(TurnEvent::CandidateCancelled { .. }))
+    )));
+    assert_eq!(Run::outcomes(&after), [("ack".into(), SayOutcome::Heard)]);
 }
 
 #[test]

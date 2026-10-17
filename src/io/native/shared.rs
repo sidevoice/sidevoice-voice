@@ -6,7 +6,7 @@
 //! dry: a frame sent is a frame reported. Stopping a lane cuts the speaker at once (with its short fade) and mixes
 //! what the other lanes had in flight again, so an interruption is never late by the lead.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, Weak};
 
 use futures_channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
@@ -71,6 +71,12 @@ struct Lane {
     resampler: Option<(u32, Resampler)>,
     /// Whether it has played anything since its playback last ended.
     sounding: bool,
+    /// Source-level pending fence; a later synthesized chunk with this id is discarded.
+    fenced: HashSet<String>,
+    /// Identities handed to the physical output, which may already be audible
+    /// even before its start callback; retained across delayed actor events.
+    started: HashSet<String>,
+    fence_overflow: bool,
 }
 
 struct Chunk {
@@ -174,6 +180,9 @@ impl SharedNativeAudio {
                 incarnation: 0,
                 resampler: None,
                 sounding: false,
+                fenced: HashSet::new(),
+                started: HashSet::new(),
+                fence_overflow: false,
             },
         );
         (
@@ -206,6 +215,41 @@ impl SharedNativeAudio {
     }
 }
 
+impl InputPort {
+    /// Atomically fence only a saying with no frame already handed to the
+    /// physical output and no earlier started frame. An in-flight frame may
+    /// already be audible even if its callback is late, so it is left alone.
+    pub fn fence_pending(&self, utterance: &str) -> bool {
+        let mut state = self.inner.state.lock().expect("shared audio");
+        let Some(lane) = state.lanes.get(&self.id) else {
+            return false;
+        };
+        if lane.fence_overflow || lane.started.contains(utterance) {
+            return false;
+        }
+        let incarnation = lane.incarnation;
+        if state.frames.values().any(|frame| {
+            frame.parts.iter().any(|part| {
+                part.lane == self.id
+                    && part.incarnation == incarnation
+                    && part.pieces.iter().any(|piece| piece.utterance == utterance)
+            })
+        }) {
+            return false;
+        }
+        let lane = state.lanes.get_mut(&self.id).expect("lane");
+        if lane.fenced.len() >= 2048 {
+            lane.fence_overflow = true;
+            return false;
+        }
+        lane.fenced.insert(utterance.to_owned());
+        lane.queued.retain(|chunk| chunk.utterance != utterance);
+        // No resampler tail from a never-played chunk may leak into the next.
+        lane.resampler = None;
+        true
+    }
+}
+
 impl AudioIo for LaneIo {
     fn start(&mut self, sink: IoSink) -> Result<(), String> {
         let mut state = self.inner.state.lock().expect("shared audio");
@@ -214,6 +258,9 @@ impl AudioIo for LaneIo {
         };
         lane.sink = Some(sink.clone());
         lane.incarnation = lane.incarnation.wrapping_add(1);
+        // A pending fence can be acknowledged before the lane first starts.
+        // Keep saying IDs for this lane's lifetime across starts and stops;
+        // delayed bridge commands must see the same source decision.
         if !state.running {
             state.generation += 1;
             let physical_sink = IoSink {
@@ -221,6 +268,7 @@ impl AudioIo for LaneIo {
                 generation: state.generation,
                 rendered: Arc::clone(&self.inner.rendered),
                 direct_rendered: true,
+                capture: None,
             };
             if let Err(code) = state.physical.start(physical_sink) {
                 state.lanes.get_mut(&self.id).expect("lane").sink = None;
@@ -238,6 +286,9 @@ impl AudioIo for LaneIo {
             return;
         };
         if lane.sink.is_none() {
+            return;
+        }
+        if lane.fenced.contains(utterance) {
             return;
         }
         let resampler = match &mut lane.resampler {
@@ -286,6 +337,9 @@ impl AudioIo for LaneIo {
             lane.queued.clear();
             lane.resampler = None;
             lane.sounding = false;
+            // A Tauri pending-cancel command may arrive after stop. Keep the
+            // bounded identity history until this lane is dropped, so a
+            // previously handed-off saying cannot become "never started".
         }
         if state.routed == Some(self.id) {
             state.routed = None;
@@ -316,6 +370,24 @@ impl Drop for LaneIo {
 }
 
 impl State {
+    fn note_started(&mut self, id: u64, incarnation: u64, utterance: &str) {
+        let Some(lane) = self
+            .lanes
+            .get_mut(&id)
+            .filter(|lane| lane.incarnation == incarnation)
+        else {
+            return;
+        };
+        if lane.fence_overflow {
+            return;
+        }
+        lane.started.insert(utterance.to_owned());
+        if lane.started.len() >= 2048 {
+            lane.fence_overflow = true;
+            lane.started.clear()
+        }
+    }
+
     /// Attribute only the physical samples actually consumed by the output. The physical backend reports rendered
     /// samples before progress in a tick, so hold them until its first chunk-start marker arrives.
     fn rendered(&mut self, samples: Vec<f32>, queued: Vec<bool>) {
@@ -531,6 +603,14 @@ impl State {
             let seq = self.next_frame;
             self.next_frame += 1;
             let id = format!("shared-frame-{seq}");
+            // Record potential physical start before handing the frame off.
+            // A late ChunkStarted callback can arrive after stop/flush has
+            // removed the frame, but cannot make a later fence certify zero.
+            for part in &parts {
+                for piece in &part.pieces {
+                    self.note_started(part.lane, part.incarnation, &piece.utterance);
+                }
+            }
             self.frames.insert(
                 id.clone(),
                 MixedFrame {
@@ -547,17 +627,26 @@ impl State {
     }
 
     fn event(&mut self, event: IoEvent) {
+        let captured_at = if let IoEvent::CapturedAt(_, at) = &event {
+            Some(*at)
+        } else {
+            None
+        };
         match event {
             IoEvent::Ready => {}
-            IoEvent::Captured(samples) => {
+            IoEvent::Captured(samples) | IoEvent::CapturedAt(samples, _) => {
                 let silence = vec![0.0; samples.len()];
                 for (&id, lane) in &self.lanes {
                     if let Some(sink) = &lane.sink {
-                        sink.send(IoEvent::Captured(if self.routed == Some(id) {
+                        let samples = if self.routed == Some(id) {
                             samples.clone()
                         } else {
                             silence.clone()
-                        }));
+                        };
+                        sink.send(match captured_at {
+                            Some(at) => IoEvent::CapturedAt(samples, at),
+                            None => IoEvent::Captured(samples),
+                        });
                     }
                 }
             }
@@ -570,6 +659,15 @@ impl State {
             IoEvent::PlaybackEnded => {}
             IoEvent::ChunkStarted { utterance, .. } => {
                 if let Some(frame) = self.frames.get_mut(&utterance) {
+                    let started = frame
+                        .parts
+                        .iter()
+                        .flat_map(|part| {
+                            part.pieces.iter().map(move |piece| {
+                                (part.lane, part.incarnation, piece.utterance.clone())
+                            })
+                        })
+                        .collect::<Vec<_>>();
                     frame.started = true;
                     for (&id, lane) in &self.lanes {
                         let Some(sink) = &lane.sink else { continue };
@@ -593,11 +691,19 @@ impl State {
                             }
                         }
                     }
+                    for (id, incarnation, name) in started {
+                        self.note_started(id, incarnation, &name)
+                    }
                 }
                 self.drain_rendered();
             }
             IoEvent::ChunkPlayed { utterance, .. } => {
                 if let Some(frame) = self.frames.remove(&utterance) {
+                    for part in &frame.parts {
+                        for piece in &part.pieces {
+                            self.note_started(part.lane, part.incarnation, &piece.utterance)
+                        }
+                    }
                     for part in &frame.parts {
                         let ending = part.pieces.last().filter(|piece| piece.last);
                         let sink = self

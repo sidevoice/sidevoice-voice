@@ -24,8 +24,9 @@ use futures_util::{stream, Stream, StreamExt};
 
 use crate::call::{Call, Effect, Input};
 use crate::config::{EndOfTurn, VoiceConfig};
+use crate::event::PlaybackCapture;
 use crate::event::{VoiceError, VoiceEvent};
-use crate::io::{AudioIo, IoEvent, IoSink, RenderedMailbox};
+use crate::io::{AudioIo, CaptureEvidence, IoEvent, IoSink, RenderedMailbox};
 use crate::level::{instant, Level};
 use crate::maybe_send::MaybeSend;
 use crate::models::{Models, VadFrame, VoiceModels};
@@ -67,6 +68,8 @@ pub(crate) enum Message {
     Start(StartOptions),
     Stop,
     Config(Box<VoiceConfig>),
+    EvidenceMark(u64),
+    EvidenceMarkAt(u64, u64),
     /// Say `text`, telling `events` what becomes of it.
     Say {
         id: String,
@@ -85,6 +88,7 @@ pub(crate) enum Message {
     SharedRoute(u64, oneshot::Sender<Result<(), String>>),
     Models(Arc<dyn VoiceModels>, Box<VoiceConfig>),
     Io(u64, IoEvent),
+    Captured(u64, Vec<f32>, Arc<PlaybackCapture>, u64, Option<u64>),
     Rendered(u64),
     #[cfg(native)]
     PhysicalRendered(u64, Vec<bool>, Vec<f32>),
@@ -129,12 +133,16 @@ impl VoiceCall {
         let (internal, reported) = unbounded();
         let (events, received) = unbounded();
         let call_id = call_id();
+        let call_state = Call::new(
+            config.clone(),
+            call_id.clone(),
+            unix_ms().saturating_sub(monotonic_ms()),
+        );
+        let capture_evidence = Arc::new(Mutex::new(CaptureEvidence::new(
+            call_state.playback_capture(),
+        )));
         let driver = Driver {
-            call: Call::new(
-                config.clone(),
-                call_id.clone(),
-                unix_ms().saturating_sub(monotonic_ms()),
-            ),
+            call: call_state,
             residency: Residency::new(config.idle_unload_minutes),
             config,
             models,
@@ -144,9 +152,11 @@ impl VoiceCall {
             opening: false,
             tasks: VecDeque::new(),
             captured: VecDeque::new(),
+            capture_marks: VecDeque::new(),
             rendered: VecDeque::new(),
             playback_level: Level::default(),
             rendered_mailbox: Arc::new(Mutex::new(RenderedMailbox::default())),
+            capture_evidence,
             generation: 0,
             taken: 0,
             taking: false,
@@ -183,6 +193,16 @@ impl VoiceCall {
     /// A new configuration, in effect at once.
     pub fn set_config(&self, config: VoiceConfig) {
         self.send(Message::Config(Box::new(config)));
+    }
+
+    /// Places an opaque host marker in the call's ordered input stream. A later
+    /// microphone capture copies the highest marker already processed.
+    pub fn mark_evidence(&self, mark: u64) {
+        self.send(Message::EvidenceMark(mark));
+    }
+
+    pub fn mark_evidence_at(&self, mark: u64, frame: u64) {
+        self.send(Message::EvidenceMarkAt(mark, frame));
     }
 
     /// Other models, with the configuration they go with, taken together: the models loaded are dropped, and the new
@@ -250,10 +270,13 @@ struct Driver {
     opening: bool,
     /// Capture not yet in a whole detector window.
     captured: VecDeque<f32>,
+    /// Speaker evidence and source time of capture blocks, retained across async VAD.
+    capture_marks: VecDeque<CaptureMark>,
     /// Rendered 16 kHz speaker samples waiting for capture's detector windows.
     rendered: VecDeque<f32>,
     playback_level: Level,
     rendered_mailbox: Arc<Mutex<RenderedMailbox>>,
+    capture_evidence: Arc<Mutex<CaptureEvidence>>,
     /// A new start rejects any queued report from an older microphone or speaker.
     generation: u64,
     /// The detector's position: samples taken into windows since its last reset.
@@ -271,6 +294,13 @@ struct Driver {
     events: UnboundedSender<VoiceEvent>,
     /// The handles of what is being said or waits to be, by id, until each is done.
     sayers: HashMap<String, UnboundedSender<SayEvent>>,
+}
+
+struct CaptureMark {
+    start: u64,
+    end: u64,
+    at: u64,
+    playback: crate::event::PlaybackCapture,
 }
 
 impl Driver {
@@ -392,6 +422,7 @@ impl Driver {
         }
         self.loaded = None;
         self.captured.clear();
+        self.capture_marks.clear();
         self.taken = 0;
         self.input(Input::Stop);
     }
@@ -422,6 +453,8 @@ impl Driver {
                     self.halt().await;
                 }
             }
+            Message::EvidenceMark(mark) => self.input(Input::EvidenceMark(mark)),
+            Message::EvidenceMarkAt(mark, frame) => self.input(Input::EvidenceMarkAt(mark, frame)),
             Message::Models(models, config) => {
                 self.models = models;
                 self.loaded = None;
@@ -444,6 +477,7 @@ impl Driver {
                     id,
                     text,
                     language: options.language,
+                    evidence_key: options.evidence_key,
                 });
             }
             Message::CancelSay(id) => self.input(Input::CancelSay(id)),
@@ -460,6 +494,10 @@ impl Driver {
             Message::SharedRoute(_, _) => {}
             #[cfg(native)]
             Message::PhysicalRendered(_, _, _) => {}
+            Message::Captured(generation, _, _, _, _) if generation != self.generation => {}
+            Message::Captured(_, pcm, evidence, at, frame) => {
+                self.captured(&pcm, &evidence, at, frame).await
+            }
             Message::Io(generation, _) if generation != self.generation => {}
             Message::Rendered(generation) => {
                 let frame = self
@@ -488,7 +526,22 @@ impl Driver {
                     self.input(Input::Start { take: self.taking });
                 }
             }
-            Message::Io(_, IoEvent::Captured(pcm)) => self.captured(&pcm).await,
+            Message::Io(_, IoEvent::Captured(pcm)) => {
+                let at = unix_ms().saturating_sub(crate::turns::duration_ms(pcm.len()));
+                self.captured(&pcm, &PlaybackCapture::unknown(), at, None)
+                    .await
+            }
+            #[cfg(native)]
+            Message::Io(_, IoEvent::CapturedAt(pcm, at)) => {
+                self.captured(&pcm, &PlaybackCapture::unknown(), at, None)
+                    .await
+            }
+            #[cfg(web)]
+            Message::Io(_, IoEvent::CapturedSource(pcm, frame)) => {
+                let at = unix_ms().saturating_sub(crate::turns::duration_ms(pcm.len()));
+                self.captured(&pcm, &PlaybackCapture::unknown(), at, Some(frame))
+                    .await
+            }
             Message::Io(_, IoEvent::Rendered(pcm)) => {
                 self.accept_rendered(&pcm);
             }
@@ -501,6 +554,21 @@ impl Driver {
             }
             Message::Io(_, IoEvent::ChunkPlayed { utterance, chunk }) => {
                 self.input(Input::ChunkPlayed { utterance, chunk });
+            }
+            #[cfg(web)]
+            Message::Io(
+                _,
+                IoEvent::ChunkPlayedAt {
+                    utterance,
+                    chunk,
+                    frame,
+                },
+            ) => {
+                self.input(Input::ChunkPlayedAt {
+                    utterance,
+                    chunk,
+                    frame,
+                });
             }
             Message::Io(_, IoEvent::MicrophoneMuted(muted)) => {
                 self.input(Input::MicrophoneMuted(muted));
@@ -571,6 +639,10 @@ impl Driver {
             return;
         }
         self.generation = self.generation.wrapping_add(1);
+        self.capture_evidence
+            .lock()
+            .expect("capture evidence")
+            .reset();
         self.reset_playback();
         self.rendered_mailbox
             .lock()
@@ -581,6 +653,7 @@ impl Driver {
             generation: self.generation,
             rendered: Arc::clone(&self.rendered_mailbox),
             direct_rendered: false,
+            capture: Some(Arc::clone(&self.capture_evidence)),
         };
         if let Err(code) = self.io.start(sink) {
             self.error(code);
@@ -608,6 +681,7 @@ impl Driver {
         }
         self.input(Input::Stop);
         self.captured.clear();
+        self.capture_marks.clear();
         self.taken = 0;
         if let Some(loaded) = &mut self.loaded {
             loaded.vad.reset().await;
@@ -615,13 +689,31 @@ impl Driver {
     }
 
     /// Runs the detector on new capture and hands each window it completed to the state machine.
-    async fn captured(&mut self, pcm: &[f32]) {
-        let Some(loaded) = &mut self.loaded else {
-            return;
-        };
+    async fn captured(
+        &mut self,
+        pcm: &[f32],
+        _evidence: &PlaybackCapture,
+        at: u64,
+        source_frame: Option<u64>,
+    ) {
         if !self.running || self.opening {
             return;
         }
+        let start = self.taken + self.captured.len() as u64;
+        self.capture_marks.push_back(CaptureMark {
+            start,
+            end: start + pcm.len() as u64,
+            at,
+            // Unclocked native and legacy adapters cannot prove their hardware
+            // sample time from actor callback order. The browser frame and
+            // completed output chunks share one AudioContext graph clock.
+            playback: source_frame.map_or_else(PlaybackCapture::unknown, |frame| {
+                self.call.playback_capture_at(frame)
+            }),
+        });
+        let Some(loaded) = &mut self.loaded else {
+            return;
+        };
         self.captured.extend(pcm);
         if let Some(recording) = &mut self.recording {
             recording.extend(pcm, self.muted);
@@ -634,20 +726,37 @@ impl Driver {
                     probability,
                 } in frames
                 {
+                    let first = self.taken;
+                    let source = self.capture_marks.iter().find(|mark| mark.end > first);
+                    let evidence = source.map(|mark| mark.playback.clone());
+                    let captured_at = source.map(|mark| {
+                        mark.at
+                            + crate::turns::duration_ms(first.saturating_sub(mark.start) as usize)
+                    });
                     let take = (end.saturating_sub(self.taken) as usize).min(self.captured.len());
                     self.taken = end;
                     let window: Vec<f32> = self.captured.drain(..take).collect();
+                    while self
+                        .capture_marks
+                        .front()
+                        .is_some_and(|mark| mark.end <= end)
+                    {
+                        self.capture_marks.pop_front();
+                    }
                     self.playback_window(take);
                     self.input(Input::Window {
                         pcm: window,
                         speech,
                         probability,
+                        evidence,
+                        captured_at,
                     });
                 }
             }
             Err(code) => {
                 loaded.vad.reset().await;
                 self.captured.clear();
+                self.capture_marks.clear();
                 self.taken = 0;
                 self.error(code);
             }
@@ -699,6 +808,10 @@ impl Driver {
 
     fn input(&mut self, input: Input) {
         let effects = self.call.handle(monotonic_ms(), input);
+        self.capture_evidence
+            .lock()
+            .expect("capture evidence")
+            .published = Arc::new(self.call.playback_capture());
         self.apply(effects);
     }
 
