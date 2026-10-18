@@ -188,6 +188,7 @@ export function createVoiceHost(source, options = {}) {
   }
   return Object.freeze({
     createCall,
+    activateAudio(prepared) { audio.activate?.(prepared); },
     routeInput(target) {
       if (target !== null && ![...calls.values()].some(({ hostCall }) => hostCall === target)) return Promise.reject(new TypeError("a call from this host"));
       return audio.routeInput(target === null ? null : calls.get(target.id).port);

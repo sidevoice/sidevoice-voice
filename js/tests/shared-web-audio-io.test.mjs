@@ -67,6 +67,24 @@ test("one physical capture routes the next frame to one lane and zeros to the ot
   a.io.dispose(); b.io.dispose();
 });
 
+test("a stream and context begun in a button gesture are reused after slow model loading", async () => {
+  const physical = browser();
+  const context = new AudioContext();
+  const track = { getSettings: () => ({ echoCancellation: true }), stop() {}, muted: false };
+  const stream = { getAudioTracks: () => [track], getTracks: () => [track] };
+  const audio = createSharedWebAudioIo();
+  audio.activate({ context, resumed: Promise.resolve(), stream: Promise.resolve(stream) });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const lane = audio.attach();
+  const listener = sink();
+  lane.io.start(listener);
+  for (let i = 0; i < 5 && !listener.events.ready; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(listener.events.ready, 1);
+  assert.equal(physical.opens, 0, "the test must not open a second microphone after loading");
+  await audio.routeInput(lane.input);
+  lane.io.stop();
+});
+
 test("stopping a routed lane lets another call open, and restart requires a fresh route", async () => {
   const physical = browser();
   const audio = createSharedWebAudioIo();
