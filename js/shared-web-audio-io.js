@@ -17,6 +17,7 @@ export function createSharedWebAudioIo(options = {}) {
   let microphone = null;
   let capture = null;
   let opening = null;
+  let activation = null;
   let session = 0;
   let inputDevice = options.inputDevice || null;
   let outputDevice = options.outputDevice || null;
@@ -77,10 +78,16 @@ export function createSharedWebAudioIo(options = {}) {
     if (capture) { microphone?.disconnect(); microphone = context.createMediaStreamSource(next); microphone.connect(capture); }
   }
   async function open(opened) {
-    const mediaStream = await media(inputDevice);
+    const prepared = activation;
+    activation = null;
+    const mediaStream = prepared ? await prepared.stream : await media(inputDevice);
+    if (prepared && mediaStream.getAudioTracks().some((track) => track.getSettings?.().echoCancellation === false)) {
+      mediaStream.getTracks().forEach((track) => track.stop());
+      throw failure("echo-cancellation-unavailable");
+    }
     if (opened !== session) { mediaStream.getTracks().forEach((track) => track.stop()); return; }
     useStream(mediaStream, opened);
-    context = new AudioContext();
+    context = prepared?.context ?? new AudioContext();
     await context.audioWorklet.addModule(new URL("./capture-worklet.js", import.meta.url).href);
     await context.audioWorklet.addModule(new URL("./playback-worklet.js", import.meta.url).href);
     if (opened !== session) return;
@@ -103,7 +110,7 @@ export function createSharedWebAudioIo(options = {}) {
     capture.onprocessorerror = () => failAll("audio-capture-failed");
     microphone.connect(capture).connect(context.destination);
     if (outputDevice && selectable()) await context.setSinkId(outputDevice);
-    await context.resume();
+    await (prepared?.resumed ?? context.resume());
     if (opened !== session) return;
     // The worklet acknowledges the initial route before any lane reports ready.
     await route(null);
@@ -187,6 +194,8 @@ export function createSharedWebAudioIo(options = {}) {
   }
   return {
     get outputSelectable() { return selectable(); },
+    // The page begins both browser permission and audio activation in the button's user gesture, before model loading.
+    activate(prepared) { activation = prepared; },
     attach() {
       const port = Object.freeze({ id: ++nextPort });
       const lane = { port, sink: null, meter: null, gain: null, sources: new Set(), queueEnd: 0, playback: 0,

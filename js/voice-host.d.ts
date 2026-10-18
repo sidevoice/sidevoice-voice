@@ -79,6 +79,8 @@ export interface VoiceAudioDevices {
 /** A generic owner of shared devices and model loads. */
 export interface VoiceHost {
   createCall(): VoiceCallHost;
+  /** Hand a browser stream and running context begun in a user gesture to the next call. */
+  activateAudio?(prepared: { context: AudioContext; resumed: Promise<void>; stream: Promise<MediaStream> }): void;
   /** Acknowledged next-frame switch; null supplies silence to every call. */
   routeInput(target: VoiceCallHost | null): Promise<void>;
   audioDevices(): Promise<VoiceAudioDevices>;
