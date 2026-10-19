@@ -84,6 +84,7 @@ fn the_shipped_js_is_what_the_package_names() {
 fn a_smoke_report_must_show_a_running_call() {
     let ran = json!({
         "loaded": SMOKE_SLOTS,
+        "outputOnly": {"loaded": ["speaker"], "input": false, "listening": "off"},
         "ioStarted": true,
         "listenedEarly": false,
         "said": {"id": "string", "steps": ["playing", "progress", "progress", "done"], "outcome": {"status": "heard"}},
@@ -92,18 +93,19 @@ fn a_smoke_report_must_show_a_running_call() {
         "microphone": ["muted", "live"],
         "webAudio": {
             "asked": ["mic-a", "mic-b", null], "stopped": ["track-1", "track-2", "track-3"], "sinks": ["out-c"],
-            "lost": [["input", "mic-b"]], "failed": ["microphone-lost"], "muted": [false, false], "ready": 1, "worklets": 2,
+            "lost": [["input", "mic-b"]], "inputLost": ["microphone-lost"], "failed": [], "muted": [false, false],
+            "ready": 1, "worklets": 2,
             "workletSamples": [true, 3, true],
             "outputSelectable": true, "heard": ["muted", "ready", "unmuted", "muted", "audio-capture-failed"],
         },
         "host": {
-            "missing": "settings-missing", "unknown": "model-unknown", "reloaded": 1,
-            "smartMissing": "end-of-turn-missing", "flags": ["muted"],
-            "early": "not-played", "said": ["function", "heard"],
-            "started": "resolved", "again": "resolved", "restarted": "resolved", "afterRestart": "listening",
-            "smartLive": ["listening", []],
-            "states": ["idle", "listening", "idle"],
-            "handed": {"catalog": "smoke", "model": "smoke-stt", "language": "es"}, "voiceOnly": 0,
+            "unknown": "model-unknown", "reloaded": 1, "reused": [0, 0, 0],
+            "smart": ["resolved", 1], "smartMissing": "end-of-turn-missing", "flags": ["muted"],
+            "said": ["function", "heard"], "stoppedSay": "not-played",
+            "started": "resolved", "errors": [],
+            "voiceTry": ["resolved", 0, 0, false, "off"],
+            "states": ["idle", "muted", "listening", "idle"],
+            "handed": {"catalog": "smoke", "model": "smoke-stt"},
         "devices": [["mic-a"], ["Speakers B"], null, true],
         "chosen": ["mic-a", "out-b", [["input", "mic-a"], ["output", "out-b"]]],
         "deviceGone": [null, "mic-a", ["input", null], null],
@@ -116,6 +118,10 @@ fn a_smoke_report_must_show_a_running_call() {
     assert_eq!(check_smoke(&ran), Ok(()));
     for (key, value) in [
         ("loaded", json!(["vad"])),
+        (
+            "outputOnly",
+            json!({"loaded": ["vad", "transcriber", "speaker"], "input": true, "listening": "listening"}),
+        ),
         ("ioStarted", json!(false)),
         ("listenedEarly", json!(true)),
         (
@@ -146,9 +152,10 @@ fn a_smoke_report_must_show_a_running_call() {
     }
     for (key, value) in [
         ("started", json!("stopped")),
-        ("states", json!(["idle", "listening"])),
-        ("handed", json!({"model": "smoke-stt"})),
-        ("voiceOnly", json!(1)),
+        ("states", json!(["muted", "listening"])),
+        ("handed", json!({"model": "smoke-stt", "language": "es"})),
+        ("reused", json!([1, 1, 1])),
+        ("voiceTry", json!(["resolved", 1, 1, true, "listening"])),
         (
             "deviceGone",
             json!(["mic-a", null, ["input", "mic-a"], null]),
@@ -157,8 +164,7 @@ fn a_smoke_report_must_show_a_running_call() {
         ("reloaded", json!(0)),
         ("flags", json!(["listening"])),
         ("said", json!(["function", "not-played"])),
-        ("afterRestart", json!("idle")),
-        ("smartLive", json!(["idle", ["end-of-turn-missing"]])),
+        ("smart", json!(["end-of-turn-missing", 0])),
         // No take before the stop resolved.
         ("take", json!([])),
     ] {

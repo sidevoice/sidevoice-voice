@@ -14,17 +14,24 @@ export interface AudioIoSink {
   chunkPlayed(utterance: string, chunk: number): void;
   /** Whether the microphone's device gives no audio for now (muted by the browser or the system, not by the person). */
   microphoneMuted(muted: boolean): void;
-  /** The microphone or the speaker failed, with a stable code; the call stops. */
+  /** The microphone failed, went away with no other in its place, or could not open, with a stable code: it is closed,
+   *  and the speaker goes on. */
+  inputLost(code: string): void;
+  /** The speaker failed, or the devices could not open, with a stable code; the call stops. */
   failed(code: string): void;
 }
 
 /** A microphone and speaker for one call. */
 export interface AudioIo {
   /**
-   * Starts opening the microphone and the speaker; reports to `sink`: `ready()` once both work (the call listens only
-   * from then), or `failed(code)`. May throw an `Error` with a stable `code` when it cannot even begin.
+   * Starts opening the speaker and, with `input`, the microphone (none is asked for otherwise); reports to `sink`:
+   * `ready()` once what was asked for works (the call listens only from then), `inputLost(code)` for a microphone that
+   * cannot open, or `failed(code)`. May throw an `Error` with a stable `code` when it cannot even begin.
    */
-  start(sink: AudioIoSink): void;
+  start(sink: AudioIoSink, options?: { input?: boolean }): void;
+  /** Opens the microphone (`true`) or closes it (`false`) while the speaker goes on; one that cannot open is said as
+   *  `inputLost(code)`. Before `start`, or after `stop`, it does nothing. */
+  setInput(input: boolean): void;
   /** Queues a chunk of a reply: mono samples at `sampleRate`, played after whatever is queued. */
   play(utterance: string, chunk: number, samples: Float32Array, sampleRate: number): void;
   /** Stops the speaker at once, with a short fade, and drops every queued chunk. */
@@ -53,9 +60,11 @@ export interface WebAudioIoOptions {
 }
 
 /**
- * The browser's microphone (`getUserMedia` with its echo cancellation, at 16 kHz mono) and speaker (Web Audio).
- * Failures reach `sink.failed` as `microphone-denied`, `microphone-unavailable`, `microphone-lost`,
- * `audio-capture-failed`, `echo-cancellation-unavailable` or `audio-output-failed`. Its devices can be chosen at any time (`setInputDevice`,
- * `setOutputDevice`); a chosen microphone that goes away falls back to the default one (`onDeviceLost`).
+ * The browser's microphone (`getUserMedia` with its echo cancellation, at 16 kHz mono, asked for only with `input`) and
+ * speaker (Web Audio). A microphone that cannot open or goes away reaches `sink.inputLost` as `microphone-denied`,
+ * `microphone-unavailable`, `echo-cancellation-unavailable` or `microphone-lost`, and the speaker goes on; other
+ * failures reach `sink.failed` as `audio-capture-failed` or `audio-output-failed`. Its devices can be chosen at any time
+ * (`setInputDevice`, `setOutputDevice`); a chosen microphone that goes away falls back to the default one
+ * (`onDeviceLost`).
  */
 export function createWebAudioIo(options?: WebAudioIoOptions): AudioIo;

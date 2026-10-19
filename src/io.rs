@@ -19,7 +19,7 @@ pub use native::{
 /// What the microphone and the speaker tell the call.
 #[derive(Debug, Clone, PartialEq)]
 pub enum IoEvent {
-    /// The microphone and the speaker are open: the call listens from now.
+    /// What was asked for is open (the speaker, and the microphone when asked): the call listens from now.
     Ready,
     /// Captured audio: 16 kHz mono samples, in order, after echo cancellation.
     Captured(Vec<f32>),
@@ -44,7 +44,10 @@ pub enum IoEvent {
     /// Whether the microphone's device gives no audio for now (muted by the browser or the system, not by the person),
     /// each time that changes.
     MicrophoneMuted(bool),
-    /// The microphone or the speaker failed, as a stable code; the call stops.
+    /// The microphone failed or went away and no other opened (or it could not open), as a stable code: it is closed,
+    /// and the speaker goes on.
+    InputLost(String),
+    /// The speaker failed, or the devices could not open, as a stable code; the call stops.
     Failed(String),
 }
 
@@ -157,14 +160,19 @@ impl IoSink {
 
 /// A microphone and a speaker for one call.
 pub trait AudioIo: MaybeSend {
-    /// Starts opening the microphone and the speaker; every event goes to `sink`. Once capture and playback work it
-    /// sends [`IoEvent::Ready`], or [`IoEvent::Failed`] if they cannot; the call listens only from `Ready`. Fails at
-    /// once with a stable code when it cannot even begin.
+    /// Starts opening the speaker and, with `input`, the microphone; every event goes to `sink`. Without `input` no
+    /// microphone is asked for (a call that only speaks). Once what was asked for works it sends [`IoEvent::Ready`],
+    /// or [`IoEvent::Failed`] if it cannot; the call listens only from `Ready`. Fails at once with a stable code when
+    /// it cannot even begin.
     ///
     /// # Errors
     ///
     /// The code of why the microphone or the speaker could not be opened.
-    fn start(&mut self, sink: IoSink) -> Result<(), String>;
+    fn start(&mut self, sink: IoSink, input: bool) -> Result<(), String>;
+    /// Opens the microphone (`true`) or closes it (`false`) while the speaker goes on, from the next frame on. One that
+    /// cannot open is said as [`IoEvent::InputLost`]. Before `start`, or after `stop`, it does nothing: `start` says
+    /// whether to open it.
+    fn set_input(&mut self, input: bool);
     /// Queues a chunk of something said: mono samples at `sample_rate`, played after whatever is queued.
     fn play(&mut self, utterance: &str, chunk: usize, samples: Vec<f32>, sample_rate: u32);
     /// Stops the speaker at once, with a short fade, and drops every queued chunk.

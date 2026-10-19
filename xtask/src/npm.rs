@@ -20,19 +20,18 @@ const STEM: &str = "sidevoice_voice";
 /// hand, like any pin.
 const NPM_VERSION: &str = "11.21.0";
 const SMOKE_JS: &str = include_str!("../npm/smoke.mjs");
-/// The slots the smoke test's models fill, recorded each time the call loads them.
+/// The slots the smoke test's models fill, recorded each time the call loads one: a call with both halves.
 const SMOKE_SLOTS: [&str; 3] = ["vad", "transcriber", "speaker"];
 /// The calls of the voice seam, `VoiceHost` (js/voice-host.d.ts), sorted.
 const SEAM: [&str; 5] = [
     "audioDevices",
-    "createCall",
     "onAudioDevices",
     "routeInput",
     "setAudioDevices",
+    "start",
 ];
-const CALL_SEAM: [&str; 15] = [
+const CALL_SEAM: [&str; 13] = [
     "cancelInput",
-    "dispose",
     "endInput",
     "id",
     "mute",
@@ -42,9 +41,8 @@ const CALL_SEAM: [&str; 15] = [
     "onState",
     "onTake",
     "onTurn",
+    "ready",
     "say",
-    "setSettings",
-    "start",
     "stop",
 ];
 
@@ -147,14 +145,19 @@ pub(crate) fn smoke() -> Result<()> {
     Ok(())
 }
 
-/// Whether the smoke test's report shows a call that ran: it loaded the page's models once, started the microphone and
-/// speaker, and told its state as listening and its microphone's device muted and live; the package offers the default
+/// Whether the smoke test's report shows a call that ran: it loaded the page's models once, slot by slot, started the
+/// microphone and speaker, and told its state as listening and its microphone's device muted and live; a call with the
+/// output half alone loaded the speaker only, asked for no microphone and said `off`; the package offers the default
 /// web microphone and speaker, which reports its track's mute and a capture processor that threw; and its voice seam
 /// answers as `VoiceHost` says.
 fn check_smoke(report: &Value) -> Result<()> {
     let (loaded, want) = (&report["loaded"], json!(SMOKE_SLOTS));
     if *loaded != want {
         return Err(format!("the call loaded {loaded}, not {want}"));
+    }
+    let output_only = json!({"loaded": ["speaker"], "input": false, "listening": "off"});
+    if report["outputOnly"] != output_only {
+        return Err(format!("a call that only speaks went otherwise: {report}"));
     }
     if report["ioStarted"] != true {
         return Err(format!("the call never started its io: {report}"));
@@ -180,12 +183,13 @@ fn check_smoke(report: &Value) -> Result<()> {
         ));
     }
     // The browser's microphone and speaker, chosen and switched mid-call: the worklet kept, the old microphone let go
-    // once the new one works (whether it gives audio said), a chosen one gone falling back to the default, only the
-    // default one gone ending it. And a track muted from the outset, unmuted, muted again, and a capture worklet whose
-    // processor throws: each reaches the sink, the processor's as a failure.
+    // once the new one works (whether it gives audio said), a chosen one gone falling back to the default, the default
+    // one gone losing the microphone and keeping the speaker. And a track muted from the outset, unmuted, muted again,
+    // and a capture worklet whose processor throws: each reaches the sink, the processor's as a failure.
     let web_audio = json!({
         "asked": ["mic-a", "mic-b", null], "stopped": ["track-1", "track-2", "track-3"], "sinks": ["out-c"],
-        "lost": [["input", "mic-b"]], "failed": ["microphone-lost"], "muted": [false, false], "ready": 1, "worklets": 2,
+        "lost": [["input", "mic-b"]], "inputLost": ["microphone-lost"], "failed": [], "muted": [false, false],
+        "ready": 1, "worklets": 2,
         "workletSamples": [true, 3, true],
         "outputSelectable": true, "heard": ["muted", "ready", "unmuted", "muted", "audio-capture-failed"],
     });
@@ -194,13 +198,14 @@ fn check_smoke(report: &Value) -> Result<()> {
     }
     let host = &report["host"];
     let want = json!({
-        "missing": "settings-missing", "unknown": "model-unknown", "reloaded": 1,
-        "smartMissing": "end-of-turn-missing", "flags": ["muted"],
-        "early": "not-played", "said": ["function", "heard"],
-        "started": "resolved", "again": "resolved", "restarted": "resolved", "afterRestart": "listening",
-        "smartLive": ["listening", []],
+        "unknown": "model-unknown", "reloaded": 1, "reused": [0, 0, 0],
+        "smart": ["resolved", 1], "smartMissing": "end-of-turn-missing", "flags": ["muted"],
+        "said": ["function", "heard"], "stoppedSay": "not-played",
+        "started": "resolved", "errors": [],
+        // A voice try: ready, no detector, no transcriber, no microphone, `off`.
+        "voiceTry": ["resolved", 0, 0, false, "off"],
         "states": host["states"],
-        "handed": {"catalog": "smoke", "model": "smoke-stt", "language": "es"}, "voiceOnly": 0,
+        "handed": {"catalog": "smoke", "model": "smoke-stt"},
         "devices": [["mic-a"], ["Speakers B"], null, true],
         "chosen": ["mic-a", "out-b", [["input", "mic-a"], ["output", "out-b"]]],
         "deviceGone": [null, "mic-a", ["input", null], null],

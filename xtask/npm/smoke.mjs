@@ -1,7 +1,7 @@
 // `cargo xtask npm-smoke` (xtask/src/npm.rs) runs this from a directory where @sidevoice/voice was installed from
 // its tarball, as a consumer installs it: the package as Node resolves it, its wasm (the file named by the first
-// argument, relative to the entry point) read from node_modules, and a call started on plain-object models (the
-// interfaces of js/voice-models.d.ts) and a plain-object microphone and speaker, and the default web microphone and
+// argument, relative to the entry point) read from node_modules, and calls started with both halves and with the output
+// half alone on plain-object models (the interfaces of js/voice-models.d.ts) and a plain-object microphone and speaker, and the default web microphone and
 // speaker on a fake browser. It prints what it saw; the checks are xtask's.
 import { readFileSync } from "node:fs";
 import { runInNewContext } from "node:vm";
@@ -10,7 +10,7 @@ import { createVoiceHost, createWebAudioIo, initSync, VoiceCall } from "@sidevoi
 const wasm = new URL(process.argv[2], import.meta.resolve("@sidevoice/voice"));
 initSync({ module: readFileSync(wasm) });
 
-// The page's models, as the call loads them: each load records the slots it filled.
+// The page's models, as the call loads them: each load records the slot it filled.
 const loaded = [];
 const detector = () => {
   let end = 0;
@@ -29,26 +29,26 @@ const detector = () => {
     async reset() { end = 0; pending = 0; },
   };
 };
-const models = {
-  async load() {
-    loaded.push("vad", "transcriber", "speaker");
-    return {
-      createVad: detector,
-      transcriber: { transcribe: async () => "" },
-      speaker: { speak: async () => ({ samples: new Float32Array(160), sampleRate: 16000 }) },
-    };
-  },
+const transcriber = { transcribe: async () => "" };
+const speakerModel = { speak: async () => ({ samples: new Float32Array(160), sampleRate: 16000 }) };
+const inputModels = {
+  async vad() { loaded.push("vad"); return detector(); },
+  async transcriber() { loaded.push("transcriber"); return transcriber; },
 };
+const outputModels = { async speaker() { loaded.push("speaker"); return speakerModel; } };
 
 let ioStarted = false;
+// Whether each start asked for the microphone.
+const ioInputs = [];
 // The microphone answers a little later, as a permission prompt does: the call must not listen before it is ready.
 let ready = false;
 let listenedEarly = false;
 let speaker = null;
 const switched = [];
 const io = {
-  start(sink) {
+  start(sink, options) {
     ioStarted = true;
+    ioInputs.push(options?.input);
     speaker = sink;
     setTimeout(() => {
       ready = true;
@@ -56,6 +56,7 @@ const io = {
       sink.captured(new Float32Array(160));
     }, 50);
   },
+  setInput() {},
   // Plays at once: each chunk starts and ends as it is queued.
   play(utterance, chunk) {
     speaker.chunkStarted(utterance, chunk);
@@ -68,10 +69,16 @@ const io = {
   async setOutputDevice(id) { switched.push(["output", id]); },
   stop() {},
 };
+const until = async (done) => {
+  for (let waited = 0; !done() && waited < 5000; waited += 10) await new Promise((r) => setTimeout(r, 10));
+};
 
 // Models dropped as the call stops, so no timer of theirs keeps Node running after the last check.
-const config = { language: "en", idle_unload_minutes: 0 };
-const call = VoiceCall.create(models, config, { io });
+const call = VoiceCall.create({
+  input: { models: inputModels, language: "en" },
+  output: { models: outputModels },
+  idle_unload_minutes: 0,
+}, { io });
 let state = null;
 const errors = [];
 call.onEvent((event) => {
@@ -82,17 +89,13 @@ call.onEvent((event) => {
   if (event.type === "error") errors.push(event.data.code);
 });
 call.start();
-for (let waited = 0; state?.listening !== "listening" && errors.length === 0 && waited < 5000; waited += 10) {
-  await new Promise((resolve) => setTimeout(resolve, 10));
-}
+await until(() => state?.listening === "listening" || errors.length > 0);
 // The microphone's device going quiet and giving audio again: the call's state says each.
 const microphone = [];
 for (const muted of [true, false]) {
   speaker.microphoneMuted(muted);
   const want = muted ? "muted" : "live";
-  for (let waited = 0; state?.microphone !== want && waited < 5000; waited += 10) {
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
+  await until(() => state?.microphone === want);
   microphone.push(state?.microphone);
 }
 // Something said: its handle tells the steps and how it ended.
@@ -104,25 +107,33 @@ const said = { id: typeof saying.id, steps, outcome };
 call.stop();
 const callLoaded = loaded.slice();
 const callState = state;
+// A call with only an output half: it loads the speaker alone, asks for no microphone, and its state says `off`.
+loaded.length = 0;
+ready = false;
+const speaking = VoiceCall.create({ output: { models: outputModels }, idle_unload_minutes: 0 }, { io });
+let speakingState = null;
+speaking.onEvent((event) => { if (event.type === "state") speakingState = event.data; });
+speaking.start();
+await until(() => speakingState?.listening === "off");
+const outputOnly = { loaded: loaded.slice(), input: ioInputs.at(-1), listening: speakingState?.listening };
+speaking.stop();
 
-// The voice seam on a page's source of the same models: refusals by code, flags set before the settings kept, the
-// slots handed to the source as the page wrote them and a change of voice that asks it nothing, a start that resolves
-// once listening and at once after, a start straight after a stop that listens, the models loaded again after a stop
-// with 0 idle minutes, a live switch to smart-turn with an end-of-turn model, and smart-turn refused without one.
+// The voice seam on a page's source of the same models, slot by slot: a choice it refuses, by code; the transcriber's
+// choice handed as the page wrote it (its language no part of it); a mute right after the start kept; two calls on the
+// same choices loading nothing twice; a voice try (output only) loading no detector nor transcriber and asking for no
+// microphone; a call loaded again after a stop with 0 idle minutes; smart with an end-of-turn model, and refused
+// without one.
 const code = (promise) => promise.then(() => "resolved", (error) => error.code);
-const asked = [];
+const asked = { vad: 0, transcriber: [], speaker: 0, endOfTurn: 0 };
 const source = {
-  models: async (settings) => {
-    asked.push(settings);
-    if (settings.stt.model !== "smoke-stt") throw Object.assign(new Error("unknown"), { code: "model-unknown" });
-    // A build that comes with an end-of-turn model, for smart-turn.
-    return settings.stt.build === "ends-turns" ? ending : models;
+  async vad() { asked.vad++; return { createVad: detector }; },
+  async transcriber(choice) {
+    asked.transcriber.push(choice);
+    if (choice.model !== "smoke-stt") throw Object.assign(new Error("unknown"), { code: "model-unknown" });
+    return transcriber;
   },
-};
-const ending = {
-  async load() {
-    return { ...(await models.load()), endOfTurn: { endOfTurn: async () => 0.9 } };
-  },
+  async speaker() { asked.speaker++; return speakerModel; },
+  async endOfTurn() { asked.endOfTurn++; return { endOfTurn: async () => 0.9 }; },
 };
 // The browser's audio devices, as it lists them, and its devicechange.
 let deviceList = [
@@ -139,36 +150,33 @@ const sharedIo = { outputSelectable: io.outputSelectable,
   attach() { return { io, input: {} }; }, routeInput: async () => {},
   setInputDevice: io.setInputDevice, setOutputDevice: io.setOutputDevice };
 const owner = createVoiceHost(source, { io: sharedIo });
-const voice = owner.createCall();
+const stt = { catalog: "smoke", model: "smoke-stt", language: "es" };
+const settings = {
+  input: { stt, endOfTurn: { kind: "silence" }, patience: "fast" },
+  output: { tts: { catalog: "smoke", model: "smoke-tts" } },
+  idle_unload_minutes: 0,
+};
+const host = {};
+const refused = owner.start({ ...settings, input: { ...settings.input, stt: { model: "nope" } } });
+host.unknown = await code(refused.ready);
+await refused.stop();
+const voice = owner.start(settings);
+// Muted right after the start: the call starts that way.
+voice.mute(true);
 const playbackLevels = [];
 const unsubscribePlayback = voice.onPlaybackLevel((level) => playbackLevels.push(level));
 voice.onPlaybackLevel(() => { throw new Error("isolated listener"); });
 const secondPlayback = [];
 voice.onPlaybackLevel((level) => secondPlayback.push(level));
 const states = [];
-const seen = [];
 const hostErrors = [];
-voice.onState((s) => {
-  states.push(s.listening);
-  seen.push(s);
-});
+voice.onState((s) => states.push(s.listening));
 voice.onError((e) => hostErrors.push(e.code));
-const until = async (done) => {
-  for (let waited = 0; !done() && waited < 5000; waited += 10) await new Promise((r) => setTimeout(r, 10));
-};
-const host = { missing: await code(voice.start()) };
+host.started = await code(voice.ready);
 await owner.routeInput(voice);
-// Said before any settings: there is no call, so it is not played.
-host.early = (await voice.say("Too early.").outcome).status;
-// Muted before any settings: the call they create must start that way.
-voice.mute(true);
-host.unknown = await code(voice.setSettings({ stt: { model: "nope" }, tts: { model: "smoke-tts" } }));
-await voice.setSettings({
-  stt: { catalog: "smoke", model: "smoke-stt", language: "es" }, tts: { catalog: "smoke", model: "smoke-tts" },
-  patience: "fast", idle_unload_minutes: 0,
-});
-host.handed = asked.at(-1).stt;
-host.started = await code(voice.start());
+host.handed = asked.transcriber.at(-1);
+host.flags = [states.find((listening) => listening !== "idle")];
+voice.mute(false);
 speaker.rendered(new Float32Array(512).fill(0.5));
 speaker.captured(new Float32Array(512));
 await until(() => playbackLevels.some((level) => level > 0));
@@ -179,17 +187,6 @@ speaker.rendered(new Float32Array(512).fill(0.5));
 speaker.captured(new Float32Array(512));
 await until(() => secondPlayback.length > playbackLevels.length);
 host.playbackLevels = [playbackLevels.some((level) => level > 0), playbackLevels.at(-1), secondPlayback.some((level) => level > 0)];
-// Another voice and speed are the call's own: the source is not asked again.
-const asks = asked.length;
-await voice.setSettings({
-  stt: { model: "smoke-stt", catalog: "smoke", language: "es" }, tts: { catalog: "smoke", model: "smoke-tts", voice: "other", speed: 1.2 },
-  patience: "fast", idle_unload_minutes: 0,
-});
-host.voiceOnly = asked.length - asks;
-const first = seen.find((s) => s.listening !== "idle");
-host.flags = [first?.listening];
-voice.mute(false);
-host.again = await code(voice.start());
 // Audio devices with the call listening: the list (the default one is no entry: it is null), a choice the io switches
 // to at once, and the chosen microphone gone: the default one again, said once with the list.
 const listed = await owner.audioDevices();
@@ -205,51 +202,57 @@ host.deviceGone = [told[0].input, told[0].lost?.input ?? null, switched.at(-1), 
 // Said with the call listening: heard, its handle telling how.
 const sayingHost = voice.say("The host says this.", { language: "en" });
 host.said = [typeof sayingHost.cancel, (await sayingHost.outcome).status];
-// A start that asks for a take: what the microphone gives from then on, handed to `onTake` before the stop resolves.
+// A second call on the same choices while the first runs: nothing is loaded twice. (The smoke's io is one for every
+// call: the second takes its sink, so this comes last for the first.)
+const loadsBefore = [asked.vad, asked.transcriber.length, asked.speaker];
+const second = owner.start(settings);
+await second.ready;
+host.reused = [asked.vad, asked.transcriber.length, asked.speaker].map((count, slot) => count - loadsBefore[slot]);
+await second.stop();
 await voice.stop();
+host.stoppedSay = (await voice.say("Too late.").outcome).status;
+// A start that asks for a take: what the microphone gives from then on, handed to `onTake` before the stop resolves.
+const taking = owner.start(settings, { take: true });
 const takes = [];
-voice.onTake((take) => takes.push(take));
-await voice.start({ take: true });
+taking.onTake((take) => takes.push(take));
+await taking.ready;
 speaker.captured(new Float32Array(1600).fill(0.25));
 await new Promise((resolve) => setTimeout(resolve, 50));
-await voice.stop();
+await taking.stop();
 host.take = takes.map((take) => [take.sampleRate, take.samples.constructor.name, take.samples.length, take.ended_at - take.started_at, take.turns.length]);
-await voice.start();
-// A stop and a start straight after it, both awaited, no pause: the call ends up listening.
-await voice.stop();
-host.restarted = await code(voice.start());
-await new Promise((resolve) => setTimeout(resolve, 100));
-host.afterRestart = states.at(-1);
 // Stopped with 0 idle minutes, the models leave memory; the next start loads them again.
-await voice.stop();
-await until(() => states.at(-1) === "idle");
 await new Promise((resolve) => setTimeout(resolve, 50));
-const loadsBefore = loaded.length;
-await voice.start();
-host.reloaded = (loaded.length - loadsBefore) / 3;
-// Silence → smart-turn on the live call, with models that end turns: it keeps listening.
-const errorsBefore = hostErrors.length;
-await voice.setSettings({
-  stt: { model: "smoke-stt", build: "ends-turns" }, tts: { model: "smoke-tts" }, end_of_turn: "smart-turn",
-  idle_unload_minutes: 0,
-});
-await new Promise((resolve) => setTimeout(resolve, 100));
-host.smartLive = [states.at(-1), hostErrors.slice(errorsBefore)];
-await voice.stop();
-await voice.setSettings({
-  stt: { model: "smoke-stt" }, tts: { model: "smoke-tts" }, end_of_turn: "smart-turn", idle_unload_minutes: 0,
-});
-host.smartMissing = await code(voice.start());
-await until(() => states.at(-1) === "idle");
+const vadsBefore = asked.vad;
+const again = owner.start(settings);
+await again.ready;
+host.reloaded = asked.vad - vadsBefore;
+await again.stop();
+// A voice try: only the output half. No detector, no transcriber, no microphone; its state says `off`.
+const beforeTry = [asked.vad, asked.transcriber.length];
+const voiceTry = owner.start({ output: settings.output, idle_unload_minutes: 0 });
+const tryStates = [];
+voiceTry.onState((s) => tryStates.push(s.listening));
+host.voiceTry = [await code(voiceTry.ready), asked.vad - beforeTry[0], asked.transcriber.length - beforeTry[1], ioInputs.at(-1)];
+await voiceTry.stop();
+host.voiceTry.push(tryStates[0]);
+// Smart, with an end-of-turn model: it listens, the model loaded once; a source without one refuses it.
+const smart = owner.start({ ...settings, input: { ...settings.input, endOfTurn: { kind: "smart" } } });
+host.smart = [await code(smart.ready), asked.endOfTurn];
+await smart.stop();
+const { endOfTurn: _none, ...withoutTurns } = source;
+const refusing = createVoiceHost(withoutTurns, { io: sharedIo }).start({ ...settings, input: { ...settings.input, endOfTurn: { kind: "smart" } } });
+host.smartMissing = await code(refusing.ready);
+await refusing.stop();
 host.states = states;
+host.errors = hostErrors;
 host.seam = Object.keys(owner).sort();
 host.callSeam = Object.keys(voice).sort();
 
 // The browser's own microphone and speaker (createWebAudioIo) over a fake getUserMedia and Web Audio: a chosen
 // microphone, switched mid-call (the new one open before the old one is let go, the worklet kept), the chosen one
 // gone (the default one again, said through onDeviceLost, the call going on), the output chosen with setSinkId, and the
-// default one gone (the call ends: microphone-lost).
-const webAudio = { asked: [], stopped: [], sinks: [], lost: [], failed: [], muted: [], ready: 0 };
+// default one gone (the microphone lost, the speaker going on).
+const webAudio = { asked: [], stopped: [], sinks: [], lost: [], inputLost: [], failed: [], muted: [], ready: 0 };
 let opened = 0;
 // Whether the next microphone's track starts muted.
 let startsMuted = false;
@@ -282,15 +285,16 @@ globalThis.AudioContext = class {
 const webIo = createWebAudioIo({ inputDevice: "mic-a", onDeviceLost: (kind, id) => webAudio.lost.push([kind, id]) });
 webIo.start({
   ready: () => webAudio.ready++, captured() {}, rendered() {}, playbackEnded() {}, chunkStarted() {}, chunkPlayed() {},
-  microphoneMuted: (muted) => webAudio.muted.push(muted), failed: (code) => webAudio.failed.push(code),
-});
+  microphoneMuted: (muted) => webAudio.muted.push(muted), inputLost: (code) => webAudio.inputLost.push(code),
+  failed: (code) => webAudio.failed.push(code),
+}, { input: true });
 await until(() => webAudio.ready > 0);
 await webIo.setInputDevice("mic-b");
 await webIo.setOutputDevice("out-c");
 lastStream.track.onended();
 await until(() => webAudio.lost.length > 0);
 lastStream.track.onended();
-await until(() => webAudio.failed.length > 0);
+await until(() => webAudio.inputLost.length > 0);
 webAudio.outputSelectable = webIo.outputSelectable;
 webAudio.worklets = worklets.length;
 const devicesSeen = structuredClone(webAudio);
@@ -306,8 +310,9 @@ createWebAudioIo().start({
   chunkStarted() {},
   chunkPlayed() {},
   microphoneMuted: (muted) => heard.push(muted ? "muted" : "unmuted"),
+  inputLost: (code) => heard.push(code),
   failed: (code) => heard.push(code),
-});
+}, { input: true });
 await until(() => heard.includes("ready"));
 lastStream.track.onunmute?.();
 lastStream.track.onmute?.();
@@ -470,6 +475,7 @@ console.log(
   JSON.stringify({
     wasm: wasm.pathname,
     loaded: callLoaded,
+    outputOnly,
     ioStarted,
     listenedEarly,
     said,

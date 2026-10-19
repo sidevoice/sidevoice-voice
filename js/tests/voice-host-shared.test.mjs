@@ -6,23 +6,33 @@ const code = await readFile(new URL("../voice-host.js", import.meta.url), "utf8"
 const made = [];
 const moduleText = code
   .replace('import { VoiceCall as WasmVoiceCall } from "../dist/sidevoice_voice.js";',
-    'const WasmVoiceCall = { create(models, io) { const call = new FakeCall(models, io); made.push(call); return call; } };')
+    'const WasmVoiceCall = { create(io, setup) { const call = new FakeCall(io, setup); made.push(call); return call; } };')
   .replace('import { createSharedWebAudioIo } from "./shared-web-audio-io.js";',
     'const createSharedWebAudioIo = () => { throw new Error("unexpected browser audio"); };')
   .replace('const fail =', 'const made = globalThis.__made; const FakeCall = globalThis.__FakeCall; const fail =');
+
+// The wasm call as far as the host sees it: it loads what its halves use, slot by slot, opens its lane asking for the
+// microphone only with an input half, and says it listens (or is `off` without one).
 class FakeCall {
-  constructor(models, io) { this.models = models; this.io = io; this.events = []; this.says = []; }
+  constructor(io, setup) { this.io = io; this.setup = setup; this.loaded = {}; }
   onEvent(listener) { this.listener = listener; }
   mute() {}
   start() {
-    this.models.load().then(async (loaded) => {
-      this.loaded = { ...loaded, vad: await loaded.createVad() };
-      this.io.start({ ready: () => this.listener({ type: "state", data: { listening: "listening" } }), captured: () => {} });
-    });
+    const { input, output } = this.setup;
+    const smart = input?.end_of_turn?.kind === "smart";
+    Promise.all([
+      input ? input.models.vad() : null,
+      input ? input.models.transcriber() : null,
+      smart ? (input.models.endOfTurn ? input.models.endOfTurn() : Promise.reject(Object.assign(new Error(), { code: "end-of-turn-missing" }))) : null,
+      output ? output.models.speaker() : null,
+    ]).then(([vad, transcriber, endOfTurn, speaker]) => {
+      this.loaded = { vad, transcriber, endOfTurn, speaker };
+      const listening = input ? "listening" : "off";
+      this.io.start({ ready: () => this.listener({ type: "state", data: { listening } }), captured: () => {} }, { input: !!input });
+    }, (error) => this.listener({ type: "error", data: { code: error.code } }));
   }
   stop() { this.io.stop(); this.listener({ type: "state", data: { listening: "idle" } }); }
-  setConfig() {}
-  setModels(models) { this.models = models; }
+  free() { this.freed = true; }
   cancelInput() {}
   endInput() { this.ended = (this.ended ?? 0) + 1; return Promise.resolve(); }
   say() { return { id: "say", outcome: Promise.resolve({ status: "heard" }), cancel() {}, onEvent() {} }; }
@@ -38,7 +48,7 @@ function audio() {
     attached,
     attach() {
       const port = {};
-      const io = { start(sink) { this.sink = sink; sink.ready(); }, stop() { this.sink = null; }, dispose() { this.disposed = true; } };
+      const io = { start(sink, options) { this.sink = sink; this.input = options?.input; sink.ready(); }, stop() { this.sink = null; }, dispose() { this.disposed = true; } };
       attached.push({ port, io });
       return { io, input: port };
     },
@@ -46,140 +56,172 @@ function audio() {
     get routed() { return routed; },
   };
 }
-const settings = { stt: { model: "same" }, tts: { model: "same" } };
+
+/** A source that counts its loads, slot by slot, and gives each detector stream a number. */
+function counting(overrides = {}) {
+  const loads = { vad: 0, stt: 0, tts: 0, turn: 0 };
+  let streams = 0;
+  const source = {
+    loads,
+    vad: async () => { loads.vad++; return { createVad: () => ({ stream: ++streams }) }; },
+    transcriber: async (choice) => { loads.stt++; return { choice }; },
+    speaker: async (choice) => { loads.tts++; return { choice }; },
+    endOfTurn: async (choice) => { loads.turn++; return { choice }; },
+    ...overrides,
+  };
+  return source;
+}
+
+const input = { stt: { model: "whisper", language: "es" }, endOfTurn: { kind: "silence" } };
+const output = { tts: { model: "kokoro" }, voice: "ef_dora" };
+const both = { input, output };
+
 test("two calls share loaded weights but get separate detector streams and audio lanes", async () => {
   const io = audio();
-  let loads = 0;
-  let detectors = 0;
-  const owner = createVoiceHost({ models: async () => ({ load: async () => {
-    loads++;
-    return { createVad: () => ({ stream: ++detectors }), transcriber: {}, speaker: {} };
-  } }) }, { io });
-  const a = owner.createCall();
-  const b = owner.createCall();
-  await Promise.all([a.setSettings(settings), b.setSettings(settings)]);
-  await Promise.all([a.start(), b.start()]);
-  assert.equal(loads, 1);
+  const source = counting();
+  const owner = createVoiceHost(source, { io });
+  const a = owner.start(both);
+  const b = owner.start(both);
+  await Promise.all([a.ready, b.ready]);
+  assert.deepEqual(source.loads, { vad: 1, stt: 1, tts: 1, turn: 0 });
   assert.notEqual(made.at(-2).loaded.vad, made.at(-1).loaded.vad);
   assert.equal(made.at(-2).loaded.transcriber, made.at(-1).loaded.transcriber);
+  assert.deepEqual(made.at(-1).loaded.transcriber.choice, { model: "whisper" }, "the language chooses no model");
   assert.equal(io.attached.length, 2);
   await owner.routeInput(b);
   assert.equal(io.routed, io.attached[1].port);
   await a.stop();
-  assert.equal(loads, 1);
-  assert.equal(io.attached[1].io.sink !== null, true);
-  await a.dispose();
   assert.equal(io.attached[0].io.disposed, true);
-  await b.dispose();
+  assert.equal(made.at(-2).freed, true);
+  assert.equal(io.attached[1].io.sink !== null, true);
+  await b.stop();
   assert.equal(io.attached[1].io.disposed, true);
 });
 
-test("calls reject routing to an alien or disposed handle", async () => {
-  const one = createVoiceHost({ models: () => ({}) }, { io: audio() });
-  const two = createVoiceHost({ models: () => ({}) }, { io: audio() });
-  const a = one.createCall();
-  await assert.rejects(one.routeInput(two.createCall()), TypeError);
-  await a.dispose();
+test("a half that is absent is neither loaded nor opened", async () => {
+  const io = audio();
+  const source = counting();
+  const owner = createVoiceHost(source, { io });
+  const states = [];
+  const listening = owner.start({ output });
+  listening.onState((state) => states.push(state.listening));
+  await listening.ready;
+  assert.deepEqual(source.loads, { vad: 0, stt: 0, tts: 1, turn: 0 }, "a voice try loads no detector nor transcriber");
+  assert.equal(io.attached.at(-1).io.input, false, "and asks for no microphone");
+  assert.deepEqual(states, ["off"]);
+  assert.equal(made.at(-1).setup.input, undefined);
+  const transcribing = owner.start({ input: { stt: input.stt, endOfTurn: { kind: "silence", ms: 1500 } } });
+  await transcribing.ready;
+  assert.deepEqual(source.loads, { vad: 1, stt: 1, tts: 1, turn: 0 }, "a transcription try loads no speaker");
+  assert.equal(io.attached.at(-1).io.input, true);
+  assert.deepEqual(made.at(-1).setup.input.end_of_turn, { kind: "silence", ms: 1500 });
+  assert.equal(made.at(-1).setup.output, undefined);
+  await Promise.all([listening.stop(), transcribing.stop()]);
+  assert.throws(() => owner.start({}), TypeError);
+});
+
+test("silence loads no end-of-turn model; smart loads the one it names", async () => {
+  const source = counting();
+  const owner = createVoiceHost(source, { io: audio() });
+  const silent = owner.start(both);
+  await silent.ready;
+  assert.equal(source.loads.turn, 0);
+  assert.equal(made.at(-1).setup.input.models.endOfTurn, undefined);
+  const smart = owner.start({ ...both, input: { ...input, endOfTurn: { kind: "smart", model: { model: "smart-turn-v3" } } } });
+  await smart.ready;
+  assert.equal(source.loads.turn, 1);
+  assert.deepEqual(made.at(-1).loaded.endOfTurn.choice, { model: "smart-turn-v3" });
+  assert.deepEqual(made.at(-1).setup.input.end_of_turn, { kind: "smart" });
+  await Promise.all([silent.stop(), smart.stop()]);
+  const { endOfTurn: _none, ...withoutTurns } = counting();
+  const refused = createVoiceHost(withoutTurns, { io: audio() }).start({ input: { ...input, endOfTurn: { kind: "smart" } } });
+  await assert.rejects(refused.ready, { code: "end-of-turn-missing" });
+  await refused.stop();
+});
+
+test("a call after a try reuses the models the try loaded: nothing loads twice", async () => {
+  const source = counting();
+  const owner = createVoiceHost(source, { io: audio() });
+  const transcription = owner.start({ input, idle_unload_minutes: 0 });
+  await transcription.ready;
+  await transcription.stop();
+  // Let go at once with 0 idle minutes: the next one loads again.
+  const voice = owner.start({ output, idle_unload_minutes: 10 });
+  await voice.ready;
+  await voice.stop();
+  const call = owner.start({ ...both, idle_unload_minutes: 10 });
+  await call.ready;
+  assert.deepEqual(source.loads, { vad: 2, stt: 2, tts: 1, turn: 0 }, "the voice try's speaker is the call's");
+  const again = owner.start({ ...both, idle_unload_minutes: 10 });
+  await again.ready;
+  assert.deepEqual(source.loads, { vad: 2, stt: 2, tts: 1, turn: 0 });
+  await Promise.all([call.stop(), again.stop()]);
+});
+
+test("calls reject routing to an alien or stopped handle", async () => {
+  const one = createVoiceHost(counting(), { io: audio() });
+  const two = createVoiceHost(counting(), { io: audio() });
+  const a = one.start(both);
+  await assert.rejects(one.routeInput(two.start(both)), TypeError);
+  await a.stop();
   await assert.rejects(one.routeInput(a), TypeError);
 });
 
+test("a model that cannot load rejects ready with its code, and a stop before ready rejects it as stopped", async () => {
+  const owner = createVoiceHost(counting({ transcriber: async () => { throw Object.assign(new Error("gone"), { code: "model-unknown" }); } }), { io: audio() });
+  const failing = owner.start(both);
+  const errors = [];
+  failing.onError((error) => errors.push(error.code));
+  await assert.rejects(failing.ready, { code: "model-unknown" });
+  assert.deepEqual(errors, ["model-unknown"]);
+  await failing.stop();
+  const early = createVoiceHost(counting({ vad: () => new Promise(() => {}) }), { io: audio() }).start(both);
+  const stopped = early.stop();
+  await assert.rejects(early.ready, { code: "stopped" });
+  await stopped;
+});
+
 test("a running call's failure releases its model lease at idle", async () => {
-  let loads = 0;
-  const owner = createVoiceHost({ models: () => ({ load: async () => {
-    loads++;
-    return { createVad: () => ({}), transcriber: {}, speaker: {} };
-  } }) }, { io: audio() });
-  const a = owner.createCall();
-  await a.setSettings({ ...settings, idle_unload_minutes: 0 });
-  await a.start();
+  const source = counting();
+  const owner = createVoiceHost(source, { io: audio() });
+  const a = owner.start({ ...both, idle_unload_minutes: 0 });
+  await a.ready;
   const nativeA = made.at(-1);
   nativeA.listener({ type: "error", data: { code: "microphone-lost" } });
   nativeA.listener({ type: "state", data: { listening: "idle" } });
-  const b = owner.createCall();
-  await b.setSettings({ ...settings, idle_unload_minutes: 0 });
-  await b.start();
-  assert.equal(loads, 2, "a failed call still held in the map does not pin the weights");
+  const b = owner.start({ ...both, idle_unload_minutes: 0 });
+  await b.ready;
+  assert.equal(source.loads.stt, 2, "a failed call still held in the map does not pin the weights");
   await b.stop();
-  await a.dispose();
-  await b.dispose();
-});
-
-test("a second live call keeps shared weights through the first call's failure", async () => {
-  let loads = 0;
-  const owner = createVoiceHost({ models: () => ({ load: async () => {
-    loads++;
-    return { createVad: () => ({}), transcriber: {}, speaker: {} };
-  } }) }, { io: audio() });
-  const a = owner.createCall();
-  const b = owner.createCall();
-  await Promise.all([a.setSettings({ ...settings, idle_unload_minutes: 0 }), b.setSettings({ ...settings, idle_unload_minutes: 0 })]);
-  await Promise.all([a.start(), b.start()]);
-  const nativeA = made.at(-2);
-  nativeA.listener({ type: "error", data: { code: "audio-output-failed" } });
-  nativeA.listener({ type: "state", data: { listening: "idle" } });
-  const c = owner.createCall();
-  await c.setSettings({ ...settings, idle_unload_minutes: 0 });
-  await c.start();
-  assert.equal(loads, 1);
-  await a.dispose();
-  await b.dispose();
-  await c.dispose();
-});
-
-test("two idle calls evict one shared load and the next use reloads it", async () => {
-  let loads = 0;
-  const owner = createVoiceHost({ models: () => ({ load: async () => {
-    loads++;
-    return { createVad: () => ({}), transcriber: {}, speaker: {} };
-  } }) }, { io: audio() });
-  const a = owner.createCall(); const b = owner.createCall();
-  await Promise.all([a.setSettings({ ...settings, idle_unload_minutes: 0 }), b.setSettings({ ...settings, idle_unload_minutes: 0 })]);
-  await Promise.all([a.start(), b.start()]);
-  assert.equal(loads, 1);
   await a.stop();
-  const c = owner.createCall();
-  await c.setSettings({ ...settings, idle_unload_minutes: 0 });
-  await c.start();
-  assert.equal(loads, 1, "B retains the shared choice");
-  await Promise.all([b.stop(), c.stop()]);
-  const d = owner.createCall();
-  await d.setSettings({ ...settings, idle_unload_minutes: 0 });
-  await d.start();
-  assert.equal(loads, 2, "the final idle lease evicted the choice");
-  await Promise.all([a.dispose(), b.dispose(), c.dispose(), d.dispose()]);
 });
 
 test("an active synthesis request keeps its shared choice while another call stops", async () => {
-  let loads = 0;
   let finish;
-  const owner = createVoiceHost({ models: () => ({ load: async () => {
-    loads++;
-    return { createVad: () => ({}), transcriber: {}, speaker: {
-      speak: () => new Promise((resolve) => { finish = resolve; }),
-    } };
-  } }) }, { io: audio() });
-  const a = owner.createCall(); const b = owner.createCall();
-  await Promise.all([a.setSettings({ ...settings, idle_unload_minutes: 0 }), b.setSettings({ ...settings, idle_unload_minutes: 0 })]);
-  await Promise.all([a.start(), b.start()]);
+  const source = counting({ speaker: async () => { source.loads.tts++; return { speak: () => new Promise((resolve) => { finish = resolve; }) }; } });
+  const owner = createVoiceHost(source, { io: audio() });
+  const a = owner.start({ ...both, idle_unload_minutes: 0 });
+  const b = owner.start({ ...both, idle_unload_minutes: 0 });
+  await Promise.all([a.ready, b.ready]);
   const request = made.at(-1).loaded.speaker.speak("reply");
   await a.stop();
-  const c = owner.createCall();
-  await c.setSettings({ ...settings, idle_unload_minutes: 0 });
-  await c.start();
-  assert.equal(loads, 1, "B's active request keeps the shared load");
+  const c = owner.start({ ...both, idle_unload_minutes: 0 });
+  await c.ready;
+  assert.equal(source.loads.tts, 1, "B keeps the shared load");
   finish({ samples: new Float32Array(0), sampleRate: 16000 });
   assert.equal((await request).sampleRate, 16000);
   await Promise.all([b.stop(), c.stop()]);
-  await Promise.all([a.dispose(), b.dispose(), c.dispose()]);
+  const d = owner.start({ ...both, idle_unload_minutes: 0 });
+  await d.ready;
+  assert.equal(source.loads.tts, 2, "the last stop let the choice go");
+  await d.stop();
 });
 
-test("endInput resolves at once before settings and reaches only its own call afterwards", async () => {
-  const owner = createVoiceHost({ models: async () => ({ load: async () => ({ createVad: () => ({}), transcriber: {}, speaker: {} }) }) }, { io: audio() });
-  const a = owner.createCall();
-  const b = owner.createCall();
-  await a.endInput();
-  await Promise.all([a.setSettings(settings), b.setSettings(settings)]);
-  await Promise.all([a.start(), b.start()]);
+test("endInput reaches only its own call, and resolves at once after stop", async () => {
+  const owner = createVoiceHost(counting(), { io: audio() });
+  const a = owner.start(both);
+  const b = owner.start(both);
+  await Promise.all([a.ready, b.ready]);
   const nativeA = made.at(-2);
   const nativeB = made.at(-1);
   await a.endInput();
@@ -187,7 +229,8 @@ test("endInput resolves at once before settings and reaches only its own call af
   assert.equal(nativeA.ended, 2);
   assert.equal(nativeB.ended, undefined);
   assert.equal(await a.endInput(), undefined);
-  await a.dispose();
-  await b.dispose();
+  await a.stop();
+  await b.stop();
   await a.endInput();
+  assert.equal(nativeA.ended, 3, "nothing reaches a stopped call");
 });

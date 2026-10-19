@@ -38,7 +38,7 @@ function sink() {
     rendered(frame) { events.rendered.push(frame); }, playbackEnded() { events.ended++; },
     chunkStarted(id, chunk) { events.chunks.push([id, chunk, "start"]); },
     chunkPlayed(id, chunk) { events.chunks.push([id, chunk, "end"]); },
-    microphoneMuted() {}, failed(code) { throw new Error(code); } };
+    microphoneMuted() {}, inputLost(code) { events.lost = [...(events.lost ?? []), code]; }, failed(code) { throw new Error(code); } };
 }
 
 test("one physical capture routes the next frame to one lane and zeros to the other", async () => {
@@ -47,7 +47,7 @@ test("one physical capture routes the next frame to one lane and zeros to the ot
   const a = audio.attach(); const b = audio.attach();
   await assert.rejects(audio.routeInput(a.input), TypeError);
   const as = sink(); const bs = sink();
-  a.io.start(as); b.io.start(bs);
+  a.io.start(as, { input: true }); b.io.start(bs, { input: true });
   for (let i = 0; i < 5 && (!as.events.ready || !bs.events.ready); i++) await new Promise((resolve) => setTimeout(resolve, 0));
   assert.equal(physical.opens, 1);
   assert.deepEqual([as.events.ready, bs.events.ready], [1, 1]);
@@ -72,12 +72,12 @@ test("stopping a routed lane lets another call open, and restart requires a fres
   const audio = createSharedWebAudioIo();
   const a = audio.attach(); const b = audio.attach();
   const first = sink();
-  a.io.start(first);
+  a.io.start(first, { input: true });
   for (let i = 0; i < 5 && !first.events.ready; i++) await new Promise((resolve) => setTimeout(resolve, 0));
   await audio.routeInput(a.input);
   a.io.stop();
   const second = sink();
-  b.io.start(second);
+  b.io.start(second, { input: true });
   for (let i = 0; i < 5 && !second.events.ready; i++) await new Promise((resolve) => setTimeout(resolve, 0));
   assert.equal(second.events.ready, 1);
   assert.equal(physical.opens, 2);
@@ -85,7 +85,7 @@ test("stopping a routed lane lets another call open, and restart requires a fres
   capture.port.onmessage({ data: { type: "captured", generation: 2, samples: new Float32Array(160).fill(0.8) } });
   assert.equal(second.events.captured.at(-1)[0], 0);
   const restarted = sink();
-  a.io.start(restarted);
+  a.io.start(restarted, { input: true });
   for (let i = 0; i < 5 && !restarted.events.ready; i++) await new Promise((resolve) => setTimeout(resolve, 0));
   capture.port.onmessage({ data: { type: "captured", generation: 2, samples: new Float32Array(160).fill(0.8) } });
   assert.equal(restarted.events.captured.at(-1)[0], 0);
@@ -100,7 +100,7 @@ test("posted old frames retain their lane until the route fence, including null 
   const audio = createSharedWebAudioIo();
   const a = audio.attach(); const b = audio.attach();
   const as = sink(); const bs = sink();
-  a.io.start(as); b.io.start(bs);
+  a.io.start(as, { input: true }); b.io.start(bs, { input: true });
   for (let i = 0; i < 5 && (!as.events.ready || !bs.events.ready); i++) await new Promise((resolve) => setTimeout(resolve, 0));
   const capture = physical.nodes.find((node) => node.name === "sidevoice-capture");
   await audio.routeInput(a.input);
@@ -128,7 +128,7 @@ test("independent playback meters report only their own lane", async () => {
   const audio = createSharedWebAudioIo();
   const a = audio.attach(); const b = audio.attach();
   const as = sink(); const bs = sink();
-  a.io.start(as); b.io.start(bs);
+  a.io.start(as, { input: true }); b.io.start(bs, { input: true });
   for (let i = 0; i < 5 && (!as.events.ready || !bs.events.ready); i++) await new Promise((resolve) => setTimeout(resolve, 0));
   const meters = physical.nodes.filter((node) => node.name === "sidevoice-playback");
   assert.equal(meters.length, 2);
@@ -198,7 +198,7 @@ test("a cut emits terminal zero before successor playback telemetry", async () =
   const audio = createSharedWebAudioIo();
   const lane = audio.attach();
   const heard = sink();
-  lane.io.start(heard);
+  lane.io.start(heard, { input: true });
   for (let i = 0; i < 5 && !heard.events.ready; i++) await new Promise((resolve) => setTimeout(resolve, 0));
   const meter = physical.nodes.find((node) => node.name === "sidevoice-playback");
   lane.io.play("first", 0, new Float32Array(160), 16000);
@@ -219,13 +219,13 @@ test("restarting one lane cannot deliver an old meter report to its new sink", a
   const audio = createSharedWebAudioIo();
   const a = audio.attach(); const b = audio.attach();
   const old = sink(); const other = sink();
-  a.io.start(old); b.io.start(other);
+  a.io.start(old, { input: true }); b.io.start(other, { input: true });
   for (let i = 0; i < 5 && !old.events.ready; i++) await new Promise((resolve) => setTimeout(resolve, 0));
   const oldMeter = physical.nodes.find((node) => node.name === "sidevoice-playback");
   a.io.play("old", 0, new Float32Array(160), 16000);
   a.io.stop();
   const next = sink();
-  a.io.start(next);
+  a.io.start(next, { input: true });
   for (let i = 0; i < 5 && !next.events.ready; i++) await new Promise((resolve) => setTimeout(resolve, 0));
   a.io.play("new", 0, new Float32Array(160), 16000);
   await Promise.resolve();
@@ -253,7 +253,7 @@ test("a context the browser suspended is resumed once the page is shown again, a
     const audio = createSharedWebAudioIo();
     const lane = audio.attach();
     const listener = sink();
-    lane.io.start(listener);
+    lane.io.start(listener, { input: true });
     await settle(() => listener.events.ready);
     const [context] = made;
     const before = resumes;
@@ -275,7 +275,7 @@ test("a context the browser suspended is resumed once the page is shown again, a
   }
 });
 
-test("an ended microphone is opened again from the system's default; only one that cannot be opened fails the calls", async () => {
+test("an ended microphone is opened again from the system's default; one that cannot be opened is lost, and the call goes on", async () => {
   const physical = browser();
   const tracks = [];
   const open = navigator.mediaDevices.getUserMedia;
@@ -284,12 +284,47 @@ test("an ended microphone is opened again from the system's default; only one th
   const lane = audio.attach();
   const failures = [];
   const listener = { ...sink(), failed: (code) => failures.push(code) };
-  lane.io.start(listener);
+  lane.io.start(listener, { input: true });
   await settle(() => listener.events.ready);
   await tracks[0].onended();
   assert.equal(physical.opens, 2, "the default microphone, opened again");
   assert.deepEqual(failures, [], "the call goes on");
   navigator.mediaDevices.getUserMedia = async () => { throw Object.assign(new Error("none"), { name: "NotFoundError" }); };
   await tracks[1].onended();
-  assert.deepEqual(failures, ["microphone-lost"]);
+  assert.deepEqual(listener.events.lost, ["microphone-lost"]);
+  assert.deepEqual(failures, [], "the speaker goes on");
+  assert.equal(physical.tracks, 2, "both microphones were released");
+});
+
+test("a lane that only speaks opens no microphone, and one that listens opens it without opening the devices again", async () => {
+  const physical = browser();
+  const audio = createSharedWebAudioIo();
+  const speaking = audio.attach(); const listening = audio.attach();
+  const ss = sink(); const ls = sink();
+  speaking.io.start(ss, { input: false });
+  await settle(() => ss.events.ready);
+  assert.equal(physical.opens, 0, "no getUserMedia for a call that only speaks");
+  listening.io.start(ls);
+  await settle(() => ls.events.ready);
+  assert.equal(physical.opens, 0, "nothing asked: no microphone");
+  listening.io.setInput(true);
+  await settle(() => false);
+  assert.equal(physical.opens, 1);
+  listening.io.setInput(false);
+  assert.equal(physical.tracks, 1, "closed once no lane asks for it");
+  listening.io.stop(); speaking.io.stop();
+  assert.equal(physical.closes, 1);
+});
+
+test("a microphone that cannot open is lost to the lanes that asked for it, and their speakers still open", async () => {
+  browser();
+  navigator.mediaDevices.getUserMedia = async () => { throw Object.assign(new Error("denied"), { name: "NotAllowedError" }); };
+  const audio = createSharedWebAudioIo();
+  const speaking = audio.attach(); const listening = audio.attach();
+  const ss = sink(); const ls = sink();
+  speaking.io.start(ss); listening.io.start(ls, { input: true });
+  await settle(() => ss.events.ready && ls.events.ready);
+  assert.deepEqual(ls.events.lost, ["microphone-denied"]);
+  assert.equal(ss.events.lost, undefined);
+  speaking.io.stop(); listening.io.stop();
 });

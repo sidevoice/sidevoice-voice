@@ -2,7 +2,7 @@
 //! tests read them too), a voice activity detector on energy that answers as a streaming detector does, and a
 //! configuration.
 
-use crate::config::VoiceConfig;
+use crate::config::{CallConfig, InputConfig, OutputConfig};
 use crate::turns::instant;
 
 /// LibriSpeech dev-clean 1272-128104-0000, English, 16 kHz mono (tests/fixtures/README.md).
@@ -89,10 +89,21 @@ impl EnergyVad {
     }
 }
 
-/// A configuration with the default numbers, for English.
-pub(crate) fn config() -> VoiceConfig {
-    VoiceConfig {
+/// A configuration with both halves and the default numbers, for English.
+pub(crate) fn config() -> CallConfig {
+    config_with(|_| {})
+}
+
+/// [`config`], its input half as `edit` leaves it.
+pub(crate) fn config_with(edit: impl FnOnce(&mut InputConfig)) -> CallConfig {
+    let mut input = InputConfig {
         language: Some("en".into()),
-        ..VoiceConfig::default()
+        ..InputConfig::default()
+    };
+    edit(&mut input);
+    CallConfig {
+        input: Some(input),
+        output: Some(OutputConfig::default()),
+        ..CallConfig::default()
     }
 }

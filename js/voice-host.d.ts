@@ -4,15 +4,19 @@
 //
 //   const voice = window.__sidevoiceDesktop?.host?.voice ?? createVoiceHost(source);
 //
-// where `source` is the page's `VoiceModelSource`: the models that fill the call's slots for the person's settings
-// (the page's, wired into `voice-models.d.ts`'s interfaces). Which models there are, and how a setting names one,
-// are the page's: the call reads a slot's language, voice and speed, and hands the rest of it to `source` as it is.
+// where `source` is the page's `VoiceModelSource`: the models that fill a call's slots, one slot at a time (the page's,
+// wired into `voice-models.d.ts`'s interfaces). Which models there are, and how a setting names one, are the page's:
+// the host reads a slot's language, voice and speed, and hands the rest of it to `source` as it is.
+//
+//   const call = voice.start({ input: { stt, endOfTurn: { kind: "silence", ms: 1500 } } }); // a transcription try
+//   const call = voice.start({ output: { tts, voice, speed } });                               // listen only: no mic
+//   await call.ready;
 //
 // Each call emits its own turns and saying outcomes (`voice-events.d.ts`).
 
 import type { WebAudioIoOptions } from "./web-audio-io.js";
 import type { SharedWebAudioIo } from "./shared-web-audio-io.js";
-import type { VoiceModels } from "./voice-models.js";
+import type { VoiceEndOfTurn, VoiceSpeaker, VoiceTranscriber, VoiceVad } from "./voice-models.js";
 import type {
   VoiceCallState,
   VoiceSaying,
@@ -21,36 +25,59 @@ import type {
   VoiceTurnEvent,
 } from "./voice-events.js";
 
-/** The person's choices. A slot's model is named as the page's `source` names it: the call hands everything in a slot
- *  but the fields below to `source.models(settings)`, and reads nothing else of it. */
-export interface VoiceSettings {
-  stt: {
-    /** A BCP 47 tag; null or absent to detect it. */
+/** A model as the page's `source` names it (`{catalog, model}`, say): the host hands it to `source` as it is, and two
+ *  choices with the same fields are the same model. */
+export interface VoiceModelChoice {
+  [choice: string]: unknown;
+}
+
+/** What ends a turn: a pause of `ms` after the detector says speech stopped (the patience's when absent; loads no
+ *  end-of-turn model), or the page's end-of-turn classifier (`model`, as the source names it; the source's own choice
+ *  when absent) at each pause. */
+export type VoiceEndOfTurnSettings =
+  | { kind: "silence"; ms?: number }
+  | { kind: "smart"; model?: VoiceModelChoice | null };
+
+/** The input half: the microphone, the detector, the transcriber and, for `smart`, the end-of-turn classifier. */
+export interface VoiceInputSettings {
+  /** The transcriber, as the source names it. */
+  stt: VoiceModelChoice & {
+    /** A BCP 47 tag; null or absent to detect it. Not part of the model's choice. */
     language?: string | null;
-    /** The model this slot takes, as the page's source names it. */
-    [choice: string]: unknown;
   };
-  tts: {
-    /** One of the model's voices; null or absent for the speaker's own choice. */
-    voice?: string | null;
-    speed?: number;
-    /** The model this slot takes, as the page's source names it. */
-    [choice: string]: unknown;
-  };
+  /** `{kind: "silence"}` when absent. */
+  endOfTurn?: VoiceEndOfTurnSettings;
   patience?: "fast" | "normal" | "calm";
-  /** `silence` by default; `smart-turn` needs `source` to give an end-of-turn model. */
-  end_of_turn?: "silence" | "smart-turn";
-  /** How long an unused model choice stays loaded, in minutes (10 by default; 0: release it at once). */
-  idle_unload_minutes?: number;
   /** Continuous raised-bar speech, in seconds, before sounding agent audio is cut (default 1.0). */
   barge_in_min_speech?: number;
 }
 
+/** The output half: the speaker model and the playback. */
+export interface VoiceOutputSettings {
+  /** The speaker model, as the source names it. */
+  tts: VoiceModelChoice;
+  /** One of the model's voices; null or absent for the speaker's own choice. */
+  voice?: string | null;
+  speed?: number;
+  /** The language of what is said when `say` gives none; absent: the input's. */
+  language?: string | null;
+}
+
+/** The person's choices for one call: each half optional, at least one. A half that is absent is neither loaded nor
+ *  opened: without `input` there is no microphone (a blocked one cannot fail the call), no detector and no transcriber;
+ *  without `output` no speaker model and no playback. Barge-in needs both. */
+export interface VoiceSettings {
+  input?: VoiceInputSettings | null;
+  output?: VoiceOutputSettings | null;
+  /** How long a model no call holds stays loaded, in minutes (10 by default; 0: let go at once). */
+  idle_unload_minutes?: number;
+}
+
 /** What a failed call rejects with, and what `onError` hears: rely on `code`. */
 export interface VoiceHostError {
-  /** `microphone-denied`, `microphone-unavailable`, `speaker-unavailable`, `audio-device-unavailable`,
-   *  `echo-cancellation-unavailable`, `settings-missing`, `stopped`, `end-of-turn-missing`, and the codes of the page's models and of its source's
-   *  refusals of settings, as they give them. */
+  /** `microphone-denied`, `microphone-unavailable`, `microphone-lost`, `speaker-unavailable`,
+   *  `audio-device-unavailable`, `echo-cancellation-unavailable`, `stopped`, `end-of-turn-missing`, and the codes of the
+   *  page's models and of its source's refusals of a choice, as they give them. */
   code: string;
   message?: string;
 }
@@ -76,9 +103,14 @@ export interface VoiceAudioDevices {
   lost?: { input?: string; output?: string };
 }
 
-/** A generic owner of shared devices and model loads. */
+/** The owner of the shared devices and of the models its calls load. */
 export interface VoiceHost {
-  createCall(): VoiceCallHost;
+  /** Starts a call with the halves of `settings`: it loads the models they use (each slot on its own, all at once; one
+   *  another call holds is not loaded again), opens the speaker and, with an input half, the microphone, and listens.
+   *  With `take`, the call keeps what the microphone gives from the moment it listens until that listening ends, and
+   *  hands it to `onTake` then; never otherwise. Answers at once; `ready` says when it works. Malformed settings, or
+   *  none of the halves, throw. */
+  start(settings: VoiceSettings, options?: { take?: boolean }): VoiceCallHost;
   /** Acknowledged next-frame switch; null supplies silence to every call. */
   routeInput(target: VoiceCallHost | null): Promise<void>;
   audioDevices(): Promise<VoiceAudioDevices>;
@@ -86,31 +118,23 @@ export interface VoiceHost {
   onAudioDevices(listener: (devices: VoiceAudioDevices) => void): () => void;
 }
 
-/** A call's state, events, and saying handles are independent of every other call. */
+/** One call: its state, events, and saying handles are independent of every other call. */
 export interface VoiceCallHost {
   readonly id: string;
-  dispose(): Promise<void>;
-
-  /** Sets the person's choices; the first creates the call. Rejects `VoiceHostError`. */
-  setSettings(settings: VoiceSettings): Promise<void>;
-  /** Loads the models, opens the microphone and the speaker, listens. `smart-turn` without an end-of-turn model
-   *  rejects `{code: "end-of-turn-missing"}`. Resolves once the microphone and the speaker work, at the first
-   *  state whose `listening` is not `idle` (at once if the call listens already; a second `start` while one is pending
-   *  settles with it). Rejects `VoiceHostError`; with `{code: "stopped"}` when `stop()` comes first. With `take`, the
-   *  call keeps what the microphone gives from the moment it listens until that listening ends, and hands it to
-   *  `onTake` then; never otherwise (a call is not recorded). A start while one runs changes nothing, its take
-   *  included. */
-  start(options?: { take?: boolean }): Promise<void>;
-  /** Stops listening and speaking: the turn not told yet is cancelled, and what is being said or waits to be ends
-   *  (`stopped`). The models stay loaded. Safe at any time; a `start` after it, awaited or not, starts the call
-   *  again. After a start that asked for a take, it resolves once the take was handed to `onTake`. */
+  /** Resolves once the call works: at its first state whose `listening` is not `idle` (`off` for a call without an
+   *  input half). Rejects `VoiceHostError`: a model that cannot load, the devices refused, `smart` without an
+   *  end-of-turn classifier (`end-of-turn-missing`), or `{code: "stopped"}` when `stop()` comes first. */
+  readonly ready: Promise<void>;
+  /** Ends the call: the turn not told yet is cancelled, what is being said or waits to be ends (`stopped`), its audio
+   *  lane is released, and the models it held are let go `idle_unload_minutes` later unless another call holds them.
+   *  After a start that asked for a take, it resolves once the take was handed to `onTake`. A second call answers the
+   *  first's promise. */
   stop(): Promise<void>;
   /** Says `text` after whatever is being said, once nothing of the person's holds it back. The handle tells its steps
-   *  and how it ended, and cancels it. Before `setSettings`, or with the call stopped, its outcome is `not-played`
-   *  (`stopped`). */
+   *  and how it ended, and cancels it. After `stop()` its outcome is `not-played` (`stopped`); without an output half,
+   *  `not-played` (`failed`, `output-missing`). */
   say(text: string, options?: VoiceSayOptions): VoiceSaying;
-  /** Mutes or unmutes the microphone; muting feeds silence and closes an open turn normally. Kept from the first call, even
-   *  before `setSettings`. */
+  /** Mutes or unmutes the microphone; muting feeds silence and closes an open turn normally. */
   mute(muted: boolean): void;
   /** Cancels what the person said that is not told yet. */
   cancelInput(): void;
@@ -119,8 +143,8 @@ export interface VoiceCallHost {
    *  playback, mute, other calls or how later turns end; the next utterance opens a fresh turn. Resolves once the turn
    *  is closed, not transcribed: the words arrive later as its `finished`, after the transcription and the merge window
    *  (a turn that opens within that window joins it, and this one is then `cancelled` with `merged`, its words carried
-   *  by the later `finished`). Mute is not a substitute: it is ordinary silence and does not end a turn. Before `setSettings`, or
-   *  with the call stopped, it resolves at once. */
+   *  by the later `finished`). Mute is not a substitute: it is ordinary silence and does not end a turn. After `stop()`
+   *  it resolves at once. */
   endInput(): Promise<void>;
   /** For each `turn_id`: `started`, then exactly one `finished` (the words) or `cancelled`. */
   onTurn(listener: (turn: VoiceTurnEvent) => void): () => void;
@@ -132,19 +156,29 @@ export interface VoiceCallHost {
    *  It continues while the microphone is muted. */
   onPlaybackLevel(listener: (level: number) => void): () => void;
   onError(listener: (error: VoiceHostError) => void): () => void;
-  /** The take of a start that asked for one (`start({take: true})`), once per stretch of listening, as it ends: before
-   *  `stop()` resolves, before the error that ended it, before a restart on other models listens again. Handed over:
-   *  the call keeps no copy. */
+  /** The take of a start that asked for one (`start(settings, {take: true})`), once per stretch of listening, as it
+   *  ends: before `stop()` resolves, before the error that ended it. Handed over: the call keeps no copy. */
   onTake(listener: (take: VoiceTake) => void): () => void;
 }
 
-/** The page's side of `createVoiceHost`: which models fill the call's slots. */
+/** A loaded voice activity detector, from which each call gets its own stream. */
+export interface VoiceVadModel {
+  createVad(): VoiceVad | Promise<VoiceVad>;
+}
+
+/** The page's side of `createVoiceHost`: the models that fill a call's slots, one slot at a time. Each method loads the
+ *  model and answers it (or a promise of it), or rejects `{code}` for a choice it cannot fill; the host asks only for
+ *  what a call's halves use, and only when no call holds that slot's model for the same choice already. */
 export interface VoiceModelSource {
-  /** A lightweight model loader for `settings`, not an owner of loaded weights. Its `load()` returns the detector
-   *  factory, transcriber, speaker, and optional end-of-turn classifier when a call starts. Rejects `{code}` for settings it
-   *  cannot fill. Asked again only when what chooses models changes: a slot's fields other than its language, voice
-   *  and speed, or the end of turn. */
-  models(settings: VoiceSettings): VoiceModels | Promise<VoiceModels>;
+  /** The voice activity detector, the page's own choice. */
+  vad(): VoiceVadModel | Promise<VoiceVadModel>;
+  /** The transcriber `choice` names: the input settings' `stt` without its `language`. */
+  transcriber(choice: VoiceModelChoice): VoiceTranscriber | Promise<VoiceTranscriber>;
+  /** The speaker `choice` names: the output settings' `tts`. */
+  speaker(choice: VoiceModelChoice): VoiceSpeaker | Promise<VoiceSpeaker>;
+  /** The end-of-turn classifier `choice` names (null: the source's own), for `{kind: "smart"}`. Absent: `smart` is
+   *  refused with `end-of-turn-missing`. */
+  endOfTurn?(choice: VoiceModelChoice | null): VoiceEndOfTurn | Promise<VoiceEndOfTurn>;
 }
 
 export interface VoiceHostOptions extends WebAudioIoOptions {

@@ -1,6 +1,7 @@
-//! [`VoiceCall`]: one call, run as a task of its own around the state machine (`call`). The task loads the app's
-//! models ([`VoiceModels`]) as the call starts and drops them once it has been stopped for its idle minutes, opens
-//! the microphone and the speaker, feeds the capture to the detector and its windows to the state machine, runs each
+//! [`VoiceCall`]: one call, run as a task of its own around the state machine (`call`). The task loads the models its
+//! halves use ([`VoiceSetup`]: the input half's detector, transcriber and, for `smart`, end-of-turn model; the output
+//! half's speaker), each slot on its own and all at once, as the call starts, and drops them once it has been stopped
+//! for its idle minutes; it opens the speaker, and the microphone only with an input half, feeds the capture to the detector and its windows to the state machine, runs each
 //! transcription, synthesis and end-of-turn question as a task of its own (so a long one never holds the detector
 //! back), and does what the state machine answers. A start that asks for a take has the capture kept from the moment
 //! the call listens, handed over with the state machine's marks as that listening ends. The owner's calls reach it on
@@ -19,19 +20,22 @@ use std::sync::{Arc, Mutex};
 
 use futures_channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures_channel::oneshot;
-use futures_util::future::{abortable, ready, select, AbortHandle, Either};
+use futures_util::future::{abortable, join, join3, ready, select, AbortHandle, Either};
 use futures_util::{stream, Stream, StreamExt};
 
 use crate::call::{Call, Effect, Input};
-use crate::config::{EndOfTurn, VoiceConfig};
+use crate::config::{CallConfig, EndOfTurn};
 use crate::event::{VoiceError, VoiceEvent};
 use crate::io::{AudioIo, IoEvent, IoSink, RenderedMailbox};
 use crate::level::{instant, Level};
 use crate::maybe_send::MaybeSend;
-use crate::models::{Models, VadFrame, VoiceModels};
+use crate::models::{
+    EndOfTurnModel, InputModels, OutputModels, Speaker, Transcriber, Vad, VadFrame,
+};
 use crate::residency::Residency;
 use crate::runtime::{monotonic_ms, sleep, spawn, unix_ms};
 use crate::say::{SayEvent, SayOptions, Saying};
+use crate::setup::VoiceSetup;
 use crate::take::Recording;
 use crate::turns::RATE;
 
@@ -66,7 +70,8 @@ pub struct StartOptions {
 pub(crate) enum Message {
     Start(StartOptions),
     Stop,
-    Config(Box<VoiceConfig>),
+    /// Another setup: other halves, other models, another configuration.
+    Update(Box<VoiceSetup>),
     /// Say `text`, telling `events` what becomes of it.
     Say {
         id: String,
@@ -83,7 +88,6 @@ pub(crate) enum Message {
     /// The shared native input router applies this after preceding captured frames.
     #[cfg(native)]
     SharedRoute(u64, oneshot::Sender<Result<(), String>>),
-    Models(Arc<dyn VoiceModels>, Box<VoiceConfig>),
     Io(u64, IoEvent),
     Rendered(u64),
     #[cfg(native)]
@@ -117,29 +121,32 @@ pub struct VoiceCall {
 }
 
 impl VoiceCall {
-    /// A call on the app's `models`, the microphone and speaker of `io`, set up with `config`. It does nothing until
+    /// A call with the halves of `setup`, on the microphone and speaker of `io`. It loads and opens nothing until
     /// [`VoiceCall::start`]. Natively its task runs on the app's Tokio runtime.
     #[must_use]
-    pub fn new(
-        models: Arc<dyn VoiceModels>,
-        io: Box<dyn AudioIo>,
-        config: VoiceConfig,
-    ) -> (Self, Events) {
+    pub fn new(io: Box<dyn AudioIo>, setup: VoiceSetup) -> (Self, Events) {
         let (messages, inbox) = unbounded();
         let (internal, reported) = unbounded();
         let (events, received) = unbounded();
         let call_id = call_id();
+        let config = setup.call_config();
         let driver = Driver {
             call: Call::new(
                 config.clone(),
                 call_id.clone(),
                 unix_ms().saturating_sub(monotonic_ms()),
             ),
-            residency: Residency::new(config.idle_unload_minutes),
+            residency: Residency::new(config.call.idle_unload_minutes),
             config,
-            models,
+            input: setup.input.map(|input| InputHalf {
+                models: input.models,
+                loaded: None,
+            }),
+            output: setup.output.map(|output| OutputHalf {
+                models: output.models,
+                speaker: None,
+            }),
             io,
-            loaded: None,
             running: false,
             opening: false,
             tasks: VecDeque::new(),
@@ -166,7 +173,8 @@ impl VoiceCall {
         (call, received)
     }
 
-    /// Loads the models if they are not, opens the microphone and the speaker, and starts listening. With
+    /// Loads the models its halves use if they are not, opens the speaker and, with an input half, the microphone, and
+    /// starts listening (without an input half, it only speaks). With
     /// `options.take`, it keeps what the microphone gives from the moment it listens until that listening ends, and
     /// hands it over then as [`VoiceEvent::Take`] (a restart on other models ends one stretch and starts the next).
     /// Started already, it changes nothing.
@@ -180,17 +188,13 @@ impl VoiceCall {
         self.send(Message::Stop);
     }
 
-    /// A new configuration, in effect at once.
-    pub fn set_config(&self, config: VoiceConfig) {
-        self.send(Message::Config(Box::new(config)));
-    }
-
-    /// Other models, with the configuration they go with, taken together: the models loaded are dropped, and the new
-    /// ones loaded at once if the call is started (it restarts once, on both: the open turn is cancelled and what is being
-    /// said stops), else at the next start. A pair the call cannot run (`smart-turn` without an end-of-turn
-    /// model) stops it with `end-of-turn-missing`.
-    pub fn set_models(&self, models: Arc<dyn VoiceModels>, config: VoiceConfig) {
-        self.send(Message::Models(models, Box::new(config)));
+    /// Another setup. A half whose models are the same (the same `Arc`) keeps what it loaded; one with other models
+    /// loads them anew. A change of configuration only is in effect at once; a change of halves or of models restarts a
+    /// started call once (the open turn is cancelled and what is being said stops), loading what is missing, and is
+    /// loaded at the next start otherwise. A model that cannot load (`smart` without an end-of-turn model,
+    /// `end-of-turn-missing`) stops the call with its code.
+    pub fn update(&self, setup: VoiceSetup) {
+        self.send(Message::Update(Box::new(setup)));
     }
 
     /// Says `text` after whatever is being said, once nothing of the person's holds it back (an open turn, one being
@@ -236,13 +240,33 @@ impl VoiceCall {
     }
 }
 
+/// The input half in the call's task: where its models come from, and those it loaded.
+struct InputHalf {
+    models: Arc<dyn InputModels>,
+    loaded: Option<LoadedInput>,
+}
+
+/// The input half's models, loaded.
+struct LoadedInput {
+    vad: Box<dyn Vad>,
+    transcriber: Arc<dyn Transcriber>,
+    /// Loaded only for `smart`.
+    end_of_turn: Option<Arc<dyn EndOfTurnModel>>,
+}
+
+/// The output half in the call's task: where its model comes from, and the speaker it loaded.
+struct OutputHalf {
+    models: Arc<dyn OutputModels>,
+    speaker: Option<Arc<dyn Speaker>>,
+}
+
 /// The call's task.
 struct Driver {
     call: Call,
-    config: VoiceConfig,
-    models: Arc<dyn VoiceModels>,
+    config: CallConfig,
+    input: Option<InputHalf>,
+    output: Option<OutputHalf>,
     io: Box<dyn AudioIo>,
-    loaded: Option<Models>,
     /// When the loaded models leave memory, the call stopped.
     residency: Residency,
     running: bool,
@@ -299,7 +323,7 @@ impl Driver {
                                 self.apply(effects);
                                 if self.residency.due(now) {
                                     // Dropping them is what unloads them; the next start loads them again.
-                                    self.loaded = None;
+                                    self.unload();
                                 }
                                 continue;
                             }
@@ -321,7 +345,7 @@ impl Driver {
                     return;
                 }
             }
-            let idle = self.loaded.is_some() && !self.running;
+            let idle = self.loaded() && !self.running;
             self.residency.observe(monotonic_ms(), idle);
         }
     }
@@ -390,7 +414,7 @@ impl Driver {
         for task in self.tasks.drain(..) {
             task.abort();
         }
-        self.loaded = None;
+        self.unload();
         self.captured.clear();
         self.taken = 0;
         self.input(Input::Stop);
@@ -413,26 +437,7 @@ impl Driver {
                 }
                 self.taking = false;
             }
-            Message::Config(config) => {
-                self.configure(config);
-                if self.running && self.end_of_turn_missing() {
-                    self.end_take();
-                    self.reset_playback();
-                    self.error("end-of-turn-missing".into());
-                    self.halt().await;
-                }
-            }
-            Message::Models(models, config) => {
-                self.models = models;
-                self.loaded = None;
-                let running = self.running;
-                self.halt().await;
-                self.loaded = None;
-                self.configure(config);
-                if running {
-                    self.start().await;
-                }
-            }
+            Message::Update(setup) => self.update(*setup).await,
             Message::Say {
                 id,
                 text,
@@ -505,7 +510,7 @@ impl Driver {
             Message::Io(_, IoEvent::MicrophoneMuted(muted)) => {
                 self.input(Input::MicrophoneMuted(muted));
             }
-            Message::Io(_, IoEvent::Failed(code)) => {
+            Message::Io(_, IoEvent::Failed(code) | IoEvent::InputLost(code)) => {
                 self.end_take();
                 self.reset_playback();
                 self.error(code);
@@ -537,37 +542,180 @@ impl Driver {
         }
     }
 
-    fn configure(&mut self, config: Box<VoiceConfig>) {
-        self.config = (*config).clone();
-        self.residency.set_minutes(config.idle_unload_minutes);
-        self.input(Input::Config(config));
+    fn configure(&mut self, config: CallConfig) {
+        self.residency.set_minutes(config.call.idle_unload_minutes);
+        self.config = config.clone();
+        self.input(Input::Config(Box::new(config)));
     }
 
-    /// Whether the configuration asks for `smart-turn` and the loaded models have no end-of-turn classifier.
-    fn end_of_turn_missing(&self) -> bool {
-        let smart = self.config.end_of_turn == EndOfTurn::SmartTurn;
-        smart
+    /// Takes another setup: a half with the same models keeps what it loaded. Only the configuration changed: in effect
+    /// at once. Halves or models changed, or a model the configuration now needs not loaded: a started call restarts
+    /// once.
+    async fn update(&mut self, setup: VoiceSetup) {
+        let config = setup.call_config();
+        let same_input = match (&self.input, &setup.input) {
+            (None, None) => true,
+            (Some(half), Some(input)) => Arc::ptr_eq(&half.models, &input.models),
+            _ => false,
+        };
+        let same_output = match (&self.output, &setup.output) {
+            (None, None) => true,
+            (Some(half), Some(output)) => Arc::ptr_eq(&half.models, &output.models),
+            _ => false,
+        };
+        if !same_input {
+            self.input = setup.input.map(|input| InputHalf {
+                models: input.models,
+                loaded: None,
+            });
+        }
+        if !same_output {
+            self.output = setup.output.map(|output| OutputHalf {
+                models: output.models,
+                speaker: None,
+            });
+        }
+        let needs_end_of_turn = smart(&config)
             && self
-                .loaded
+                .input
                 .as_ref()
-                .is_some_and(|loaded| loaded.end_of_turn.is_none())
+                .and_then(|half| half.loaded.as_ref())
+                .is_some_and(|loaded| loaded.end_of_turn.is_none());
+        if same_input && same_output && !needs_end_of_turn {
+            self.configure(config);
+            return;
+        }
+        let running = self.running;
+        self.halt().await;
+        self.configure(config);
+        if running {
+            self.start().await;
+        }
+    }
+
+    /// Whether any model is loaded.
+    fn loaded(&self) -> bool {
+        self.input
+            .as_ref()
+            .is_some_and(|half| half.loaded.is_some())
+            || self
+                .output
+                .as_ref()
+                .is_some_and(|half| half.speaker.is_some())
+    }
+
+    /// Drops every model loaded; dropping them is what unloads them.
+    fn unload(&mut self) {
+        if let Some(half) = &mut self.input {
+            half.loaded = None;
+        }
+        if let Some(half) = &mut self.output {
+            half.speaker = None;
+        }
+    }
+
+    /// Loads what the halves use and is not loaded yet, every slot at once: the detector and the transcriber, the
+    /// end-of-turn model only for `smart` (dropped otherwise), the speaker. What loaded stays loaded when another slot
+    /// fails; the first failure's code is the answer.
+    async fn load(&mut self) -> Result<(), String> {
+        let smart = smart(&self.config);
+        let input = self.input.as_ref().map(|half| {
+            let models = Arc::clone(&half.models);
+            let whole = half.loaded.is_none();
+            let end_of_turn = smart
+                && half
+                    .loaded
+                    .as_ref()
+                    .is_none_or(|loaded| loaded.end_of_turn.is_none());
+            async move {
+                let detector = async {
+                    if whole {
+                        models.vad().await.map(Some)
+                    } else {
+                        Ok(None)
+                    }
+                };
+                let transcriber = async {
+                    if whole {
+                        models.transcriber().await.map(Some)
+                    } else {
+                        Ok(None)
+                    }
+                };
+                let classifier = async {
+                    if end_of_turn {
+                        models.end_of_turn().await.map(Some)
+                    } else {
+                        Ok(None)
+                    }
+                };
+                join3(detector, transcriber, classifier).await
+            }
+        });
+        let output = self
+            .output
+            .as_ref()
+            .filter(|half| half.speaker.is_none())
+            .map(|half| {
+                let models = Arc::clone(&half.models);
+                async move { models.speaker().await }
+            });
+        let input = async move {
+            match input {
+                Some(input) => Some(input.await),
+                None => None,
+            }
+        };
+        let output = async move {
+            match output {
+                Some(output) => Some(output.await),
+                None => None,
+            }
+        };
+        let (input, output) = join(input, output).await;
+        let mut failure = None;
+        if let (Some(half), Some(speaker)) = (&mut self.output, output) {
+            match speaker {
+                Ok(speaker) => half.speaker = Some(speaker),
+                Err(code) => failure = Some(code),
+            }
+        }
+        if let (Some(half), Some((vad, transcriber, end_of_turn))) = (&mut self.input, input) {
+            match (vad, transcriber) {
+                (Ok(Some(vad)), Ok(Some(transcriber))) => {
+                    half.loaded = Some(LoadedInput {
+                        vad,
+                        transcriber,
+                        end_of_turn: None,
+                    });
+                }
+                (Err(code), _) | (_, Err(code)) => failure = failure.or(Some(code)),
+                _ => {}
+            }
+            match end_of_turn {
+                Ok(Some(model)) => {
+                    if let Some(loaded) = &mut half.loaded {
+                        loaded.end_of_turn = Some(model);
+                    }
+                }
+                Ok(None) => {}
+                Err(code) => failure = failure.or(Some(code)),
+            }
+            if !smart {
+                if let Some(loaded) = &mut half.loaded {
+                    loaded.end_of_turn = None;
+                }
+            }
+        }
+        failure.map_or(Ok(()), Err)
     }
 
     async fn start(&mut self) {
         if self.running {
             return;
         }
-        if self.loaded.is_none() {
-            match self.models.load().await {
-                Ok(loaded) => self.loaded = Some(loaded),
-                Err(code) => {
-                    self.error(code);
-                    return;
-                }
-            }
-        }
-        if self.end_of_turn_missing() {
-            self.error("end-of-turn-missing".into());
+        if let Err(code) = self.load().await {
+            self.error(code);
             return;
         }
         self.generation = self.generation.wrapping_add(1);
@@ -582,7 +730,7 @@ impl Driver {
             rendered: Arc::clone(&self.rendered_mailbox),
             direct_rendered: false,
         };
-        if let Err(code) = self.io.start(sink) {
+        if let Err(code) = self.io.start(sink, self.input.is_some()) {
             self.error(code);
             return;
         }
@@ -609,14 +757,14 @@ impl Driver {
         self.input(Input::Stop);
         self.captured.clear();
         self.taken = 0;
-        if let Some(loaded) = &mut self.loaded {
+        if let Some(loaded) = self.input.as_mut().and_then(|half| half.loaded.as_mut()) {
             loaded.vad.reset().await;
         }
     }
 
     /// Runs the detector on new capture and hands each window it completed to the state machine.
     async fn captured(&mut self, pcm: &[f32]) {
-        let Some(loaded) = &mut self.loaded else {
+        let Some(loaded) = self.input.as_mut().and_then(|half| half.loaded.as_mut()) else {
             return;
         };
         if !self.running || self.opening {
@@ -722,7 +870,8 @@ impl Driver {
                     pcm,
                     language,
                 } => {
-                    let Some(loaded) = &self.loaded else { continue };
+                    let loaded = self.input.as_ref().and_then(|half| half.loaded.as_ref());
+                    let Some(loaded) = loaded else { continue };
                     let transcriber = Arc::clone(&loaded.transcriber);
                     let messages = self.messages.clone();
                     self.track(async move {
@@ -736,11 +885,14 @@ impl Driver {
                     text,
                     language,
                 } => {
-                    let Some(loaded) = &self.loaded else { continue };
-                    let speaker = Arc::clone(&loaded.speaker);
+                    let speaker = self.output.as_ref().and_then(|half| half.speaker.clone());
+                    let Some(speaker) = speaker else { continue };
+                    let Some(output) = &self.config.output else {
+                        continue;
+                    };
                     let messages = self.messages.clone();
-                    let (voice, speed) = (self.config.voice.clone(), self.config.speed);
-                    let language = language.or_else(|| self.config.language.clone());
+                    let (voice, speed) = (output.voice.clone(), output.speed);
+                    let language = language.or_else(|| self.config.say_language());
                     self.track(async move {
                         let result = speaker.speak(text, voice, language, speed).await;
                         let _ = messages.unbounded_send(Message::Synthesized {
@@ -759,8 +911,9 @@ impl Driver {
                 Effect::StopPlayback => self.io.stop_playback(),
                 Effect::EndOfTurn { turn, pause, pcm } => {
                     let model = self
-                        .loaded
+                        .input
                         .as_ref()
+                        .and_then(|half| half.loaded.as_ref())
                         .and_then(|loaded| loaded.end_of_turn.clone());
                     let Some(model) = model else { continue };
                     let messages = self.messages.clone();
@@ -795,6 +948,14 @@ impl Driver {
             .events
             .unbounded_send(VoiceEvent::Error(VoiceError { code }));
     }
+}
+
+/// Whether the configuration's input half ends turns with the end-of-turn model.
+fn smart(config: &CallConfig) -> bool {
+    config
+        .input
+        .as_ref()
+        .is_some_and(|input| input.end_of_turn == EndOfTurn::Smart {})
 }
 
 /// An id for a call, unique on this device: the time it was made and a counter, in hexadecimal.

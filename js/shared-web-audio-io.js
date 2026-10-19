@@ -1,4 +1,6 @@
-// One browser capture and output context with independent call lanes.
+// One browser capture and output context with independent call lanes. The microphone is open only while a started
+// lane asks for it (`start(sink, {input: true})`, `setInput(true)`): a lane that only speaks asks for no microphone, so a
+// blocked one cannot fail it.
 const CAPTURE = { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 };
 const FRAME = 160;
 const FADE_SECONDS = 0.03;
@@ -17,6 +19,7 @@ export function createSharedWebAudioIo(options = {}) {
   let microphone = null;
   let capture = null;
   let opening = null;
+  let microphoneOpening = null;
   let session = 0;
   let inputDevice = options.inputDevice || null;
   let outputDevice = options.outputDevice || null;
@@ -44,9 +47,7 @@ export function createSharedWebAudioIo(options = {}) {
     pendingRoutes = new Map();
     routes = new Map();
     selected = null;
-    for (const track of stream?.getTracks() ?? []) { track.onended = track.onmute = track.onunmute = null; track.stop(); }
-    stream = null;
-    microphone?.disconnect(); microphone = null;
+    closeMicrophone();
     capture?.disconnect(); capture?.port?.close(); capture = null;
     for (const lane of lanes.values()) {
       lane.gain?.disconnect(); lane.meter?.disconnect(); lane.meter?.port?.close();
@@ -58,6 +59,33 @@ export function createSharedWebAudioIo(options = {}) {
     if (context) context.onstatechange = null;
     context?.close().catch(() => {}); context = null;
     opening = null;
+    microphoneOpening = null;
+  }
+  function closeMicrophone() {
+    for (const track of stream?.getTracks() ?? []) { track.onended = track.onmute = track.onunmute = null; track.stop(); }
+    stream = null;
+    microphone?.disconnect(); microphone = null;
+  }
+  const listening = () => [...lanes.values()].filter((lane) => lane.sink && lane.input);
+  // The microphone went and none took its place, or it could not open: the lanes that asked for it are told, it is
+  // closed, and the speaker goes on.
+  function loseInput(code) {
+    closeMicrophone();
+    for (const lane of listening()) { lane.input = false; lane.sink.inputLost(code); }
+  }
+  // Opens the microphone for the lanes that ask for it, once; closes it when none does.
+  async function microphoneAsAsked() {
+    if (!listening().length) { closeMicrophone(); return; }
+    if (stream) return;
+    if (!microphoneOpening) {
+      const opened = session;
+      microphoneOpening = media(inputDevice).then((next) => {
+        if (opened !== session || !listening().length) { next.getTracks().forEach((track) => track.stop()); return; }
+        useStream(next, opened);
+      }, (error) => { if (opened === session) loseInput(error?.code || "microphone-unavailable"); })
+        .finally(() => { if (opened === session) microphoneOpening = null; });
+    }
+    await microphoneOpening;
   }
   function failAll(code) {
     const current = [...lanes.values()].filter((lane) => lane.sink);
@@ -88,24 +116,20 @@ export function createSharedWebAudioIo(options = {}) {
         if (opened !== session) return;
         const old = inputDevice; inputDevice = null;
         try { useStream(await media(null), opened); if (old) options.onDeviceLost?.("input", old); }
-        catch (_) { failAll("microphone-lost"); }
+        catch (_) { if (opened === session) loseInput("microphone-lost"); }
       };
-      track.onmute = () => { if (opened === session) for (const lane of lanes.values()) lane.sink?.microphoneMuted(true); };
-      track.onunmute = () => { if (opened !== session) return; wake(); for (const lane of lanes.values()) lane.sink?.microphoneMuted(false); };
+      track.onmute = () => { if (opened === session) for (const lane of listening()) lane.sink.microphoneMuted(true); };
+      track.onunmute = () => { if (opened !== session) return; wake(); for (const lane of listening()) lane.sink.microphoneMuted(false); };
     }
     if (capture) { microphone?.disconnect(); microphone = context.createMediaStreamSource(next); microphone.connect(capture); }
   }
   async function open(opened) {
-    const mediaStream = await media(inputDevice);
-    if (opened !== session) { mediaStream.getTracks().forEach((track) => track.stop()); return; }
-    useStream(mediaStream, opened);
     context = new AudioContext();
     context.onstatechange = wake;
     listen(true);
     await context.audioWorklet.addModule(new URL("./capture-worklet.js", import.meta.url).href);
     await context.audioWorklet.addModule(new URL("./playback-worklet.js", import.meta.url).href);
     if (opened !== session) return;
-    microphone = context.createMediaStreamSource(stream);
     capture = new AudioWorkletNode(context, "sidevoice-capture");
     capture.port.onmessage = ({ data }) => {
       if (opened !== session) return;
@@ -122,7 +146,10 @@ export function createSharedWebAudioIo(options = {}) {
       for (const lane of lanes.values()) if (lane.sink) lane.sink.captured(lane.port === target ? data.samples : new Float32Array(FRAME));
     };
     capture.onprocessorerror = () => failAll("audio-capture-failed");
-    microphone.connect(capture).connect(context.destination);
+    // Connected through to the destination so that every browser runs it; it outputs silence. The microphone joins it
+    // when a lane asks for one.
+    capture.connect(context.destination);
+    if (stream) { microphone = context.createMediaStreamSource(stream); microphone.connect(capture); }
     if (outputDevice && selectable()) await context.setSinkId(outputDevice);
     await context.resume();
     if (opened !== session) return;
@@ -210,17 +237,23 @@ export function createSharedWebAudioIo(options = {}) {
     get outputSelectable() { return selectable(); },
     attach() {
       const port = Object.freeze({ id: ++nextPort });
-      const lane = { port, sink: null, meter: null, gain: null, sources: new Set(), queueEnd: 0, playback: 0,
+      const lane = { port, sink: null, input: false, meter: null, gain: null, sources: new Set(), queueEnd: 0, playback: 0,
         active: null, closing: new Map(), deferred: null, rendering: false };
       const io = {
-        start(sink) {
+        start(sink, { input = false } = {}) {
           lane.sink = sink;
-          ensureOpen().then(() => {
+          lane.input = input === true;
+          ensureOpen().then(() => microphoneAsAsked()).then(() => {
             if (!lane.sink || lane.sink !== sink) return;
             outputFor(lane);
             sink.ready();
-            if (stream?.getAudioTracks().some((track) => track.muted)) sink.microphoneMuted(true);
+            if (lane.input && stream?.getAudioTracks().some((track) => track.muted)) sink.microphoneMuted(true);
           }, (error) => { if (lane.sink === sink) sink.failed(error?.code || "audio-output-failed"); });
+        },
+        setInput(input) {
+          if (!lane.sink) return;
+          lane.input = input === true;
+          void microphoneAsAsked();
         },
         play(utterance, chunk, samples, sampleRate) {
           if (!lane.sink || !context || !lane.gain) return;
@@ -274,8 +307,12 @@ export function createSharedWebAudioIo(options = {}) {
           lane.gain = lane.meter = null;
           lane.active = null; lane.closing.clear(); lane.deferred = null; lane.rendering = false;
           setTimeout(() => { meter?.disconnect(); meter?.port.close(); }, FADE_SECONDS * 2000);
+          lane.input = false;
           if (![...lanes.values()].some((other) => other.sink)) releaseDevices();
-          else if (routeWasHere && capture) void route(null).catch(() => {});
+          else {
+            void microphoneAsAsked();
+            if (routeWasHere && capture) void route(null).catch(() => {});
+          }
         },
         dispose() {
           io.stop();

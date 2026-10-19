@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use super::{
-    Models, SharedModelLoader, SharedModelResources, SharedModels, Speaker, Transcriber, Vad,
-    VadFactory, VadFrame, VoiceModels,
+    InputModels, OutputModels, SharedModelLoader, SharedModels, Speaker, Transcriber, Vad,
+    VadFactory, VadFrame,
 };
 use crate::async_trait;
 
@@ -34,7 +34,8 @@ struct Gate {
 }
 
 struct Loader {
-    loads: AtomicUsize,
+    /// How many times each slot was loaded: detector, transcriber, speaker.
+    loads: [AtomicUsize; 3],
     streams: Arc<AtomicUsize>,
     drops: Arc<AtomicUsize>,
     last: Mutex<Option<Weak<dyn Transcriber>>>,
@@ -45,7 +46,7 @@ struct Loader {
 impl Loader {
     fn new() -> Self {
         Self {
-            loads: AtomicUsize::new(0),
+            loads: Default::default(),
             streams: Arc::new(AtomicUsize::new(0)),
             drops: Arc::new(AtomicUsize::new(0)),
             last: Mutex::new(None),
@@ -60,25 +61,35 @@ impl Loader {
             .as_ref()
             .is_some_and(|weak| weak.upgrade().is_some())
     }
+    fn loads(&self) -> [usize; 3] {
+        self.loads
+            .each_ref()
+            .map(|loads| loads.load(Ordering::SeqCst))
+    }
 }
 
 #[cfg_attr(native, async_trait)]
 #[cfg_attr(web, async_trait(?Send))]
 impl SharedModelLoader for Loader {
-    async fn load(&self) -> Result<SharedModelResources, String> {
-        self.loads.fetch_add(1, Ordering::SeqCst);
+    async fn vad(&self) -> Result<Arc<dyn VadFactory>, String> {
+        self.loads[0].fetch_add(1, Ordering::SeqCst);
+        Ok(Arc::new(Factory(Arc::clone(&self.streams))))
+    }
+
+    async fn transcriber(&self) -> Result<Arc<dyn Transcriber>, String> {
+        self.loads[1].fetch_add(1, Ordering::SeqCst);
         let text: Arc<dyn Transcriber> = Arc::new(Text {
             drops: Arc::clone(&self.drops),
             #[cfg(native)]
             gate: self.gate.clone(),
         });
         *self.last.lock().unwrap() = Some(Arc::downgrade(&text));
-        Ok(SharedModelResources {
-            vad: Arc::new(Factory(Arc::clone(&self.streams))),
-            transcriber: text,
-            speaker: Arc::new(Speech),
-            end_of_turn: None,
-        })
+        Ok(text)
+    }
+
+    async fn speaker(&self) -> Result<Arc<dyn Speaker>, String> {
+        self.loads[2].fetch_add(1, Ordering::SeqCst);
+        Ok(Arc::new(Speech))
     }
 }
 
@@ -136,22 +147,20 @@ impl Speaker for Speech {
 async fn check_shared_leases() {
     let loader = Arc::new(Loader::new());
     let shared = SharedModels::new(Arc::clone(&loader) as Arc<dyn SharedModelLoader>);
-    let Models {
-        vad: mut a,
-        transcriber: text_a,
-        speaker: speech_a,
-        ..
-    } = shared.load().await.unwrap();
-    let Models {
-        vad: mut b,
-        transcriber: text_b,
-        speaker: speech_b,
-        ..
-    } = shared.load().await.unwrap();
+    let (mut a, text_a, speech_a) = (
+        shared.vad().await.unwrap(),
+        shared.transcriber().await.unwrap(),
+        shared.speaker().await.unwrap(),
+    );
+    let (mut b, text_b, speech_b) = (
+        shared.vad().await.unwrap(),
+        shared.transcriber().await.unwrap(),
+        shared.speaker().await.unwrap(),
+    );
     assert_eq!(
-        loader.loads.load(Ordering::SeqCst),
-        1,
-        "two calls share one loaded choice"
+        loader.loads(),
+        [1, 1, 1],
+        "two calls share each loaded slot"
     );
     assert_eq!(
         loader.streams.load(Ordering::SeqCst),
@@ -166,7 +175,7 @@ async fn check_shared_leases() {
     a.reset().await;
     assert_eq!(a.accept(&[0.0]).await.unwrap()[0].end, 1);
     assert_eq!(b.accept(&[0.0]).await.unwrap()[0].end, 4);
-    // A call's existing idle timer releases its Models; one still-live lease prevents eviction.
+    // A call's existing idle timer releases its models; one still-live lease prevents eviction.
     drop((a, text_a, speech_a));
     assert!(loader.live());
     drop((b, text_b, speech_b));
@@ -175,14 +184,59 @@ async fn check_shared_leases() {
         "the lightweight provider keeps no strong weight reference"
     );
     assert_eq!(loader.drops.load(Ordering::SeqCst), 1);
-    let again = shared.load().await.unwrap();
+    let again = shared.transcriber().await.unwrap();
     assert_eq!(
-        loader.loads.load(Ordering::SeqCst),
-        2,
+        loader.loads(),
+        [1, 2, 1],
         "restart after final idle unload reloads"
     );
     drop(again);
     assert_eq!(loader.drops.load(Ordering::SeqCst), 2);
+}
+
+/// A transcription try (the input half) then a call (both halves) on one pool: the try loads no speaker, and the call
+/// reuses the try's detector and transcriber while the try still holds them, loading only the speaker.
+async fn check_halves_reuse_what_is_loaded() {
+    let loader = Arc::new(Loader::new());
+    let shared = SharedModels::new(Arc::clone(&loader) as Arc<dyn SharedModelLoader>);
+    let input: &dyn InputModels = &shared;
+    let output: &dyn OutputModels = &shared;
+    let try_models = (
+        input.vad().await.unwrap(),
+        input.transcriber().await.unwrap(),
+    );
+    assert_eq!(loader.loads(), [1, 1, 0], "an input half loads no speaker");
+    let call = (
+        input.vad().await.unwrap(),
+        input.transcriber().await.unwrap(),
+        output.speaker().await.unwrap(),
+    );
+    assert_eq!(
+        loader.loads(),
+        [1, 1, 1],
+        "no second load of what the try holds"
+    );
+    assert_eq!(
+        input.end_of_turn().await.err().as_deref(),
+        Some("end-of-turn-missing")
+    );
+    drop((try_models, call));
+}
+
+#[cfg(native)]
+#[test]
+fn halves_reuse_what_is_loaded() {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_time()
+        .build()
+        .unwrap()
+        .block_on(check_halves_reuse_what_is_loaded());
+}
+
+#[cfg(web)]
+#[test]
+async fn halves_reuse_what_is_loaded() {
+    check_halves_reuse_what_is_loaded().await;
 }
 
 #[cfg(native)]
@@ -217,9 +271,9 @@ fn an_in_flight_transcription_keeps_weights_after_other_leases_end() {
             source.gate = Some(Arc::clone(&gate));
             let loader = Arc::new(source);
             let shared = SharedModels::new(Arc::clone(&loader) as Arc<dyn SharedModelLoader>);
-            let a = shared.load().await.unwrap();
-            let b = shared.load().await.unwrap();
-            let transcriber = Arc::clone(&a.transcriber);
+            let a = shared.transcriber().await.unwrap();
+            let b = shared.transcriber().await.unwrap();
+            let transcriber = Arc::clone(&a);
             let task =
                 tokio::spawn(
                     async move { transcriber.transcribe(vec![0.0; 16], 16_000, None).await },

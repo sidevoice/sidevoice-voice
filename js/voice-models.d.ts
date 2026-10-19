@@ -44,24 +44,24 @@ export interface VoiceAudio {
   sampleRate: number;
 }
 
-/** An end-of-turn classifier, for `end_of_turn: "smart-turn"`. */
+/** An end-of-turn classifier, for `end_of_turn: {kind: "smart"}`. */
 export interface VoiceEndOfTurn {
   /** The probability, from 0 to 1, that the speaker of mono `samples` at `sampleRate` has finished their turn. */
   endOfTurn(samples: Float32Array, sampleRate: number): number | Promise<number>;
 }
 
-/** A lightweight loader, safe to retain after its resources are evicted. `load()` runs on the next start when the
- *  last call lease has expired. Keep loaded weights in its answer, not in this loader. */
-export interface VoiceModels {
-  load(): VoiceLoadedModels | Promise<VoiceLoadedModels>;
+/** Where a call's input half gets its models: each slot asked for only when the call needs it (the detector and the
+ *  transcriber as the input half starts, the end-of-turn classifier only for `{kind: "smart"}`), each answering the
+ *  loaded model or a promise of it. A failure is a throw or a rejection with a stable `code`. */
+export interface VoiceInputModels {
+  /** A fresh detector stream for this call (the weights behind it may be shared). */
+  vad(): VoiceVad | Promise<VoiceVad>;
+  transcriber(): VoiceTranscriber | Promise<VoiceTranscriber>;
+  /** Absent: `{kind: "smart"}` refuses to start (`end-of-turn-missing`). */
+  endOfTurn?(): VoiceEndOfTurn | Promise<VoiceEndOfTurn>;
 }
 
-/** Loaded model resources leased by active calls and their idle-unload timers. `createVad` gives each call a fresh
- *  detector stream. Without `endOfTurn`, `smart-turn` refuses to start (`end-of-turn-missing`). */
-export interface VoiceLoadedModels {
-  /** A fresh detector stream for every call; loaded weights may be shared. */
-  createVad(): VoiceVad | Promise<VoiceVad>;
-  transcriber: VoiceTranscriber;
-  speaker: VoiceSpeaker;
-  endOfTurn?: VoiceEndOfTurn;
+/** Where a call's output half gets its speaker, loaded. */
+export interface VoiceOutputModels {
+  speaker(): VoiceSpeaker | Promise<VoiceSpeaker>;
 }

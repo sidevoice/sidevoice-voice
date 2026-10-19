@@ -9,43 +9,72 @@
 
 The [Sidevoice](https://github.com/sidevoice) voice call for the web: it listens to the microphone, tells when you
 start and stop speaking, has what you said transcribed, and tells the page your turns as words; it says what the
-page asks it to, plays it, stops when you speak over it, and tells the page how much of it you heard. This package
-is its WebAssembly build (`wasm-bindgen --target web`) with the browser's microphone and speaker. The models are the
-page's, supplied through the package's own interfaces (`VoiceModels`: a voice activity detector, a transcriber, a
-speaker and an optional end-of-turn classifier, typed in `js/voice-models.d.ts`), with
-[`@sidevoice/engine`](https://www.npmjs.com/package/@sidevoice/engine)'s models, say. Calls carry no application routing identity.
+page asks it to, plays it, stops when you speak over it, and tells the page how much of it you heard. Each of the two
+halves is optional: a call can only listen (a transcription try), only speak (a voice try, a call without a
+microphone), or both, and it loads and opens only what its halves use. This package is its WebAssembly build
+(`wasm-bindgen --target web`) with the browser's microphone and speaker. The models are the page's, supplied through
+the package's own interfaces, one slot at a time (`VoiceInputModels`: a voice activity detector, a transcriber and an
+optional end-of-turn classifier; `VoiceOutputModels`: a speaker; typed in `js/voice-models.d.ts`), with
+[`@sidevoice/engine`](https://www.npmjs.com/package/@sidevoice/engine)'s models, say. Calls carry no application
+routing identity.
+
+Most pages use the voice seam, `createVoiceHost(source)`: `source` loads the model a slot needs (`vad()`,
+`transcriber(choice)`, `speaker(choice)`, `endOfTurn(choice)`), and the host asks it only for what a call's halves
+use, and only once for a choice any call holds (`js/voice-host.d.ts`):
+
+```js
+import init, { createVoiceHost } from "@sidevoice/voice";
+
+await init();
+const voice = createVoiceHost(source);
+// A transcription try: the input half only, a turn ending after 1.5 s of silence. No speaker model is loaded.
+const transcribing = voice.start({ input: { stt: { catalog, model, language: "es" }, endOfTurn: { kind: "silence", ms: 1500 } } });
+// A voice try, or a call without a microphone: the output half only. No microphone is asked for, no detector loaded.
+const listening = voice.start({ output: { tts: { catalog, model }, voice: "ef_dora", speed: 1 } });
+// A normal call: both halves; `{kind: "smart", model}` loads the end-of-turn classifier, `silence` never does.
+const call = voice.start({ input: { stt, endOfTurn: { kind: "smart" }, patience: "normal" }, output: { tts, voice } });
+call.onTurn((turn) => { /* started, then finished (the words) or cancelled */ });
+await call.ready; // the first state that is not idle; rejects { code } (a model that cannot load, the microphone, ...)
+const saying = call.say("Hecho."); // a handle: saying.cancel(), saying.onEvent(step), saying.outcome
+await call.stop(); // ends the call; its models stay loaded for `idle_unload_minutes` (10) unless another call holds them
+```
+
+A call without an input half says `listening: "off"` in its state and has no barge-in; one without an output half
+answers `say` with `not-played` (`failed`, `output-missing`).
+
+The lower level is one call on the page's models, `VoiceCall.create(setup, options)`:
 
 ```js
 import init, { VoiceCall } from "@sidevoice/voice";
 
 await init();
-// The page's models: `load()` answers objects with the methods js/voice-models.d.ts types.
-const models = { load: async () => ({ createVad: () => newDetector(), transcriber, speaker }) };
-const call = VoiceCall.create(models, { language: "es", voice: "ef_dora", patience: "normal" });
-call.onEvent(({ type, data }) => {
-  // "turn", "state", "level", "playback-level", "error" ({ code })
+const call = VoiceCall.create({
+  input: { models: { vad: () => newDetector(), transcriber: () => transcriber }, language: "es", end_of_turn: { kind: "silence" } },
+  output: { models: { speaker: () => speaker }, voice: "ef_dora" },
 });
-call.start(); // loads the models, asks for the microphone, listens
-const saying = call.say("Hecho.", { language: "es" }); // a handle: saying.cancel(), saying.onEvent(step)
+call.onEvent(({ type, data }) => {
+  // "turn", "state", "level", "playback-level", "error" ({ code }), "take"
+});
+call.start(); // loads what the halves use, asks for the microphone only with an input half, listens
+const saying = call.say("Hecho.", { language: "es" });
 const outcome = await saying.outcome; // heard, heard up to N characters, or not played, and why
 ```
 
 The microphone is `getUserMedia` with the browser's echo cancellation, noise suppression and gain control, turned
-into 16 kHz mono in an AudioWorklet; the speaker is Web Audio. `VoiceCall.create(models, config, { outputDevice })`
-plays on another output where the browser allows it (a non-default output may escape the browser's echo canceller),
-and `{ io }` brings a microphone and speaker of the page's own (`createWebAudioIo` is the default one). Failures are
-`error` events with a stable `code` (`microphone-denied`, `microphone-unavailable`, ...), for the page to translate.
-`playback-level` carries one number from 0 to 1: the smoothed RMS of the rendered speaker audio, on the same
-detector windows as microphone `level` (normally 32 ms). It continues while the microphone is muted and reaches
-exact zero at the end of playback and on stop. Each `createVoiceHost().createCall()` exposes it through
-`onPlaybackLevel(listener)`, which returns an unsubscribe function.
+into 16 kHz mono in an AudioWorklet; the speaker is Web Audio. `VoiceCall.create(setup, { outputDevice })` plays on
+another output where the browser allows it (a non-default output may escape the browser's echo canceller), and
+`{ io }` brings a microphone and speaker of the page's own (`createWebAudioIo` is the default one; it opens the
+microphone only when asked, `start(sink, {input})` and `setInput(input)`). Failures are `error` events with a stable
+`code` (`microphone-denied`, `microphone-unavailable`, ...), for the page to translate. `playback-level` carries one
+number from 0 to 1: the smoothed RMS of the rendered speaker audio, on the same detector windows as microphone `level`
+(normally 32 ms). It continues while the microphone is muted and reaches exact zero at the end of playback and on stop.
+Each call of the host exposes it through `onPlaybackLevel(listener)`, which returns an unsubscribe function.
+
+Several calls can run at once on one host: `await host.routeInput(call)` sends the next microphone frame to one call
+while the others receive silence, and `host.routeInput(null)` sends silence to all. The host uses one physical
+microphone and output context, the microphone open only while a call with an input half runs;
+`createSharedWebAudioIo` exposes the same audio factory directly.
 
 Source, documentation and issues: https://github.com/sidevoice/sidevoice-voice
 
 Apache-2.0. Sidevoice is a trademark; see TRADEMARKS.md in the repository.
-
-For several concurrent calls, use `createVoiceHost(source)`, then `host.createCall()` for each call.
-Start them independently and `await host.routeInput(call)` to send the next microphone frame to one call while
-the others receive silence. `host.routeInput(null)` sends silence to all. The host uses one physical microphone and
-output context; `createSharedWebAudioIo` exposes the same audio factory directly. `source.models(settings).load()`
-provides shared `transcriber`/`speaker` and `createVad()` for a fresh detector stream per call.
