@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.6.0](https://github.com/sidevoice/sidevoice-voice/compare/v0.5.2...v0.6.0) (2026-10-19)
+
+
+### ⚠ BREAKING CHANGES
+
+* optional input and output halves, live updates and VAD warm-up ([#56](https://github.com/sidevoice/sidevoice-voice/issues/56))
+
+### Features
+
+* **host:** preload the models a call's settings use ([#60](https://github.com/sidevoice/sidevoice-voice/issues/60)) ([bb1aa81](https://github.com/sidevoice/sidevoice-voice/commit/bb1aa810daf4e861e614b60082c8d1e531e41634))
+* optional input and output halves, live updates and VAD warm-up ([#56](https://github.com/sidevoice/sidevoice-voice/issues/56)) ([7f5cee1](https://github.com/sidevoice/sidevoice-voice/commit/7f5cee184bf579710bfdee7df0c5ae2f26a0f587)), closes [#55](https://github.com/sidevoice/sidevoice-voice/issues/55)
+
+
+### Bug Fixes
+
+* **turns:** accumulate speech over a reply in a sliding window to barge in ([#59](https://github.com/sidevoice/sidevoice-voice/issues/59)) ([e9ce192](https://github.com/sidevoice/sidevoice-voice/commit/e9ce192515133d96765c46065790076cb89a4313)), closes [#54](https://github.com/sidevoice/sidevoice-voice/issues/54)
+* **web-audio:** resume an interrupted context and reopen an ended microphone ([#51](https://github.com/sidevoice/sidevoice-voice/issues/51)) ([77b84af](https://github.com/sidevoice/sidevoice-voice/commit/77b84af649f7ee6367294960a2269488b37a9c67))
+
 ## [0.5.2](https://github.com/sidevoice/sidevoice-voice/compare/v0.5.1...v0.5.2) (2026-10-16)
 
 
