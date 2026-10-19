@@ -98,6 +98,8 @@ pub enum Microphone {
 pub enum Listening {
     /// The call is not started.
     Idle,
+    /// The call is started without an input half: no microphone, nothing is heard; it only speaks.
+    Off,
     /// Muted by the person.
     Muted,
     /// Waiting for speech: no turn is open, or the person paused in the open one (their speech stopped, as the

@@ -9,14 +9,15 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 
 use super::{Events, StartOptions, VoiceCall};
-use crate::config::{Patience, VoiceConfig};
+use crate::config::{CallConfig, Patience};
 use crate::io::{AudioIo, IoEvent, IoSink};
 use crate::models::{
-    EndOfTurnModel, Models, SharedModelLoader, SharedModelResources, SharedModels, Speaker,
-    Transcriber, Vad, VadFactory, VadFrame, VoiceModels,
+    EndOfTurnModel, InputModels, OutputModels, SharedModelLoader, SharedModels, Speaker,
+    Transcriber, Vad, VadFactory, VadFrame,
 };
 use crate::say::{SayEvent, SayOptions, SayOutcome};
-use crate::test_support::{clip, config, silence, EnergyVad, QUILTER, WINDOW};
+use crate::setup::{VoiceInput, VoiceOutput, VoiceSetup};
+use crate::test_support::{clip, config, config_with, silence, EnergyVad, QUILTER, WINDOW};
 use crate::TurnEvent;
 use crate::VoiceEvent;
 
@@ -25,33 +26,54 @@ struct FakeModels {
     fail: Option<&'static str>,
     /// The end-of-turn classifier it supplies, if any.
     end_of_turn: Option<Arc<dyn EndOfTurnModel>>,
-    /// How many times the models were loaded, and how many detectors are alive (one per load not dropped yet).
+    /// How many times the detector was loaded, and how many detectors are alive (one per load not dropped yet).
     loads: Arc<AtomicUsize>,
     alive: Arc<AtomicUsize>,
+    /// How many times the transcriber, the speaker and the end-of-turn model were loaded.
+    transcribers: Arc<AtomicUsize>,
+    speakers: Arc<AtomicUsize>,
+    classifiers: Arc<AtomicUsize>,
+    /// The voice each chunk was spoken with.
+    voices: Arc<Mutex<Vec<Option<String>>>>,
     /// Once set, the detector never answers again.
     hang: Arc<AtomicBool>,
 }
 
 #[async_trait]
-impl VoiceModels for FakeModels {
-    async fn load(&self) -> Result<Models, String> {
+impl InputModels for FakeModels {
+    async fn vad(&self) -> Result<Box<dyn Vad>, String> {
         if let Some(code) = self.fail {
             return Err(code.into());
         }
         self.loads.fetch_add(1, Ordering::SeqCst);
         self.alive.fetch_add(1, Ordering::SeqCst);
-        Ok(Models {
-            vad: Box::new(FakeDetector {
-                vad: EnergyVad::new(),
-                pending: Vec::new(),
-                end: 0,
-                alive: Arc::clone(&self.alive),
-                hang: Arc::clone(&self.hang),
-            }),
-            transcriber: Arc::new(FakeTranscriber),
-            speaker: Arc::new(FakeSpeaker),
-            end_of_turn: self.end_of_turn.clone(),
-        })
+        Ok(Box::new(FakeDetector {
+            vad: EnergyVad::new(),
+            pending: Vec::new(),
+            end: 0,
+            alive: Arc::clone(&self.alive),
+            hang: Arc::clone(&self.hang),
+        }))
+    }
+
+    async fn transcriber(&self) -> Result<Arc<dyn Transcriber>, String> {
+        self.transcribers.fetch_add(1, Ordering::SeqCst);
+        Ok(Arc::new(FakeTranscriber))
+    }
+
+    async fn end_of_turn(&self) -> Result<Arc<dyn EndOfTurnModel>, String> {
+        self.classifiers.fetch_add(1, Ordering::SeqCst);
+        self.end_of_turn
+            .clone()
+            .ok_or_else(|| "end-of-turn-missing".into())
+    }
+}
+
+#[async_trait]
+impl OutputModels for FakeModels {
+    async fn speaker(&self) -> Result<Arc<dyn Speaker>, String> {
+        self.speakers.fetch_add(1, Ordering::SeqCst);
+        Ok(Arc::new(FakeSpeaker(Arc::clone(&self.voices))))
     }
 }
 
@@ -115,17 +137,20 @@ impl Transcriber for FakeTranscriber {
     }
 }
 
-struct FakeSpeaker;
+/// Speaks silence, and records the voice of each chunk.
+#[derive(Default)]
+struct FakeSpeaker(Arc<Mutex<Vec<Option<String>>>>);
 
 #[async_trait]
 impl Speaker for FakeSpeaker {
     async fn speak(
         &self,
         text: String,
-        _voice: Option<String>,
+        voice: Option<String>,
         _language: Option<String>,
         _speed: f32,
     ) -> Result<(Vec<f32>, u32), String> {
+        self.0.lock().unwrap().push(voice);
         Ok((vec![0.0; text.len() * 10], 24_000))
     }
 }
@@ -136,6 +161,10 @@ struct Speakers {
     /// Whether `start` leaves the microphone opening: the test says when it is ready.
     opening: bool,
     sink: Option<IoSink>,
+    /// Whether the microphone was asked for.
+    input: bool,
+    /// Whether what is played waits for the test to say when each chunk starts and ends.
+    held: bool,
     played: Vec<(String, usize, usize, u32)>,
     stopped: usize,
 }
@@ -143,8 +172,9 @@ struct Speakers {
 struct FakeIo(Arc<Mutex<Speakers>>);
 
 impl AudioIo for FakeIo {
-    fn start(&mut self, sink: IoSink) -> Result<(), String> {
+    fn start(&mut self, sink: IoSink, input: bool) -> Result<(), String> {
         let mut speakers = self.0.lock().unwrap();
+        speakers.input = input;
         if !speakers.opening {
             sink.send(IoEvent::Ready);
         }
@@ -157,6 +187,9 @@ impl AudioIo for FakeIo {
         speakers
             .played
             .push((utterance.into(), chunk, samples.len(), sample_rate));
+        if speakers.held {
+            return;
+        }
         let sink = speakers.sink.clone().unwrap();
         sink.send(IoEvent::ChunkStarted {
             utterance: utterance.into(),
@@ -166,6 +199,10 @@ impl AudioIo for FakeIo {
             utterance: utterance.into(),
             chunk,
         });
+    }
+
+    fn set_input(&mut self, input: bool) {
+        self.0.lock().unwrap().input = input;
     }
 
     fn stop_playback(&mut self) {
@@ -241,27 +278,45 @@ fn rendered_output_uses_detector_windows_even_with_a_muted_microphone_and_reject
     });
 }
 
+/// Both halves, fast patience, no grace.
+fn fast() -> CallConfig {
+    let mut config = config_with(|input| input.patience = Patience::Fast);
+    config.call.audio_grace_ms = 0;
+    config
+}
+
+/// `config`'s halves on `models`.
+fn setup<M: InputModels + OutputModels + 'static>(
+    models: &Arc<M>,
+    config: CallConfig,
+) -> VoiceSetup {
+    VoiceSetup {
+        input: config.input.map(|config| VoiceInput {
+            models: Arc::clone(models) as Arc<dyn InputModels>,
+            config,
+        }),
+        output: config.output.map(|config| VoiceOutput {
+            models: Arc::clone(models) as Arc<dyn OutputModels>,
+            config,
+        }),
+        config: config.call,
+    }
+}
+
 fn call(models: FakeModels) -> (VoiceCall, Events, Arc<Mutex<Speakers>>) {
-    with_config(
-        models,
-        VoiceConfig {
-            patience: Patience::Fast,
-            audio_grace_ms: 0,
-            ..config()
-        },
-    )
+    with_config(models, fast())
 }
 
 fn with_config(
     models: FakeModels,
-    config: VoiceConfig,
+    config: CallConfig,
 ) -> (VoiceCall, Events, Arc<Mutex<Speakers>>) {
+    with_setup(setup(&Arc::new(models), config))
+}
+
+fn with_setup(setup: VoiceSetup) -> (VoiceCall, Events, Arc<Mutex<Speakers>>) {
     let speakers = Arc::default();
-    let (call, events) = VoiceCall::new(
-        Arc::new(models),
-        Box::new(FakeIo(Arc::clone(&speakers))),
-        config,
-    );
+    let (call, events) = VoiceCall::new(Box::new(FakeIo(Arc::clone(&speakers))), setup);
     (call, events, speakers)
 }
 
@@ -360,11 +415,12 @@ fn a_model_that_cannot_load_is_an_error_and_the_call_stays_idle() {
 #[test]
 fn smart_turn_without_an_end_of_turn_model_is_refused() {
     runtime().block_on(async {
-        let (call, mut events, _speakers) = call(FakeModels::default());
-        call.set_config(VoiceConfig {
-            end_of_turn: crate::EndOfTurn::SmartTurn,
-            ..config()
-        });
+        let models = Arc::new(FakeModels::default());
+        let (call, mut events, _speakers) = with_setup(setup(&models, fast()));
+        call.update(setup(
+            &models,
+            config_with(|input| input.end_of_turn = crate::EndOfTurn::Smart {}),
+        ));
         call.start(StartOptions::default());
         let code = next(&mut events, |event| match event {
             VoiceEvent::Error(error) => Some(error.code),
@@ -396,13 +452,9 @@ fn idle_models_leave_memory_and_come_back_on_the_next_start() {
             _ => None,
         };
         // Zero minutes: they leave as soon as the call stops.
-        let (call, mut events, _speakers) = with_config(
-            models,
-            VoiceConfig {
-                idle_unload_minutes: 0,
-                ..config()
-            },
-        );
+        let mut zero = config();
+        zero.call.idle_unload_minutes = 0;
+        let (call, mut events, _speakers) = with_config(models, zero);
         call.start(StartOptions::default());
         next(&mut events, listening).await;
         assert_eq!(
@@ -458,14 +510,17 @@ impl VadFactory for LeaseVadFactory {
 
 #[async_trait]
 impl SharedModelLoader for LeaseLoader {
-    async fn load(&self) -> Result<SharedModelResources, String> {
+    async fn vad(&self) -> Result<Arc<dyn VadFactory>, String> {
+        Ok(Arc::new(LeaseVadFactory))
+    }
+
+    async fn transcriber(&self) -> Result<Arc<dyn Transcriber>, String> {
         self.loads.fetch_add(1, Ordering::SeqCst);
-        Ok(SharedModelResources {
-            vad: Arc::new(LeaseVadFactory),
-            transcriber: Arc::new(LeaseText(Arc::clone(&self.drops))),
-            speaker: Arc::new(FakeSpeaker),
-            end_of_turn: None,
-        })
+        Ok(Arc::new(LeaseText(Arc::clone(&self.drops))))
+    }
+
+    async fn speaker(&self) -> Result<Arc<dyn Speaker>, String> {
+        Ok(Arc::new(FakeSpeaker::default()))
     }
 }
 
@@ -474,20 +529,18 @@ fn two_cached_calls_release_shared_weights_after_the_last_idle_deadline() {
     runtime().block_on(async {
         let loads = Arc::new(AtomicUsize::new(0));
         let drops = Arc::new(AtomicUsize::new(0));
-        let pool: Arc<dyn VoiceModels> = Arc::new(SharedModels::new(Arc::new(LeaseLoader {
+        let pool = Arc::new(SharedModels::new(Arc::new(LeaseLoader {
             loads: Arc::clone(&loads),
             drops: Arc::clone(&drops),
         })));
-        let config = VoiceConfig {
-            idle_unload_minutes: 0,
-            ..config()
-        };
+        let mut config = config();
+        config.call.idle_unload_minutes = 0;
         let (a, mut a_events) = VoiceCall::new(
-            Arc::clone(&pool),
             Box::new(FakeIo(Arc::default())),
-            config.clone(),
+            setup(&pool, config.clone()),
         );
-        let (b, mut b_events) = VoiceCall::new(pool, Box::new(FakeIo(Arc::default())), config);
+        let (b, mut b_events) =
+            VoiceCall::new(Box::new(FakeIo(Arc::default())), setup(&pool, config));
         let listening = |event| match event {
             VoiceEvent::State(state) if state.listening == crate::Listening::Listening => Some(()),
             _ => None,
@@ -565,15 +618,11 @@ fn smart_turn_ends_a_turn_at_a_pause_its_model_says_is_the_end() {
             end_of_turn: Some(Arc::new(Finished(Arc::clone(&asked)))),
             ..FakeModels::default()
         };
-        let (call, mut events, speakers) = with_config(
-            models,
-            VoiceConfig {
-                end_of_turn: crate::EndOfTurn::SmartTurn,
-                patience: Patience::Fast,
-                audio_grace_ms: 0,
-                ..config()
-            },
-        );
+        let mut smart = fast();
+        if let Some(input) = &mut smart.input {
+            input.end_of_turn = crate::EndOfTurn::Smart {};
+        }
+        let (call, mut events, speakers) = with_config(models, smart);
         call.start(StartOptions::default());
         next(&mut events, |event| match event {
             VoiceEvent::State(state) if state.listening == crate::Listening::Listening => Some(()),
@@ -676,35 +725,47 @@ fn the_call_listens_only_once_its_microphone_and_speaker_are_ready() {
 }
 
 #[test]
-fn models_and_their_configuration_change_together_on_a_live_call() {
+fn a_live_update_swaps_models_at_the_next_turn_without_restarting() {
     runtime().block_on(async {
-        let (call, mut events, _speakers) = call(FakeModels::default());
-        let listening = |event| match event {
-            VoiceEvent::State(state) if state.listening == crate::Listening::Listening => {
-                Some(Ok(()))
-            }
-            VoiceEvent::Error(error) => Some(Err(error.code)),
-            _ => None,
-        };
+        let (call, mut events, speakers) = call(FakeModels::default());
         call.start(StartOptions::default());
-        assert_eq!(next(&mut events, listening).await, Ok(()));
-        // Silence → smart-turn, with models that end turns: the call restarts on both and listens.
-        let smart = VoiceConfig {
-            end_of_turn: crate::EndOfTurn::SmartTurn,
-            ..config()
-        };
-        let ending = FakeModels {
-            end_of_turn: Some(Arc::new(Finished(Arc::default()))),
+        assert_eq!(started(&mut events).await, crate::Listening::Listening);
+        // Silence → smart, on models that end turns: they load while the call listens on, and take over between turns.
+        let asked = Arc::new(AtomicUsize::new(0));
+        let ending = Arc::new(FakeModels {
+            end_of_turn: Some(Arc::new(Finished(Arc::clone(&asked)))),
             ..FakeModels::default()
-        };
-        call.set_models(Arc::new(ending), smart);
-        assert_eq!(next(&mut events, listening).await, Ok(()));
-        // Smart-turn → silence, with models that do not: the same.
-        call.set_models(Arc::new(FakeModels::default()), config());
-        assert_eq!(next(&mut events, listening).await, Ok(()));
+        });
+        let mut smart = fast();
+        if let Some(input) = &mut smart.input {
+            input.end_of_turn = crate::EndOfTurn::Smart {};
+        }
+        call.update(setup(&ending, smart));
+        until(|| ending.classifiers.load(Ordering::SeqCst) == 1).await;
+        let sink = speakers
+            .lock()
+            .unwrap()
+            .sink
+            .clone()
+            .expect("still the same io");
+        // A pause of 1.2 s: shorter than any silence that ends a turn; only the new end-of-turn model ends it.
+        for frame in [silence(300), clip(QUILTER, 0.9), silence(1_200)]
+            .concat()
+            .chunks(160)
+        {
+            sink.send(IoEvent::Captured(frame.to_vec()));
+        }
+        let restarted = next(&mut events, |event| match event {
+            VoiceEvent::Turn(TurnEvent::Finished { .. }) => Some(false),
+            VoiceEvent::State(state) if state.listening == crate::Listening::Idle => Some(true),
+            _ => None,
+        })
+        .await;
+        assert!(!restarted, "the call never stopped");
+        assert!(asked.load(Ordering::SeqCst) >= 1);
+        assert_eq!(ending.loads.load(Ordering::SeqCst), 1);
     });
 }
-
 #[test]
 fn every_stop_is_answered_with_an_idle_state() {
     runtime().block_on(async {
@@ -951,47 +1012,45 @@ fn a_take_ends_before_the_failure_that_ends_its_listening() {
 }
 
 #[test]
-fn fatal_live_configuration_ends_take_and_playback_before_error() {
+fn a_live_update_that_cannot_load_leaves_the_call_as_it_was() {
     runtime().block_on(async {
-        let (call, mut events, speakers) = call(FakeModels::default());
+        let models = Arc::new(FakeModels::default());
+        let (call, mut events, speakers) = with_setup(setup(&models, fast()));
         call.start(StartOptions { take: true });
-        next(&mut events, |event| match event {
-            VoiceEvent::State(state) if state.listening == crate::Listening::Listening => Some(()),
-            _ => None,
-        })
-        .await;
-        let sink = speakers.lock().unwrap().sink.clone().unwrap();
-        sink.send(IoEvent::Rendered(vec![0.8; WINDOW]));
-        sink.send(IoEvent::Captured(vec![0.0; WINDOW]));
-        next(&mut events, |event| match event {
-            VoiceEvent::PlaybackLevel(level) if level > 0.0 => Some(()),
-            _ => None,
-        })
-        .await;
-        call.set_config(VoiceConfig {
-            end_of_turn: crate::EndOfTurn::SmartTurn,
-            ..config()
-        });
-        let sequence = next(&mut events, |event| match event {
-            VoiceEvent::Take(_) => Some("take"),
-            VoiceEvent::PlaybackLevel(0.0) => Some("zero"),
-            VoiceEvent::Error(error) if error.code == "end-of-turn-missing" => Some("error"),
-            _ => None,
-        })
-        .await;
-        assert_eq!(sequence, "take");
-        for expected in ["zero", "error"] {
-            let actual = next(&mut events, |event| match event {
-                VoiceEvent::PlaybackLevel(0.0) => Some("zero"),
-                VoiceEvent::Error(error) if error.code == "end-of-turn-missing" => Some("error"),
-                _ => None,
-            })
-            .await;
-            assert_eq!(actual, expected);
+        assert_eq!(started(&mut events).await, crate::Listening::Listening);
+        // Smart on models with no end-of-turn model: the change fails, and the call goes on listening with silence.
+        let mut smart = fast();
+        if let Some(input) = &mut smart.input {
+            input.end_of_turn = crate::EndOfTurn::Smart {};
         }
+        call.update(setup(&models, smart));
+        let seen = next(&mut events, |event| match event {
+            VoiceEvent::Error(error) => Some(error.code),
+            VoiceEvent::Take(_) => Some("take".into()),
+            VoiceEvent::State(state) if state.listening == crate::Listening::Idle => {
+                Some("idle".into())
+            }
+            _ => None,
+        })
+        .await;
+        assert_eq!(seen, "end-of-turn-missing");
+        let sink = speakers.lock().unwrap().sink.clone().unwrap();
+        for frame in [silence(300), clip(QUILTER, 0.9), silence(2_600)]
+            .concat()
+            .chunks(160)
+        {
+            sink.send(IoEvent::Captured(frame.to_vec()));
+        }
+        next(&mut events, |event| match event {
+            VoiceEvent::Turn(TurnEvent::Finished { .. }) => Some(()),
+            VoiceEvent::State(state) if state.listening == crate::Listening::Idle => {
+                panic!("the call stopped")
+            }
+            _ => None,
+        })
+        .await;
     });
 }
-
 /// Starts `call` and sends it `audio` as its microphone; answers its events.
 async fn hear(
     call: &VoiceCall,
@@ -1083,5 +1142,400 @@ fn end_input_of_one_call_leaves_another_calls_turn_open() {
         })
         .await;
         assert!(other.is_err(), "the other call's turn is still open");
+    });
+}
+
+/// How what `saying` says ends, within five seconds.
+async fn outcome(mut saying: crate::Saying) -> SayOutcome {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(SayEvent::Done { outcome }) = saying.next().await {
+                return outcome;
+            }
+        }
+    })
+    .await
+    .expect("it ended in time")
+}
+
+/// The first state that says the call is started.
+async fn started(events: &mut Events) -> crate::Listening {
+    next(events, |event| match event {
+        VoiceEvent::State(state) if state.listening != crate::Listening::Idle => {
+            Some(state.listening)
+        }
+        VoiceEvent::Error(error) => panic!("{}", error.code),
+        _ => None,
+    })
+    .await
+}
+
+#[test]
+fn a_call_with_only_an_output_half_loads_and_opens_nothing_of_the_input() {
+    runtime().block_on(async {
+        let models = Arc::new(FakeModels::default());
+        let (call, mut events, speakers) = with_setup(setup(
+            &models,
+            CallConfig {
+                input: None,
+                ..fast()
+            },
+        ));
+        call.start(StartOptions::default());
+        assert_eq!(started(&mut events).await, crate::Listening::Off);
+        assert!(!speakers.lock().unwrap().input, "no microphone asked for");
+        assert_eq!(
+            [&models.loads, &models.transcribers, &models.classifiers]
+                .map(|loads| loads.load(Ordering::SeqCst)),
+            [0, 0, 0],
+            "no detector, transcriber or end-of-turn model"
+        );
+        assert_eq!(models.speakers.load(Ordering::SeqCst), 1);
+        let saying = call.say("Only spoken.", SayOptions::default());
+        assert_eq!(outcome(saying).await, SayOutcome::Heard);
+    });
+}
+
+#[test]
+fn a_transcription_try_loads_no_speaker_and_silence_loads_no_end_of_turn_model() {
+    runtime().block_on(async {
+        let models = Arc::new(FakeModels::default());
+        let try_config = CallConfig {
+            output: None,
+            ..config_with(|input| {
+                input.end_of_turn = crate::EndOfTurn::Silence { ms: Some(1_500) };
+            })
+        };
+        let (call, mut events, speakers) = with_setup(setup(&models, try_config));
+        call.start(StartOptions::default());
+        assert_eq!(started(&mut events).await, crate::Listening::Listening);
+        assert!(speakers.lock().unwrap().input);
+        assert_eq!(
+            [
+                &models.loads,
+                &models.transcribers,
+                &models.speakers,
+                &models.classifiers
+            ]
+            .map(|loads| loads.load(Ordering::SeqCst)),
+            [1, 1, 0, 0]
+        );
+        let saying = call.say("Nobody hears this.", SayOptions::default());
+        assert!(matches!(
+            outcome(saying).await,
+            SayOutcome::NotPlayed {
+                reason: crate::StopReason::Failed { ref code }
+            } if code == "output-missing"
+        ));
+    });
+}
+
+#[test]
+fn an_update_keeps_what_the_same_models_loaded() {
+    runtime().block_on(async {
+        let models = Arc::new(FakeModels {
+            end_of_turn: Some(Arc::new(Finished(Arc::default()))),
+            ..FakeModels::default()
+        });
+        let try_config = CallConfig {
+            output: None,
+            ..fast()
+        };
+        let (call, mut events, _speakers) = with_setup(setup(&models, try_config));
+        call.start(StartOptions::default());
+        started(&mut events).await;
+        // The output half joins on the same models: only the speaker loads, and what is said is heard.
+        call.update(setup(&models, fast()));
+        let saying = call.say("Now it speaks.", SayOptions::default());
+        assert_eq!(outcome(saying).await, SayOutcome::Heard);
+        // The end of turn turns smart and back: only the end-of-turn model loads, once.
+        let smart = config_with(|input| {
+            input.patience = Patience::Fast;
+            input.end_of_turn = crate::EndOfTurn::Smart {};
+        });
+        call.update(setup(
+            &models,
+            CallConfig {
+                call: fast().call,
+                ..smart
+            },
+        ));
+        until(|| models.classifiers.load(Ordering::SeqCst) == 1).await;
+        call.update(setup(&models, fast()));
+        call.stop();
+        next(&mut events, |event| match event {
+            VoiceEvent::State(state) if state.listening == crate::Listening::Idle => Some(()),
+            _ => None,
+        })
+        .await;
+        assert_eq!(
+            [
+                &models.loads,
+                &models.transcribers,
+                &models.speakers,
+                &models.classifiers
+            ]
+            .map(|loads| loads.load(Ordering::SeqCst)),
+            [1, 1, 1, 1]
+        );
+    });
+}
+
+#[test]
+fn an_output_change_waits_for_the_next_utterance_and_never_cuts_what_plays() {
+    runtime().block_on(async {
+        let models = Arc::new(FakeModels::default());
+        let speaking = CallConfig {
+            input: None,
+            ..fast()
+        };
+        let (call, mut events, speakers) = with_setup(setup(&models, speaking.clone()));
+        speakers.lock().unwrap().held = true;
+        call.start(StartOptions::default());
+        started(&mut events).await;
+        let first = call.say("The first thing said.", SayOptions::default());
+        until(|| speakers.lock().unwrap().played.len() == 1).await;
+        // Another voice while it plays: nothing stops, and what waits behind it waits for the change.
+        let mut other = speaking;
+        other.output = Some(crate::OutputConfig {
+            voice: Some("other".into()),
+            ..crate::OutputConfig::default()
+        });
+        call.update(setup(&models, other));
+        let second = call.say("The second thing said.", SayOptions::default());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(speakers.lock().unwrap().stopped, 0, "nothing was cut");
+        assert_eq!(models.voices.lock().unwrap().len(), 1, "the next waits");
+        let sink = speakers.lock().unwrap().sink.clone().unwrap();
+        let (utterance, chunk) = {
+            let played = &speakers.lock().unwrap().played[0];
+            (played.0.clone(), played.1)
+        };
+        speakers.lock().unwrap().held = false;
+        sink.send(IoEvent::ChunkStarted {
+            utterance: utterance.clone(),
+            chunk,
+        });
+        sink.send(IoEvent::ChunkPlayed { utterance, chunk });
+        assert_eq!(outcome(first).await, SayOutcome::Heard);
+        assert_eq!(outcome(second).await, SayOutcome::Heard);
+        assert_eq!(
+            *models.voices.lock().unwrap(),
+            [None, Some("other".into())],
+            "the first in its voice, the next in the new one"
+        );
+        assert_eq!(
+            models.speakers.load(Ordering::SeqCst),
+            1,
+            "the same speaker"
+        );
+        assert_eq!(speakers.lock().unwrap().stopped, 0);
+    });
+}
+
+#[test]
+fn an_input_half_added_later_opens_the_microphone_and_listens() {
+    runtime().block_on(async {
+        let models = Arc::new(FakeModels::default());
+        let speaking = CallConfig {
+            input: None,
+            ..fast()
+        };
+        let (call, mut events, speakers) = with_setup(setup(&models, speaking));
+        call.start(StartOptions::default());
+        assert_eq!(started(&mut events).await, crate::Listening::Off);
+        assert!(!speakers.lock().unwrap().input);
+        // A microphone appears: the input half joins without a restart.
+        call.update(setup(&models, fast()));
+        next(&mut events, |event| match event {
+            VoiceEvent::State(state) if state.listening == crate::Listening::Listening => Some(()),
+            VoiceEvent::State(state) if state.listening == crate::Listening::Idle => {
+                panic!("restarted")
+            }
+            _ => None,
+        })
+        .await;
+        assert!(speakers.lock().unwrap().input, "the microphone was opened");
+        assert_eq!(models.loads.load(Ordering::SeqCst), 1);
+        let sink = speakers.lock().unwrap().sink.clone().unwrap();
+        for frame in [silence(300), clip(QUILTER, 0.9), silence(2_600)]
+            .concat()
+            .chunks(160)
+        {
+            sink.send(IoEvent::Captured(frame.to_vec()));
+        }
+        next(&mut events, |event| match event {
+            VoiceEvent::Turn(TurnEvent::Finished { .. }) => Some(()),
+            _ => None,
+        })
+        .await;
+        // And it can go again, at the next turn: the microphone closes.
+        call.update(setup(
+            &models,
+            CallConfig {
+                input: None,
+                ..fast()
+            },
+        ));
+        next(&mut events, |event| match event {
+            VoiceEvent::State(state) if state.listening == crate::Listening::Off => Some(()),
+            _ => None,
+        })
+        .await;
+        assert!(!speakers.lock().unwrap().input, "the microphone was closed");
+    });
+}
+
+#[test]
+fn a_lost_microphone_leaves_a_call_that_speaks_speaking() {
+    runtime().block_on(async {
+        let (call, mut events, speakers) = call(FakeModels::default());
+        call.start(StartOptions::default());
+        assert_eq!(started(&mut events).await, crate::Listening::Listening);
+        let sink = speakers.lock().unwrap().sink.clone().unwrap();
+        sink.send(IoEvent::InputLost("microphone-lost".into()));
+        let code = next(&mut events, |event| match event {
+            VoiceEvent::Error(error) => Some(error.code),
+            _ => None,
+        })
+        .await;
+        assert_eq!(code, "microphone-lost");
+        next(&mut events, |event| match event {
+            VoiceEvent::State(state) if state.listening == crate::Listening::Off => Some(()),
+            VoiceEvent::State(state) if state.listening == crate::Listening::Idle => {
+                panic!("the call stopped")
+            }
+            _ => None,
+        })
+        .await;
+        let saying = call.say("Still speaking.", SayOptions::default());
+        assert_eq!(outcome(saying).await, SayOutcome::Heard);
+        // A microphone refused while opening: it starts speaking only.
+        call.stop();
+        until(|| speakers.lock().unwrap().sink.is_none()).await;
+        call.update(setup(&Arc::new(FakeModels::default()), fast()));
+        speakers.lock().unwrap().opening = true;
+        call.start(StartOptions::default());
+        until(|| speakers.lock().unwrap().sink.is_some()).await;
+        let sink = speakers.lock().unwrap().sink.clone().unwrap();
+        sink.send(IoEvent::InputLost("microphone-denied".into()));
+        sink.send(IoEvent::Ready);
+        // The call works, speaking only, and then says why it does not listen.
+        let first = next(&mut events, |event| match event {
+            VoiceEvent::State(state) if state.listening == crate::Listening::Off => Some(None),
+            VoiceEvent::State(state) if state.listening == crate::Listening::Listening => {
+                panic!("listening without a microphone")
+            }
+            VoiceEvent::Error(error) => Some(Some(error.code)),
+            _ => None,
+        })
+        .await;
+        assert_eq!(first, None, "the state before the error");
+        let code = next(&mut events, |event| match event {
+            VoiceEvent::Error(error) => Some(error.code),
+            _ => None,
+        })
+        .await;
+        assert_eq!(code, "microphone-denied");
+    });
+}
+
+#[test]
+fn a_lost_microphone_ends_a_call_that_only_listens() {
+    runtime().block_on(async {
+        let listening = CallConfig {
+            output: None,
+            ..fast()
+        };
+        let (call, mut events, speakers) = with_config(FakeModels::default(), listening);
+        call.start(StartOptions::default());
+        started(&mut events).await;
+        let sink = speakers.lock().unwrap().sink.clone().unwrap();
+        sink.send(IoEvent::InputLost("microphone-lost".into()));
+        let code = next(&mut events, |event| match event {
+            VoiceEvent::Error(error) => Some(error.code),
+            _ => None,
+        })
+        .await;
+        assert_eq!(code, "microphone-lost");
+        next(&mut events, |event| match event {
+            VoiceEvent::State(state) if state.listening == crate::Listening::Idle => Some(()),
+            _ => None,
+        })
+        .await;
+        drop(call);
+    });
+}
+
+/// Input models whose transcriber loads only when the test says, with a detector that logs what it is fed.
+struct Warming {
+    log: Arc<Mutex<Vec<String>>>,
+    gate: Arc<tokio::sync::Notify>,
+}
+
+struct LoggedDetector(Arc<Mutex<Vec<String>>>);
+
+#[async_trait]
+impl Vad for LoggedDetector {
+    async fn accept(&mut self, pcm: &[f32]) -> Result<Vec<VadFrame>, String> {
+        let silent = pcm.iter().all(|sample| *sample == 0.0);
+        self.0
+            .lock()
+            .unwrap()
+            .push(format!("accept {} silent {silent}", pcm.len()));
+        Ok(Vec::new())
+    }
+
+    async fn reset(&mut self) {
+        self.0.lock().unwrap().push("reset".into());
+    }
+}
+
+#[async_trait]
+impl InputModels for Warming {
+    async fn vad(&self) -> Result<Box<dyn Vad>, String> {
+        self.log.lock().unwrap().push("vad loaded".into());
+        Ok(Box::new(LoggedDetector(Arc::clone(&self.log))))
+    }
+
+    async fn transcriber(&self) -> Result<Arc<dyn Transcriber>, String> {
+        self.gate.notified().await;
+        self.log.lock().unwrap().push("transcriber loaded".into());
+        Ok(Arc::new(FakeTranscriber))
+    }
+}
+
+#[test]
+fn the_detector_warms_up_while_the_other_models_load() {
+    runtime().block_on(async {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let input = Arc::new(Warming {
+            log: Arc::clone(&log),
+            gate: Arc::clone(&gate),
+        });
+        let config = fast();
+        let setup = VoiceSetup {
+            input: config.input.map(|config| VoiceInput {
+                models: input as Arc<dyn InputModels>,
+                config,
+            }),
+            output: config.output.map(|config| VoiceOutput {
+                models: Arc::new(FakeModels::default()) as Arc<dyn OutputModels>,
+                config,
+            }),
+            config: config.call,
+        };
+        let (call, mut events, _speakers) = with_setup(setup);
+        call.start(StartOptions::default());
+        // The transcriber still loads: the detector has run its first windows on silence and started over.
+        until(|| log.lock().unwrap().iter().any(|entry| entry == "reset")).await;
+        assert_eq!(
+            *log.lock().unwrap(),
+            ["vad loaded", "accept 1600 silent true", "reset"]
+        );
+        gate.notify_one();
+        assert_eq!(started(&mut events).await, crate::Listening::Listening);
+        assert_eq!(log.lock().unwrap().last().unwrap(), "transcriber loaded");
     });
 }

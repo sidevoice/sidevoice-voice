@@ -10,18 +10,23 @@ use js_sys::{Array, Float32Array, Promise, Reflect};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 
-use super::{EndOfTurnModel, Models, Speaker, Transcriber, Vad, VadFrame, VoiceModels};
+use super::{EndOfTurnModel, InputModels, OutputModels, Speaker, Transcriber, Vad, VadFrame};
 
 #[wasm_bindgen]
 extern "C" {
-    /// `VoiceModels`: `{ load(): Promise<{createVad(), transcriber, speaker, endOfTurn?}> }`.
-    pub type JsVoiceModels;
+    /// `VoiceInputModels`: `{ vad(), transcriber(), endOfTurn?() }`, each answering the loaded model or a promise of it.
+    pub type JsInputModels;
     #[wasm_bindgen(method, catch)]
-    fn load(this: &JsVoiceModels) -> Result<JsValue, JsValue>;
+    fn vad(this: &JsInputModels) -> Result<JsValue, JsValue>;
+    #[wasm_bindgen(method, catch)]
+    fn transcriber(this: &JsInputModels) -> Result<JsValue, JsValue>;
+    #[wasm_bindgen(method, catch, js_name = endOfTurn)]
+    fn end_of_turn(this: &JsInputModels) -> Result<JsValue, JsValue>;
 
-    type JsLoadedModels;
-    #[wasm_bindgen(method, catch, js_name = createVad)]
-    fn create_vad(this: &JsLoadedModels) -> Result<JsValue, JsValue>;
+    /// `VoiceOutputModels`: `{ speaker() }`, answering the loaded speaker or a promise of it.
+    pub type JsOutputModels;
+    #[wasm_bindgen(method, catch)]
+    fn speaker(this: &JsOutputModels) -> Result<JsValue, JsValue>;
 
     type JsVad;
     #[wasm_bindgen(method, catch)]
@@ -50,7 +55,7 @@ extern "C" {
 
     type JsEndOfTurn;
     #[wasm_bindgen(method, catch, js_name = endOfTurn)]
-    fn end_of_turn(
+    fn probability(
         this: &JsEndOfTurn,
         samples: Float32Array,
         sample_rate: u32,
@@ -58,29 +63,56 @@ extern "C" {
 }
 
 #[async_trait(?Send)]
-impl VoiceModels for JsVoiceModels {
-    async fn load(&self) -> Result<Models, String> {
-        let loaded = settle(JsVoiceModels::load(self), "models-load-failed").await?;
-        let field = |name: &str| Reflect::get(&loaded, &name.into()).unwrap_or(JsValue::UNDEFINED);
-        let present = |value: &JsValue| !value.is_undefined() && !value.is_null();
-        let (transcriber, speaker) = (field("transcriber"), field("speaker"));
-        let vad = settle(
-            JsLoadedModels::create_vad(&loaded.clone().unchecked_into()),
+impl InputModels for JsInputModels {
+    async fn vad(&self) -> Result<Box<dyn Vad>, String> {
+        let vad = present(
+            settle(JsInputModels::vad(self), "vad-failed").await?,
             "vad-failed",
-        )
-        .await?;
-        if !present(&vad) || !present(&transcriber) || !present(&speaker) {
-            return Err("models-incomplete".into());
+        )?;
+        Ok(Box::new(WebVad(vad.unchecked_into())))
+    }
+
+    async fn transcriber(&self) -> Result<Arc<dyn Transcriber>, String> {
+        let failure = "transcriber-load-failed";
+        let transcriber = present(
+            settle(JsInputModels::transcriber(self), failure).await?,
+            failure,
+        )?;
+        Ok(Arc::new(WebTranscriber(transcriber.unchecked_into())))
+    }
+
+    async fn end_of_turn(&self) -> Result<Arc<dyn EndOfTurnModel>, String> {
+        let method = Reflect::get(self, &"endOfTurn".into()).unwrap_or(JsValue::UNDEFINED);
+        if !method.is_function() {
+            return Err(super::END_OF_TURN_MISSING.into());
         }
-        let end_of_turn = field("endOfTurn");
-        Ok(Models {
-            vad: Box::new(WebVad(vad.unchecked_into())),
-            transcriber: Arc::new(WebTranscriber(transcriber.unchecked_into())),
-            speaker: Arc::new(WebSpeaker(speaker.unchecked_into())),
-            end_of_turn: present(&end_of_turn).then(|| {
-                Arc::new(WebEndOfTurn(end_of_turn.unchecked_into())) as Arc<dyn EndOfTurnModel>
-            }),
-        })
+        let failure = "end-of-turn-load-failed";
+        let model = present(
+            settle(JsInputModels::end_of_turn(self), failure).await?,
+            failure,
+        )?;
+        Ok(Arc::new(WebEndOfTurn(model.unchecked_into())))
+    }
+}
+
+#[async_trait(?Send)]
+impl OutputModels for JsOutputModels {
+    async fn speaker(&self) -> Result<Arc<dyn Speaker>, String> {
+        let failure = "speaker-load-failed";
+        let speaker = present(
+            settle(JsOutputModels::speaker(self), failure).await?,
+            failure,
+        )?;
+        Ok(Arc::new(WebSpeaker(speaker.unchecked_into())))
+    }
+}
+
+/// `value`, unless it is null or undefined: then `failure`.
+fn present(value: JsValue, failure: &str) -> Result<JsValue, String> {
+    if value.is_undefined() || value.is_null() {
+        Err(failure.to_owned())
+    } else {
+        Ok(value)
     }
 }
 
@@ -170,7 +202,7 @@ impl EndOfTurnModel for WebEndOfTurn {
     async fn end_of_turn(&self, pcm: Vec<f32>, sample_rate: u32) -> Result<f32, String> {
         let p = self
             .0
-            .end_of_turn(Float32Array::from(&pcm[..]), sample_rate);
+            .probability(Float32Array::from(&pcm[..]), sample_rate);
         let p = settle(p, "end-of-turn-failed").await?;
         p.as_f64()
             .map(|p| p as f32)

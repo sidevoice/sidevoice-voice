@@ -51,6 +51,8 @@ struct Inner {
 struct State {
     physical: Box<dyn AudioIo>,
     running: bool,
+    /// Whether the physical microphone is open: some started lane asked for it.
+    microphone: bool,
     generation: u64,
     next_lane: u64,
     next_frame: u64,
@@ -65,6 +67,8 @@ struct State {
 
 struct Lane {
     sink: Option<IoSink>,
+    /// Whether it asked for the microphone.
+    input: bool,
     queued: VecDeque<Chunk>,
     incarnation: u64,
     /// The lane's one resampler to the mixing rate, and the rate it takes: chunks follow each other without a seam.
@@ -137,6 +141,7 @@ impl SharedNativeAudio {
             state: Mutex::new(State {
                 physical,
                 running: false,
+                microphone: false,
                 generation: 0,
                 next_lane: 1,
                 next_frame: 0,
@@ -170,6 +175,7 @@ impl SharedNativeAudio {
             id,
             Lane {
                 sink: None,
+                input: false,
                 queued: VecDeque::new(),
                 incarnation: 0,
                 resampler: None,
@@ -207,14 +213,17 @@ impl SharedNativeAudio {
 }
 
 impl AudioIo for LaneIo {
-    fn start(&mut self, sink: IoSink) -> Result<(), String> {
+    fn start(&mut self, sink: IoSink, input: bool) -> Result<(), String> {
         let mut state = self.inner.state.lock().expect("shared audio");
         let Some(lane) = state.lanes.get_mut(&self.id) else {
             return Err("audio-lane-gone".into());
         };
         lane.sink = Some(sink.clone());
+        lane.input = input;
         lane.incarnation = lane.incarnation.wrapping_add(1);
-        if !state.running {
+        if state.running {
+            state.microphone_as_asked();
+        } else {
             state.generation += 1;
             let physical_sink = IoSink {
                 messages: self.inner.messages.clone(),
@@ -222,14 +231,31 @@ impl AudioIo for LaneIo {
                 rendered: Arc::clone(&self.inner.rendered),
                 direct_rendered: true,
             };
-            if let Err(code) = state.physical.start(physical_sink) {
+            let microphone = state
+                .lanes
+                .values()
+                .any(|lane| lane.sink.is_some() && lane.input);
+            if let Err(code) = state.physical.start(physical_sink, microphone) {
                 state.lanes.get_mut(&self.id).expect("lane").sink = None;
                 return Err(code);
             }
             state.running = true;
+            state.microphone = microphone;
         }
         sink.send(IoEvent::Ready);
         Ok(())
+    }
+
+    fn set_input(&mut self, input: bool) {
+        let mut state = self.inner.state.lock().expect("shared audio");
+        let Some(lane) = state.lanes.get_mut(&self.id) else {
+            return;
+        };
+        if lane.sink.is_none() {
+            return;
+        }
+        lane.input = input;
+        state.microphone_as_asked();
     }
 
     fn play(&mut self, utterance: &str, chunk: usize, samples: Vec<f32>, sample_rate: u32) {
@@ -290,9 +316,13 @@ impl AudioIo for LaneIo {
         if state.routed == Some(self.id) {
             state.routed = None;
         }
+        if state.running && state.lanes.values().any(|lane| lane.sink.is_some()) {
+            state.microphone_as_asked();
+        }
         if state.running && state.lanes.values().all(|lane| lane.sink.is_none()) {
             state.physical.stop();
             state.running = false;
+            state.microphone = false;
             state.generation += 1;
             state.frames.clear();
             state.frame_order.clear();
@@ -316,6 +346,18 @@ impl Drop for LaneIo {
 }
 
 impl State {
+    /// Opens the physical microphone when a started lane asks for it, and closes it when none does.
+    fn microphone_as_asked(&mut self) {
+        let wanted = self
+            .lanes
+            .values()
+            .any(|lane| lane.sink.is_some() && lane.input);
+        if wanted != self.microphone {
+            self.microphone = wanted;
+            self.physical.set_input(wanted);
+        }
+    }
+
     /// Attribute only the physical samples actually consumed by the output. The physical backend reports rendered
     /// samples before progress in a tick, so hold them until its first chunk-start marker arrives.
     fn rendered(&mut self, samples: Vec<f32>, queued: Vec<bool>) {
@@ -623,8 +665,18 @@ impl State {
                     }
                 }
             }
+            IoEvent::InputLost(code) => {
+                self.microphone = false;
+                for lane in self.lanes.values_mut() {
+                    if let Some(sink) = lane.sink.as_ref().filter(|_| lane.input) {
+                        sink.send(IoEvent::InputLost(code.clone()));
+                        lane.input = false;
+                    }
+                }
+            }
             IoEvent::Failed(code) => {
                 self.running = false;
+                self.microphone = false;
                 self.frames.clear();
                 self.frame_order.clear();
                 self.rendered_pending.clear();

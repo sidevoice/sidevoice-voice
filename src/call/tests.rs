@@ -2,10 +2,12 @@
 //! tests play the models and the speaker by hand.
 
 use super::{Call, Effect, Input};
-use crate::config::{EndOfTurn, Patience, VoiceConfig};
+use crate::config::{CallConfig, EndOfTurn, Patience};
 use crate::event::{CallState, Listening, Microphone, TurnEvent, TurnTimings, VoiceEvent};
 use crate::say::{SayEvent, SayOutcome, StopReason};
-use crate::test_support::{clip, config, silence, EnergyVad, FLEURS_ES, QUILTER, WINDOW};
+use crate::test_support::{
+    clip, config, config_with, silence, EnergyVad, FLEURS_ES, QUILTER, WINDOW,
+};
 
 #[cfg(web)]
 use wasm_bindgen_test::wasm_bindgen_test as test;
@@ -53,7 +55,7 @@ struct Run {
 }
 
 impl Run {
-    fn new(config: VoiceConfig) -> Self {
+    fn new(config: CallConfig) -> Self {
         let mut run = Self {
             call: Call::new(config, "c".into(), EPOCH),
             vad: EnergyVad::new(),
@@ -378,10 +380,7 @@ fn a_short_pause_stays_inside_the_turn() {
 
 #[test]
 fn a_turn_within_the_merge_window_joins_the_one_before() {
-    let mut run = Run::new(VoiceConfig {
-        patience: Patience::Calm,
-        ..config()
-    });
+    let mut run = Run::new(config_with(|input| input.patience = Patience::Calm));
     run.hear(&speech());
     run.hear(&silence(3_800));
     let (first, _) = Run::transcribe(&run.take()).expect("the first turn");
@@ -423,10 +422,7 @@ fn a_turn_within_the_merge_window_joins_the_one_before() {
 
 #[test]
 fn two_calls_keep_transcription_and_merge_queues_separate() {
-    let config = VoiceConfig {
-        patience: Patience::Calm,
-        ..config()
-    };
+    let config = config_with(|input| input.patience = Patience::Calm);
     let mut a = Run::new(config.clone());
     let mut b = Run::new(config);
     a.hear(&speech());
@@ -805,10 +801,7 @@ fn a_sentence_that_trails_off_under_minus_30_dbfs_is_one_turn() {
 
 #[test]
 fn smart_turn_is_asked_at_each_pause_and_a_pause_it_leaves_open_ends_3_s_after_speech_stopped() {
-    let mut run = Run::new(VoiceConfig {
-        end_of_turn: EndOfTurn::SmartTurn,
-        ..config()
-    });
+    let mut run = Run::new(config_with(|input| input.end_of_turn = EndOfTurn::Smart {}));
     run.hear(&speech());
     run.take();
     // A pause mid-sentence: the model is asked once speech has stopped (0.9 s without it), about the turn so far.
@@ -842,10 +835,7 @@ fn smart_turn_is_asked_at_each_pause_and_a_pause_it_leaves_open_ends_3_s_after_s
 
 #[test]
 fn smart_turn_ends_a_finished_sentence_as_soon_as_speech_stopped() {
-    let mut run = Run::new(VoiceConfig {
-        end_of_turn: EndOfTurn::SmartTurn,
-        ..config()
-    });
+    let mut run = Run::new(config_with(|input| input.end_of_turn = EndOfTurn::Smart {}));
     run.hear(&speech());
     let (_, effects) = run.quiet_until(|effects| Run::asked(effects).is_some());
     let (turn, pause, _) = Run::asked(&effects).expect("asked at the pause");
@@ -993,10 +983,7 @@ fn transcripts_that_say_nothing_cancel_their_turn() {
 
 #[test]
 fn turns_wait_in_order_and_the_ninth_is_dropped() {
-    let mut run = Run::new(VoiceConfig {
-        patience: Patience::Fast,
-        ..config()
-    });
+    let mut run = Run::new(config_with(|input| input.patience = Patience::Fast));
     for _ in 0..9 {
         run.hear(&speech());
         run.hear(&silence(2_600));
@@ -1112,10 +1099,7 @@ fn mute_finishes_with_premute_words_and_an_empty_result_uses_normal_closure() {
 
 #[test]
 fn muted_smart_turn_uses_the_normal_pause_decision_and_preserves_words() {
-    let mut run = Run::new(VoiceConfig {
-        end_of_turn: EndOfTurn::SmartTurn,
-        ..config()
-    });
+    let mut run = Run::new(config_with(|input| input.end_of_turn = EndOfTurn::Smart {}));
     run.hear(&speech());
     run.take();
     run.input(Input::Mute(true));
@@ -1600,4 +1584,100 @@ fn after_end_input_a_reply_is_admitted_and_the_next_turn_ends_by_its_own_silence
     run.hear(&silence(3_000));
     let (turn, _) = Run::transcribe(&run.take()).expect("ended by silence");
     assert_eq!(turn, 1);
+}
+
+#[test]
+fn a_call_without_an_input_half_hears_nothing_and_speaks() {
+    let mut run = Run::new(CallConfig {
+        input: None,
+        ..config()
+    });
+    let started = run.take();
+    assert!(started.iter().any(|effect| matches!(
+        effect,
+        Effect::Event(VoiceEvent::State(state)) if state.listening == Listening::Off
+    )));
+    run.hear(&speech());
+    run.hear(&silence(3_000));
+    let heard = run.take();
+    assert!(Run::turns(&heard).is_empty(), "no microphone, no turn");
+    assert!(Run::transcribe(&heard).is_none());
+    run.reply("u1", "Spoken with no one listening.");
+    assert_eq!(Run::synthesize(&run.take()).len(), 1);
+}
+
+#[test]
+fn a_call_without_an_output_half_does_not_play_what_it_is_asked_to_say() {
+    let mut run = Run::new(CallConfig {
+        output: None,
+        ..config()
+    });
+    run.take();
+    run.reply("u1", "Nobody would hear this.");
+    let effects = run.take();
+    assert!(Run::synthesize(&effects).is_empty());
+    assert_eq!(
+        Run::outcomes(&effects),
+        [(
+            "u1".into(),
+            SayOutcome::NotPlayed {
+                reason: StopReason::Failed {
+                    code: "output-missing".into()
+                }
+            }
+        )]
+    );
+    // It still hears and tells turns.
+    run.hear(&speech());
+    run.hear(&silence(3_000));
+    assert!(Run::transcribe(&run.take()).is_some());
+}
+
+#[test]
+fn silence_ends_a_turn_after_its_own_pause_or_the_patience_s() {
+    let numbers =
+        |end_of_turn| super::segmentation(&config_with(|input| input.end_of_turn = end_of_turn));
+    let own = numbers(EndOfTurn::Silence { ms: Some(1_500) });
+    assert_eq!((own.stop_ms, own.end_ms, own.ask), (200, 1_500, false));
+    let patient = numbers(EndOfTurn::Silence { ms: None });
+    assert_eq!(patient.end_ms, Patience::Normal.silence_ms());
+    let smart = numbers(EndOfTurn::Smart {});
+    assert_eq!((smart.stop_ms, smart.end_ms, smart.ask), (900, 3_000, true));
+}
+
+#[test]
+fn a_held_output_starts_nothing_new_and_one_that_goes_ends_what_waits() {
+    let mut run = Run::new(config());
+    run.take();
+    run.input(Input::HoldOutput(true));
+    run.reply("u1", "Waits for the hold to lift.");
+    run.wait(2_000);
+    assert!(Run::synthesize(&run.take()).is_empty(), "held");
+    assert!(run.call.output_idle());
+    run.input(Input::HoldOutput(false));
+    assert_eq!(Run::synthesize(&run.take()).len(), 1, "lifted: it starts");
+    run.reply("u2", "Never said.");
+    run.input(Input::Config(Box::new(CallConfig {
+        output: None,
+        ..config()
+    })));
+    let outcomes = Run::outcomes(&run.take());
+    assert!(outcomes.contains(&(
+        "u2".into(),
+        SayOutcome::NotPlayed {
+            reason: StopReason::Failed {
+                code: "output-missing".into()
+            }
+        }
+    )));
+}
+
+#[test]
+fn an_input_change_waits_for_no_turn_to_be_open() {
+    let mut run = Run::new(config());
+    assert!(run.call.input_idle());
+    run.hear(&speech());
+    assert!(!run.call.input_idle(), "a turn is open");
+    run.hear(&silence(3_000));
+    assert!(run.call.input_idle());
 }

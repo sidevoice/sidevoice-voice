@@ -1,10 +1,11 @@
 //! The voice call on the device: the microphone heard as turns of speech, transcribed, and told to the app as words;
 //! what the app asks it to say spoken, played, cut when the person speaks over it, and told back as heard, heard up to
-//! a point, or not played. The models it runs are the app's, through the module's own interfaces (`models`:
-//! [`VoiceModels`], [`Vad`], [`Transcriber`], [`Speaker`], [`EndOfTurnModel`]); nothing here names or links one. It
-//! knows nothing of what the app does with the words or where what it says comes from.
+//! a point, or not played. Each half is optional ([`VoiceSetup`]): a call can only listen, only speak, or both, and
+//! loads and opens only what its halves use. The models it runs are the app's, through the module's own interfaces
+//! (`models`: [`InputModels`], [`OutputModels`], [`Vad`], [`Transcriber`], [`Speaker`], [`EndOfTurnModel`]); nothing
+//! here names or links one. It knows nothing of what the app does with the words or where what it says comes from.
 //!
-//! Inside: `config` ([`VoiceConfig`]), `event` (what a call tells its host), `say` (something said and its handle),
+//! Inside: `setup` ([`VoiceSetup`], the halves), `config` ([`VoiceConfig`], [`InputConfig`], [`OutputConfig`]), `event` (what a call tells its host), `say` (something said and its handle),
 //! `turns` (segmentation: detector windows into turns), `recognition` (the queue, the acceptance filter and the merge
 //! window), `speech` (a text in sentence chunks), `playback` (the queue, barge-in and the heard position), `take` (what
 //! the microphone gave over one stretch of listening, and where the turns fell in it) and `call`
@@ -25,6 +26,7 @@ mod recognition;
 mod residency;
 mod runtime;
 mod say;
+mod setup;
 mod speech;
 mod take;
 mod turns;
@@ -39,7 +41,9 @@ mod test_support;
 /// in the wasm32 build.
 #[doc(no_inline)]
 pub use async_trait::async_trait;
-pub use config::{BargeInMinSpeech, EndOfTurn, ListeningBar, Patience, VoiceConfig};
+pub use config::{
+    BargeInMinSpeech, EndOfTurn, InputConfig, ListeningBar, OutputConfig, Patience, VoiceConfig,
+};
 pub use event::{
     CallState, Listening, Microphone, PlaybackState, TurnEvent, TurnTimings, VoiceError, VoiceEvent,
 };
@@ -50,9 +54,10 @@ pub use io::{
 pub use io::{AudioIo, IoEvent, IoSink};
 pub use maybe_send::{MaybeSend, MaybeSync};
 pub use models::{
-    EndOfTurnModel, Models, SharedModelLoader, SharedModelResources, SharedModels, Speaker,
-    Transcriber, Vad, VadFactory, VadFrame, VoiceModels,
+    EndOfTurnModel, InputModels, OutputModels, SharedModelLoader, SharedModels, Speaker,
+    Transcriber, Vad, VadFactory, VadFrame,
 };
 pub use say::{SayCancel, SayEvent, SayOptions, SayOutcome, Saying, StopReason};
+pub use setup::{VoiceInput, VoiceOutput, VoiceSetup};
 pub use take::{Take, TakePause, TakeTurn};
 pub use voice_call::{Events, StartOptions, VoiceCall};

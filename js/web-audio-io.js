@@ -1,7 +1,8 @@
-// The browser's microphone and speaker for a call, `createWebAudioIo(options)`: an object with `start(sink)`,
-// `play(utterance, chunk, samples, sampleRate)`, `stopPlayback()` and `stop()`, reporting to `sink` (`captured`,
-// `rendered(samples)` (16 kHz output after gain/fade), `playbackEnded()` (terminal zero),
-// `chunkStarted`, `chunkPlayed`, `failed`).
+// The browser's microphone and speaker for a call, `createWebAudioIo(options)`: an object with `start(sink, {input})`,
+// `setInput(input)`, `play(utterance, chunk, samples, sampleRate)`, `stopPlayback()` and `stop()`, reporting to `sink`
+// (`captured`, `rendered(samples)` (16 kHz output after gain/fade), `playbackEnded()` (terminal zero),
+// `chunkStarted`, `chunkPlayed`, `inputLost`, `failed`). The microphone is asked for only with `input` (at start, or
+// later through `setInput(true)`): a call that only speaks opens none.
 //
 // - Capture is `getUserMedia` with the browser's echo cancellation, noise suppression and gain control: the browser's
 //   canceller is the web's echo cancellation, and none other is applied. An AudioWorklet (capture-worklet.js) turns
@@ -11,12 +12,13 @@
 //   source ends.
 // - A microphone whose track the browser mutes (another app or the system holds it, or the device stopped delivering)
 //   gives silence, not a failure: `sink.microphoneMuted(true)` says so, and `false` once it gives audio again.
-// - Failures reach `sink.failed(code)` as stable codes: `microphone-denied`, `microphone-unavailable`,
-//   `microphone-lost`, `audio-capture-failed` (capture worklet load/processor),
-//   `audio-output-failed` (playback worklet/output). Once failed, it is stopped.
+// - A microphone that cannot open (`microphone-denied`, `microphone-unavailable`, `echo-cancellation-unavailable`) or
+//   that goes away with no other in its place (`microphone-lost`) reaches `sink.inputLost(code)`: it is closed and the
+//   speaker goes on. Other failures reach `sink.failed(code)`: `audio-capture-failed` (capture worklet
+//   load/processor), `audio-output-failed` (playback worklet/output). Once failed, it is stopped.
 // - The microphone and the output can be chosen by id, at start (`inputDevice`, `outputDevice`) or at any time
 //   (`setInputDevice`, `setOutputDevice`): a call that runs switches without ending. A chosen microphone that goes
-//   away falls back to the default one, and `onDeviceLost` hears it; only the default one going away ends the call.
+//   away falls back to the default one, and `onDeviceLost` hears it; the default one going away is `inputLost`.
 
 const FADE_SECONDS = 0.03;
 
@@ -48,6 +50,8 @@ export function createWebAudioIo(options = {}) {
   let inputDevice = options.inputDevice || null;
   let outputDevice = options.outputDevice || null;
   let sink = null;
+  // Whether the microphone is asked for.
+  let input = false;
   let context = null;
   let stream = null;
   // The microphone's node and the worklet it feeds: a switch replaces the first and keeps the second.
@@ -79,6 +83,7 @@ export function createWebAudioIo(options = {}) {
       track.stop();
     }
     stream = null;
+    input = false;
     microphone?.disconnect();
     capture?.disconnect();
     capture?.port?.close();
@@ -188,10 +193,46 @@ export function createWebAudioIo(options = {}) {
     }
   }
 
+  // Closes the microphone; the speaker goes on.
+  function closeMicrophone() {
+    for (const track of stream?.getTracks() ?? []) {
+      track.onended = null;
+      track.onmute = null;
+      track.onunmute = null;
+      track.stop();
+    }
+    stream = null;
+    microphone?.disconnect();
+    microphone = null;
+  }
+
+  // The microphone is gone, or could not open: closed, and the call told; the speaker goes on.
+  function loseInput(code) {
+    closeMicrophone();
+    input = false;
+    sink?.inputLost(code);
+  }
+
+  // Opens the microphone, when it is asked for and not open; feeds it to the worklet once there is one.
+  async function openMicrophone(current) {
+    let media;
+    try {
+      media = await microphoneStream(inputDevice);
+    } catch (error) {
+      if (current() && input && !stream) loseInput(error.code);
+      return;
+    }
+    if (!current() || !input || stream) {
+      media.getTracks().forEach((track) => track.stop());
+      return;
+    }
+    useStream(media, current);
+  }
+
   // The chosen microphone went away: the default one takes over, and the page is told. The default one going away
-  // ends the call.
+  // is the microphone lost.
   function microphoneEnded() {
-    if (!inputDevice) return fail("microphone-lost");
+    if (!inputDevice) return loseInput("microphone-lost");
     const lost = inputDevice;
     inputDevice = null;
     const opened = session;
@@ -199,22 +240,15 @@ export function createWebAudioIo(options = {}) {
       if (opened !== session) return media.getTracks().forEach((track) => track.stop());
       useStream(media, () => opened === session);
       onDeviceLost?.("input", lost);
-    }, () => opened === session && fail("microphone-lost"));
+    }, () => opened === session && loseInput("microphone-lost"));
   }
 
   async function open(opened) {
     const current = () => opened === session;
-    let media;
-    try {
-      media = await microphoneStream(inputDevice);
-    } catch (error) {
-      return current() && fail(error.code);
+    if (input) {
+      await openMicrophone(current);
+      if (!current()) return;
     }
-    if (!current()) {
-      media.getTracks().forEach((track) => track.stop());
-      return;
-    }
-    useStream(media, current);
     try {
       await context.audioWorklet.addModule(new URL("./capture-worklet.js", import.meta.url).href);
     } catch {
@@ -228,13 +262,17 @@ export function createWebAudioIo(options = {}) {
     if (!current()) {
       return;
     }
-    microphone = context.createMediaStreamSource(stream);
     capture = new AudioWorkletNode(context, "sidevoice-capture");
     capture.port.onmessage = ({ data }) => current() && sink.captured(data);
     // A processor that throws posts nothing again: the capture is over, not quiet.
     capture.onprocessorerror = () => current() && fail("audio-capture-failed");
-    // Connected through to the destination so that every browser runs it; it outputs silence.
-    microphone.connect(capture).connect(context.destination);
+    // Connected through to the destination so that every browser runs it; it outputs silence. The microphone joins it
+    // when it is asked for.
+    capture.connect(context.destination);
+    if (stream) {
+      microphone = context.createMediaStreamSource(stream);
+      microphone.connect(capture);
+    }
     meter = new AudioWorkletNode(context, "sidevoice-playback", { outputChannelCount: [1] });
     meter.port.onmessage = ({ data }) => {
       if (!current()) return;
@@ -334,7 +372,7 @@ export function createWebAudioIo(options = {}) {
       outputDevice = next;
     },
 
-    start(newSink) {
+    start(newSink, { input: wanted = false } = {}) {
       release(teardown());
       try {
         context = new AudioContext();
@@ -342,7 +380,20 @@ export function createWebAudioIo(options = {}) {
         throw Object.assign(new Error("no AudioContext"), { code: "audio-output-failed" });
       }
       sink = newSink;
+      input = wanted === true;
       open(session);
+    },
+
+    /** Opens the microphone (`true`) or closes it (`false`) while the speaker goes on. One that cannot open is said as
+     *  `inputLost(code)`. Before `start`, or after `stop`, it does nothing. */
+    setInput(wanted) {
+      if (!sink) return;
+      input = wanted === true;
+      if (!input) closeMicrophone();
+      else if (!stream) {
+        const opened = session;
+        void openMicrophone(() => opened === session);
+      }
     },
 
     play(utterance, chunk, samples, sampleRate) {

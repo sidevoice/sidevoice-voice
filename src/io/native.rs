@@ -58,6 +58,8 @@ struct Running {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     speaker: mpsc::Sender<Command>,
+    /// Whether the microphone should be open, each time that changes.
+    microphone: mpsc::Sender<bool>,
 }
 
 /// What the audio thread hands back once the devices are open, or why they are not.
@@ -81,16 +83,23 @@ impl NativeIo {
 }
 
 impl AudioIo for NativeIo {
-    fn start(&mut self, sink: IoSink) -> Result<(), String> {
+    fn start(&mut self, sink: IoSink, input: bool) -> Result<(), String> {
         self.stop();
         let stop = Arc::new(AtomicBool::new(false));
         let (opened, open) = mpsc::channel::<Opened>();
         let (speaker, commands) = mpsc::channel::<Command>();
+        let (microphone, wanted) = mpsc::channel::<bool>();
         let thread = {
             let (stop, devices) = (Arc::clone(&stop), self.devices.clone());
+            let control = Control {
+                stop,
+                commands,
+                wanted,
+                opened,
+            };
             thread::Builder::new()
                 .name("sidevoice-voice-audio".into())
-                .spawn(move || run(&sink, &devices, &stop, &commands, &opened))
+                .spawn(move || run(&sink, &devices, input, &control))
                 .map_err(|_| "audio-thread-failed".to_owned())?
         };
         open.recv()
@@ -99,8 +108,15 @@ impl AudioIo for NativeIo {
             stop,
             thread: Some(thread),
             speaker,
+            microphone,
         });
         Ok(())
+    }
+
+    fn set_input(&mut self, input: bool) {
+        if let Some(running) = &self.running {
+            let _ = running.microphone.send(input);
+        }
     }
 
     fn play(&mut self, utterance: &str, chunk: usize, samples: Vec<f32>, sample_rate: u32) {
@@ -137,27 +153,48 @@ impl Drop for NativeIo {
     }
 }
 
-/// The audio thread: opens the devices, then moves audio until `stop`. A microphone chosen anew is switched at once;
-/// a speaker once nothing is left to play, so that no chunk the call waits on is lost with the old one.
-fn run(
-    sink: &IoSink,
-    devices: &NativeDevices,
-    stop: &AtomicBool,
-    commands: &mpsc::Receiver<Command>,
-    opened: &mpsc::Sender<Opened>,
-) {
+/// The audio thread: opens the speaker and, with `input`, the microphone, then moves audio until `stop`. A microphone
+/// chosen anew is switched at once; a speaker once nothing is left to play, so that no chunk the call waits on is lost
+/// with the old one. Without a microphone the echo canceller still takes the speaker's reference, and hears nothing.
+/// What the audio thread is told, and where it says the devices opened.
+struct Control {
+    stop: Arc<AtomicBool>,
+    commands: mpsc::Receiver<Command>,
+    /// Whether the microphone should be open.
+    wanted: mpsc::Receiver<bool>,
+    opened: mpsc::Sender<Opened>,
+}
+
+fn run(sink: &IoSink, devices: &NativeDevices, input: bool, control: &Control) {
+    let Control {
+        stop,
+        commands,
+        wanted,
+        opened,
+    } = control;
     let changed = Arc::new(AtomicBool::new(false));
     let host = cpal::default_host();
     // What is chosen from here on is switched to.
     devices.take_switch(Kind::Input);
     devices.take_switch(Kind::Output);
     let choice = devices.chosen();
-    let opening = Microphone::open(&host, choice.input.as_deref(), sink, devices, &changed)
-        .and_then(|microphone| {
-            let speaker = Speaker::open(&host, choice.output.as_deref(), sink, devices, &changed)?;
-            let pipeline = Pipeline::new(microphone.rate, microphone.channels, speaker.rate)?;
+    // A microphone that cannot open is said lost, before the devices are ready: the speaker opens all the same.
+    let microphone =
+        input.then(|| Microphone::open(&host, choice.input.as_deref(), sink, devices, &changed));
+    let microphone = match microphone {
+        Some(Err(code)) => {
+            sink.send(IoEvent::InputLost(code));
+            None
+        }
+        Some(Ok(microphone)) => Some(microphone),
+        None => None,
+    };
+    let opening = Speaker::open(&host, choice.output.as_deref(), sink, devices, &changed).and_then(
+        |speaker| {
+            let pipeline = pipeline_for(microphone.as_ref(), &speaker)?;
             Ok((microphone, speaker, pipeline))
-        });
+        },
+    );
     let (mut microphone, mut speaker, mut pipeline) = match opening {
         Ok(open) => open,
         Err(code) => {
@@ -175,7 +212,37 @@ fn run(
         for command in commands.try_iter() {
             playout.command(command, &speaker.counters);
         }
-        if devices.take_switch(Kind::Input) {
+        // The microphone opened or closed as asked; one that failed under the call is closed (it said so).
+        let lost = microphone
+            .as_ref()
+            .is_some_and(|open| open.failed.load(Ordering::Acquire));
+        let want = wanted.try_iter().last();
+        let close = lost || (want == Some(false) && microphone.is_some());
+        let open = want == Some(true) && (microphone.is_none() || lost);
+        if close || open {
+            let next = if open {
+                match Microphone::open(
+                    &host,
+                    devices.chosen().input.as_deref(),
+                    sink,
+                    devices,
+                    &changed,
+                ) {
+                    Ok(next) => Some(next),
+                    Err(code) => {
+                        sink.send(IoEvent::InputLost(code));
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            match pipeline_for(next.as_ref(), &speaker) {
+                Ok(rebuilt) => (microphone, pipeline) = (next, rebuilt),
+                Err(code) => return sink.send(IoEvent::Failed(code)),
+            }
+        }
+        if devices.take_switch(Kind::Input) && microphone.is_some() {
             match switched(
                 Microphone::open(
                     &host,
@@ -186,8 +253,14 @@ fn run(
                 ),
                 &speaker,
             ) {
-                Ok((next, rebuilt)) => (microphone, pipeline) = (next, rebuilt),
-                Err(code) => return sink.send(IoEvent::Failed(code)),
+                Ok((next, rebuilt)) => (microphone, pipeline) = (Some(next), rebuilt),
+                Err(code) => {
+                    sink.send(IoEvent::InputLost(code));
+                    match pipeline_for(None, &speaker) {
+                        Ok(rebuilt) => (microphone, pipeline) = (None, rebuilt),
+                        Err(code) => return sink.send(IoEvent::Failed(code)),
+                    }
+                }
             }
         }
         speaker_switch |= devices.take_switch(Kind::Output);
@@ -205,12 +278,7 @@ fn run(
                 devices,
                 &changed,
             )
-            .and_then(|next| {
-                Ok((
-                    Pipeline::new(microphone.rate, microphone.channels, next.rate)?,
-                    next,
-                ))
-            });
+            .and_then(|next| Ok((pipeline_for(microphone.as_ref(), &next)?, next)));
             match reopened {
                 Ok((rebuilt, next)) => {
                     (speaker, pipeline) = (next, rebuilt);
@@ -221,7 +289,10 @@ fn run(
             }
         }
         playout.exchange(&mut speaker.playback, &mut speaker.reference);
-        drain(&mut microphone.capture, &mut heard, microphone.channels);
+        match &mut microphone {
+            Some(microphone) => drain(&mut microphone.capture, &mut heard, microphone.channels),
+            None => heard.clear(),
+        }
         if changed.swap(false, Ordering::AcqRel) {
             pipeline.reinitialize();
         }
@@ -235,6 +306,15 @@ fn run(
         );
         thread::sleep(TICK);
     }
+}
+
+/// The echo canceller for `microphone`'s rate and channels and `speaker`'s rate; without a microphone, for 16 kHz mono
+/// capture that never comes.
+fn pipeline_for(microphone: Option<&Microphone>, speaker: &Speaker) -> Result<Pipeline, String> {
+    let (rate, channels) = microphone.map_or((16_000, 1), |microphone| {
+        (microphone.rate, microphone.channels)
+    });
+    Pipeline::new(rate, channels, speaker.rate)
 }
 
 /// A new microphone, and the echo canceller made again for its rate and the speaker's.
@@ -278,6 +358,9 @@ struct Microphone {
     rate: u32,
     /// Its channels, interleaved in the capture ring.
     channels: usize,
+    /// Whether it failed under the call (told as [`IoEvent::InputLost`]), or the chosen one went away (the default
+    /// one is switched to).
+    failed: Arc<AtomicBool>,
 }
 
 impl Microphone {
@@ -292,11 +375,13 @@ impl Microphone {
         let config = input.default_input_config().map_err(|error| code(&error))?;
         let (rate, channels) = (config.sample_rate(), usize::from(config.channels()));
         let (capture_in, capture) = RingBuffer::new((rate * BACKLOG_SECONDS) as usize * channels);
+        let failed_flag = Arc::new(AtomicBool::new(false));
         let failed = failure(
             sink,
             changed,
             id.map(|_| (Kind::Input, devices)),
-            &Arc::default(),
+            &failed_flag,
+            true,
         );
         let stream = match config.sample_format() {
             SampleFormat::F32 => listen::<f32>(&input, config.config(), capture_in, failed),
@@ -311,6 +396,7 @@ impl Microphone {
             capture,
             rate,
             channels,
+            failed: failed_flag,
         })
     }
 }
@@ -344,7 +430,13 @@ impl Speaker {
         let player = Output::new(playback_out, reference_in, (rate * FADE_MS / 1000) as usize);
         let counters = Arc::new(Counters::default());
         let gone = Arc::new(AtomicBool::new(false));
-        let failed = failure(sink, changed, id.map(|_| (Kind::Output, devices)), &gone);
+        let failed = failure(
+            sink,
+            changed,
+            id.map(|_| (Kind::Output, devices)),
+            &gone,
+            false,
+        );
         let stream_config = config.config();
         let stream = match config.sample_format() {
             SampleFormat::F32 => speak::<f32>(&output, stream_config, player, &counters, failed),
@@ -427,6 +519,7 @@ fn failure(
     changed: &Arc<AtomicBool>,
     chosen: Option<(Kind, &NativeDevices)>,
     gone: &Arc<AtomicBool>,
+    input: bool,
 ) -> impl FnMut(cpal::Error) + Send + 'static {
     let (sink, changed, gone) = (sink.clone(), Arc::clone(changed), Arc::clone(gone));
     let chosen = chosen.map(|(kind, devices)| (kind, devices.clone()));
@@ -444,8 +537,16 @@ fn failure(
             && chosen
                 .as_ref()
                 .is_some_and(|(kind, devices)| devices.lose(*kind));
+        // A chosen device that went away gives way to the default one (the speaker once it is marked `gone`, the
+        // microphone through the switch its loss made). A microphone that fails otherwise is closed and said lost; a
+        // speaker that fails ends the call.
         if lost {
+            if !input {
+                gone.store(true, Ordering::Release);
+            }
+        } else if input {
             gone.store(true, Ordering::Release);
+            sink.send(IoEvent::InputLost(code(&error)));
         } else {
             sink.send(IoEvent::Failed(code(&error)));
         }

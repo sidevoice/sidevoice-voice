@@ -40,30 +40,50 @@ staged by each release and approved by the operator (RELEASING.md). The design i
 
 ## Using a call
 
-The call runs models it does not know: the app supplies them through the module's own interfaces, and chooses which
-model fills each slot. Natively they are Rust traits (`src/models.rs`; implement them with the re-exported
-`#[async_trait]`):
+A call has two halves, each optional (`VoiceSetup`): the **input** (the microphone, a voice activity detector, a
+transcriber and, for `smart` end of turn, an end-of-turn classifier) and the **output** (a speaker model and the
+playback). A half that is absent is neither loaded nor opened: a call that only listens (a transcription try) loads
+no speaker model; one that only speaks (a voice try, a call without a microphone) asks for no microphone and loads no
+detector, transcriber or end-of-turn classifier, so a blocked microphone cannot fail it. Barge-in needs both halves.
+
+The call runs models it does not know: the app supplies them through the module's own interfaces, one slot at a time,
+and chooses which model fills each slot. The call asks only for the slots its halves use, all at once as it starts:
+`silence` end of turn never asks for the end-of-turn classifier. Natively they are Rust traits (`src/models.rs`;
+implement them with the re-exported `#[async_trait]`):
 
 | Interface | What it does |
 |---|---|
 | `Vad` | A voice activity detector's stream over 16 kHz mono audio: `accept(pcm)` answers one `VadFrame {end, speech, probability?}` per window; speech starts and ends where `speech` changes. `reset()` starts over. The call decides on each window's `probability`; a frame without one counts as its `speech`. |
 | `Transcriber` | `transcribe(pcm, sample_rate, language?)` → the text. |
 | `Speaker` | `speak(text, voice?, language?, speed)` → mono samples and their rate. |
-| `EndOfTurnModel` | Optional: `end_of_turn(pcm, sample_rate)` → the probability that the turn is over, for `smart-turn`. |
-| `VoiceModels` | `load()` → `Models {vad, transcriber, speaker, end_of_turn?}`: called as the call starts; what it returned is dropped once the call has been stopped for `idle_unload_minutes`. |
+| `EndOfTurnModel` | `end_of_turn(pcm, sample_rate)` → the probability that the turn is over, for `smart`. |
+| `InputModels` | The input half's slots, each loaded on its own: `vad()` (a fresh stream for the call, which the call warms up on 0.1 s of silence and resets), `transcriber()`, and `end_of_turn()` (asked only for `smart`; `end-of-turn-missing` by default). |
+| `OutputModels` | The output half's slot: `speaker()`. |
 
-A native app (the desktop app, wiring sidevoice-engine's models into these) creates a call with them, the device's
-own microphone and speaker (`NativeIo`, or any other `AudioIo`) and a configuration, and runs it on its Tokio runtime:
+What the call loaded is dropped once it has been stopped for `idle_unload_minutes`.
+
+A native app (the desktop app, wiring sidevoice-engine's models into these) creates a call with the halves it wants,
+the device's own microphone and speaker (`NativeIo`, or any other `AudioIo`), and runs it on its Tokio runtime:
 
 ```rust
-let config: VoiceConfig = serde_json::from_value(json!({"language": "es", "voice": "ef_dora", "patience": "normal"}))?;
-let (call, mut events) = VoiceCall::new(Arc::new(my_models), Box::new(NativeIo::new()), config);
-call.start(StartOptions::default()); // loads the models, opens the microphone and the speaker, listens
+let setup = VoiceSetup {
+    input: Some(VoiceInput {
+        models: Arc::clone(&my_input_models),
+        config: serde_json::from_value(json!({"language": "es", "end_of_turn": {"kind": "smart"}}))?,
+    }),
+    output: Some(VoiceOutput {
+        models: Arc::clone(&my_output_models),
+        config: serde_json::from_value(json!({"voice": "ef_dora"}))?,
+    }),
+    config: VoiceConfig::default(),
+};
+let (call, mut events) = VoiceCall::new(Box::new(NativeIo::new()), setup);
+call.start(StartOptions::default()); // loads what the halves use, opens the speaker and the microphone, listens
 while let Some(event) = events.next().await {
     match event {
         VoiceEvent::Turn(TurnEvent::Finished { turn_id, text, .. }) => send_words(turn_id, text),
         VoiceEvent::Turn(turn) => show_turn(turn),  // started, cancelled
-        VoiceEvent::State(state) => show(state),   // listening, recognising, playback, microphone
+        VoiceEvent::State(state) => show(state),   // listening (`off` without an input half), recognising, playback, microphone
         VoiceEvent::Level(level) => meter(level),  // the microphone, from 0 to 1
         VoiceEvent::PlaybackLevel(level) => speaker_meter(level), // rendered output, from 0 to 1
         VoiceEvent::Error(error) => tell(error.code),
@@ -79,9 +99,18 @@ while let Some(step) = saying.next().await {
         SayEvent::Done { outcome } => report(outcome), // heard, heard up to N, or not played, and why
     }
 }
-// Other models (another transcriber, say), with the configuration they go with: call.set_models(Arc::new(other),
-// config), which restarts a running call once, on both.
+// Another setup, live: call.update(setup). A half with the same models (the same Arc) keeps what it loaded; a running
+// call loads what changes beside what it uses and swaps it at the half's safe point, with no restart (below).
 ```
+
+**A running call changes without a restart** (`update`): other models, another end of turn, another voice, a half
+added or removed. A half's new models load while it goes on as it was, then take over at its safe point: the input
+half's at the next turn (no turn open), the output half's at the next utterance (what is being said ends in its own
+voice; what is asked meanwhile waits for the new one). Nothing playing is cut. An input half added later (a microphone
+appeared, the permission was granted) opens the microphone (`AudioIo::set_input`); one removed closes it. A
+microphone lost under the call (`IoEvent::InputLost`: it failed or went away and no other opened, or it could not open
+at all) ends the open turn with what it holds, says its code as an error, and leaves the call speaking, its input half
+gone (`listening: off`), instead of failing it; without an output half there is nothing left, and the call stops.
 
 Which microphone and speaker it uses is a `NativeDevices` handle: `NativeIo::with_devices(devices.clone())`, and the
 app keeps the other clone. `devices.list()` gives the system's inputs and outputs (`{id, label}`, the id cpal's) and
@@ -99,43 +128,51 @@ through wasm-bindgen's structural imports (`src/models/web.rs`); the page wires 
 import init, { VoiceCall } from "@sidevoice/voice";
 
 await init();
-const models = { load: async () => ({ createVad: () => newDetector(), transcriber, speaker /*, endOfTurn */ }) }; // the page's VoiceModels
-const call = VoiceCall.create(models, config); // the same configuration, as JSON
+const call = VoiceCall.create({ // the same setup: each half's models (the page's objects) and its configuration
+  input: { models: { vad: () => newDetector(), transcriber: () => transcriber /*, endOfTurn */ }, language: "es" },
+  output: { models: { speaker: () => speaker }, voice: "ef_dora" },
+});
 call.onEvent(({ type, data }) => { /* "turn", "state", "level", "playback-level", "error", "take" */ });
-call.start(); // loads the models, asks for the microphone, listens
+call.start(); // loads what the halves use, asks for the microphone only with an input half, listens
 const saying = call.say("Hecho.", { language: "es" }); // a handle: saying.cancel(), saying.onEvent(step)
 const outcome = await saying.outcome; // { status: "heard" | "heard-up-to" | "not-played", ... }
 ```
 
 `onEvent(listener)` hears the same events as `{type, data}`; `say(text, options)` answers a `Saying` (`id`,
-`cancel()`, `onEvent(listener)` for its steps, and `outcome`, a promise); `setConfig`, `setModels`, `mute`,
+`cancel()`, `onEvent(listener)` for its steps, and `outcome`, a promise); `update(setup)` (the same object as a half's
+`models` is the same models), `mute`,
 `cancelInput`, `endInput` (closes the open turn now with what was captured, to be told as `finished`; nothing when none
 is open), `start` and `stop` mirror the Rust methods (`src/web.rs`). The microphone is `getUserMedia` with the
 browser's echo cancellation, noise suppression and gain control, brought to 16 kHz mono in an AudioWorklet; the speaker
-is Web Audio (`js/web-audio-io.js`). `VoiceCall.create(models, config, {inputDevice, outputDevice})` captures from another
+is Web Audio (`js/web-audio-io.js`). `VoiceCall.create(setup, {inputDevice, outputDevice})` captures from another
 microphone, and plays on another output where
 the browser lets an `AudioContext` choose one (a non-default output may escape the browser's canceller, an open point
-of sidevoice-core#89), and `{io}` brings a microphone and speaker of the page's own, with `start(sink)`,
-`play(utterance, chunk, samples, sampleRate)`, `stopPlayback()` and `stop()` (`createWebAudioIo` is the default).
-Their failures are errors with stable codes: `microphone-denied`, `microphone-unavailable`, `microphone-lost`,
-`audio-capture-failed`, `audio-output-failed`.
+of sidevoice-core#89), and `{io}` brings a microphone and speaker of the page's own, with `start(sink, {input})`,
+`setInput(input)`, `play(utterance, chunk, samples, sampleRate)`, `stopPlayback()` and `stop()` (`createWebAudioIo`
+is the default). The microphone is opened only with `input`. Their failures are errors with stable codes:
+`microphone-denied`, `microphone-unavailable`, `microphone-lost`, `audio-capture-failed`, `audio-output-failed`.
 
-- **The configuration** (`VoiceConfig`, read strictly from JSON) names no model: the `language` the transcriber is
-  given, the speaker's `voice` and `speed`, what ends a turn (`end_of_turn`: `silence`, or `smart-turn`, which needs
-  an `EndOfTurnModel`), the `patience` (`fast`, `normal`, `calm`), the grace before anything is said
-  (`audio_grace_ms`, 1 s), the listening bar, `barge_in_min_speech` (1.0 s of continuous qualified
-  capture while audio sounds), and how long the models stay loaded with the call stopped
-  (`idle_unload_minutes`, 10; 0 drops them as it stops). A new configuration is in effect at once.
-- **`start` loads the models** if they are not loaded. They stay across stops, and are dropped once the call has been
-  stopped for `idle_unload_minutes`; the next start loads them again, on the web as natively. `smart-turn` without an
-  end-of-turn model refuses to start with `end-of-turn-missing`. A model that cannot load, and every other failure a
-  person may be told of, is a `VoiceEvent::Error` with a stable code.
+- **The configuration** is data read strictly from JSON, and names no model. The input half's (`InputConfig`): the
+  `language` the transcriber is given, what ends a turn (`end_of_turn`: `{"kind": "silence", "ms"?}`, a pause of `ms`
+  after speech stopped, the patience's when absent; or `{"kind": "smart"}`, which needs an `EndOfTurnModel`), the
+  `patience` (`fast`, `normal`, `calm`), the listening bar, and `barge_in_min_speech` (1.0 s of continuous qualified
+  capture while audio sounds). The output half's (`OutputConfig`): the speaker's `voice` and `speed`, and the
+  `language` of what is said when `say` gives none (the input's when absent). The call's (`VoiceConfig`): the grace
+  before anything is said (`audio_grace_ms`, 1 s), and how long the models stay loaded with the call stopped
+  (`idle_unload_minutes`, 10; 0 drops them as it stops).
+- **`start` loads the models its halves use** if they are not loaded, every slot at once. The detector is warmed up as
+  it loads, while the others still do: its first windows (a runtime's first inference is the slow one) run on 0.1 s
+  of silence, then it starts over, so the first real window does not wait on it. They stay across stops, and
+  are dropped once the call has been stopped for `idle_unload_minutes`; the next start loads them again, on the web as
+  natively. `smart` without an end-of-turn model refuses to start with `end-of-turn-missing`. A model that cannot load,
+  and every other failure a person may be told of, is a `VoiceEvent::Error` with a stable code.
 - **A stop, or dropping the call, never waits on a model that does not answer**: after half a second behind one, the
   call closes the microphone and the speaker, drops the models and the tasks it started, and says it is idle; the next
   start loads the models again.
-- **`AudioIo`** is the microphone and the speaker: capture arrives as 16 kHz mono samples with the echo of the call's
-  own playback already cancelled, and the speaker plays the chunks of what is said in order and says when each
-  starts and ends (that is the clock of the heard position). It says when both are ready (`IoEvent::Ready`), and
+- **`AudioIo`** is the microphone and the speaker: `start(sink, input)` opens the speaker and, with `input`, the
+  microphone; `set_input` opens or closes the microphone while the speaker goes on. Capture arrives as 16 kHz mono
+  samples with the echo of the call's own playback already cancelled, and the speaker plays the chunks of what is
+  said in order and says when each starts and ends (that is the clock of the heard position). It says when both are ready (`IoEvent::Ready`), and
   only then does the call listen.
 - **Which models are the app's; when speech starts and stops is the call's.** The call times speech itself on each
   window's probability (Silero's, say), so the detector's own options only shape `speech`, which counts where a
@@ -161,38 +198,49 @@ playback ends once all it was given has played, and stopping a lane cuts the spe
 audio again. The last active lane closes the devices.
 Apps that provide their own `AudioIo` can route frames themselves.
 
-`SharedModels::new(loader)` implements `VoiceModels` as a lightweight, restartable pool. The loader returns
-`SharedModelResources` (VAD factory, transcriber, speaker and optional end-of-turn model) when no live lease exists.
-Concurrent calls share one loaded choice and each gets a fresh `VadFactory::new_stream()` detector. The pool retains
-only a weak reference: after each stopped call's `idle_unload_minutes` and the final in-flight request, the weights
-are released; the next start loads them again. Shared STT, TTS and end-of-turn requests are serialized so a provider
-with non-reentrant inference is safe. Detector history, endpoint windows and request state remain call local.
+`SharedModels::new(loader)` is a lightweight, restartable pool, slot by slot, and both halves' `InputModels` and
+`OutputModels`. The loader (`SharedModelLoader`) loads one slot when no call holds it: the detector model (a
+`VadFactory`), the transcriber, the speaker, the end-of-turn model. A slot one call loaded is reused by every call that
+asks for it while any holds it: a transcription try's transcriber is the call's after it, and a call's speaker is not
+loaded twice. Each call gets a fresh `VadFactory::new_stream()` detector. The pool retains only weak references: after
+each stopped call's `idle_unload_minutes` and the final in-flight request, a slot's weights are released; the next ask
+loads them again. Shared STT, TTS and end-of-turn requests are serialized so a provider with non-reentrant inference
+is safe. Detector history, endpoint windows and request state remain call local.
 
-The browser host (`js/voice-host.d.ts`) owns the shared audio and model choices. The same host shape can be provided
-by a native app:
+The browser host (`js/voice-host.d.ts`) owns the shared audio and the models its calls load, slot by slot: the page's
+`source` loads one slot's model for a choice (`vad()`, `transcriber(choice)`, `speaker(choice)`,
+`endOfTurn(choice)`), the host asks only for what a call's halves use and only once for a choice any call holds, and
+lets a model go `idle_unload_minutes` after the last call holding it stopped. The same host shape can be provided by a
+native app:
 
 ```js
 import init, { createVoiceHost } from "@sidevoice/voice";
 await init();
-const host = createVoiceHost(source); // source.models(settings).load() returns createVad(), transcriber, speaker
-const first = host.createCall();
-const second = host.createCall();
-await Promise.all([first.setSettings(settings), second.setSettings(settings)]);
+const host = createVoiceHost(source);
+// A transcription try: the input half only, a turn ending after 1.5 s of silence; no speaker model, no end-of-turn model.
+const trying = host.start({ input: { stt: { catalog, model, language: "es" }, endOfTurn: { kind: "silence", ms: 1500 } } });
+// A voice try, or a call without a microphone: the output half only; no microphone asked for, no detector.
+const listening = host.start({ output: { tts: { catalog, model }, voice: "ef_dora", speed: 1 } });
+// Two calls with both halves: they share every model loaded, each with its own detector stream and audio lane.
+const first = host.start({ input: { stt, endOfTurn: { kind: "smart", model: turnModel } }, output: { tts, voice } });
+const second = host.start({ input: { stt, endOfTurn: { kind: "smart", model: turnModel } }, output: { tts, voice } });
 first.onTurn((turn) => handleFirstTurn(turn));
 second.onTurn((turn) => handleSecondTurn(turn));
-await Promise.all([first.start(), second.start()]);
+await Promise.all([first.ready, second.ready]); // rejects { code }: a model that cannot load, the devices refused
 await host.routeInput(first); // real frames to first, zeros to second; await the worklet acknowledgement
 await host.routeInput(second);
 await host.routeInput(null); // zeros to both
-await first.dispose();
-await second.dispose();
+await Promise.all([trying.stop(), listening.stop(), first.stop(), second.stop()]);
 ```
+
+A call's state says `listening: "off"` without an input half; `say` without an output half is `not-played`
+(`failed`, `output-missing`).
 
 `createSharedWebAudioIo(options)` is the browser's shared audio factory. `attach()` returns `{io, input}`;
 `routeInput(input | null)` acknowledges a next-frame switch. One `getUserMedia` track and `AudioContext` serve
-all lanes; each lane has its own playback gain and telemetry processor, mixed at the context destination for the
+all lanes, the track open only while a started lane asks for the microphone; each lane has its own playback gain and telemetry processor, mixed at the context destination for the
 browser's AEC. Device selection and loss reporting live on the host. The low-level
-`VoiceCall.create(models, config, {io?})` and `createWebAudioIo` remain for one standalone call. Browser output
+`VoiceCall.create(setup, {io?})` and `createWebAudioIo` remain for one standalone call. Browser output
 selection depends on `AudioContext.setSinkId`; a non-default output can escape browser AEC on some systems.
 
 The per-call event sequence is `started {turn_id,started_at}` and exactly one
@@ -229,12 +277,12 @@ time; a task around it (`src/voice_call.rs`) feeds it and does what it answers.
   strategies of `pipecat-ai` 1.10.0). A window of the app's detector is speech when its probability is at least 0.6
   and the volume clears the listening bar: the loudness of the last 400 ms (ITU-R BS.1770), from −110 LUFS (0) to −10
   LUFS (1), smoothed, at least 0.5 (−60 LUFS), and 0.8 (−30 LUFS) while something plays. Speech starts after 400 ms of
-  such windows and stops after a stretch without any: 0.6, 0.9 or 1.3 s by patience with `smart-turn`, 0.2 s with
+  such windows and stops after a stretch without any: 0.6, 0.9 or 1.3 s by patience with `smart`, 0.2 s with
   `silence`; a breath or a click shorter than that changes nothing. A turn opens where speech starts, with the second
-  of audio before it. Where speech stops a pause begins: with `smart-turn` the end-of-turn model is asked, at every
+  of audio before it. Where speech stops a pause begins: with `smart` the end-of-turn model is asked, at every
   stop, about the turn so far (from 0.9 s before its speech started, its last 8 s); more than 0.5 ends the turn there,
-  and the pause ends it anyway 2.5, 3 or 4 s after the stop. With `silence` the pause ends it 2, 2.5 or 3.5 s after the
-  stop. Speech that starts again ends the pause. A turn also ends when its audio stops arriving for 5 s, and
+  and the pause ends it anyway 2.5, 3 or 4 s after the stop. With `silence` the pause ends it its own `ms`, or 2, 2.5 or 3.5 s by
+  patience, after the stop. Speech that starts again ends the pause. A turn also ends when its audio stops arriving for 5 s, and
   keeps at most a minute. Mute does not end it: a muted microphone is ordinary silence, so the turn ends by the usual
   endpoint and releasing the mute within it continues the same turn. `endInput` (`VoiceCall::end_input`) is the one way to close the
   open turn at once with what it holds; it then goes through recognition like any turn. With none open it does nothing,
@@ -289,10 +337,12 @@ src/            the crate sidevoice-voice
   playback.rs     the playback queue, barge-in and the heard position
   event.rs        what a call tells its host (VoiceEvent, TurnEvent)
   say.rs          something said: SayOptions, the Saying handle, SayEvent and SayOutcome
-  config.rs       VoiceConfig
+  setup.rs        VoiceSetup: the call's halves, VoiceInput and VoiceOutput, each optional
+  config.rs       VoiceConfig, InputConfig, OutputConfig
   voice_call.rs   VoiceCall, the task around the state machine
-  models.rs       the model interfaces the app implements (VoiceModels, Vad, Transcriber, Speaker, EndOfTurnModel);
-                  models/web.rs, the page's JavaScript models through structural imports (wasm32)
+  models.rs       the model interfaces the app implements (InputModels, OutputModels, Vad, Transcriber, Speaker,
+                  EndOfTurnModel) and SharedModels, the pool slot by slot; models/web.rs, the page's JavaScript models
+                  through structural imports (wasm32)
   residency.rs    when idle models are dropped
   io.rs           AudioIo, the microphone and the speaker; io/native.rs, NativeIo (cpal), with io/native/output.rs
                   (what the output callback plays, and where each chunk is), io/native/playout.rs (the audio thread's
@@ -307,9 +357,9 @@ src/            the crate sidevoice-voice
 tests/          fixtures/, the recorded clips the unit tests hear
 build.rs        the two cfg aliases: web, native
 js/             the npm package's JavaScript, shipped as it is (ES modules, no dependencies)
-  index.js        the entry point: the wasm build, and VoiceCall.create(models, config, options?) on the browser's IO
-  voice-models.d.ts the model interfaces the page implements (VoiceModels, VoiceVad, VoiceTranscriber, VoiceSpeaker,
-                  VoiceEndOfTurn)
+  index.js        the entry point: the wasm build, and VoiceCall.create(setup, options?) on the browser's IO
+  voice-models.d.ts the model interfaces the page implements (VoiceInputModels, VoiceOutputModels, VoiceVad,
+                  VoiceTranscriber, VoiceSpeaker, VoiceEndOfTurn)
   web-audio-io.js the browser's microphone and speaker (createWebAudioIo); capture-worklet.js and
                   playback-worklet.js, their AudioWorklets
   voice-host.js   the voice seam (createVoiceHost); voice-host.d.ts, VoiceHost itself

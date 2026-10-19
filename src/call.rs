@@ -15,7 +15,7 @@ mod tests;
 
 use std::collections::{HashMap, VecDeque};
 
-use crate::config::{EndOfTurn, VoiceConfig};
+use crate::config::{CallConfig, EndOfTurn};
 use crate::event::{
     CallState, Listening, Microphone, TurnEvent, TurnTimings, VoiceError, VoiceEvent,
 };
@@ -32,8 +32,12 @@ pub(crate) enum Input {
     Start { take: bool },
     /// Stop: the open turn and the turns not yet transcribed are cancelled, and what is being said stops.
     Stop,
-    /// A new configuration.
-    Config(Box<VoiceConfig>),
+    /// A new configuration: its halves, and how each works. A half that goes or comes starts its region over: an output
+    /// half that goes ends what waits to be said (`failed`, `output-missing`); an input half starts segmentation anew.
+    Config(Box<CallConfig>),
+    /// Whether nothing new may start to be said: what is being said goes on, and the next waits until this is lifted
+    /// (the output half is about to change).
+    HoldOutput(bool),
     /// One detector window: 16 kHz mono samples after echo cancellation, whether the detector holds it for speech, and
     /// its probability that the window is speech. The probability decides; a detector that gives none is taken at its
     /// word, window by window.
@@ -83,6 +87,9 @@ pub(crate) enum Input {
         result: Result<f32, String>,
     },
 }
+
+/// The failure of something said to a call without an output half.
+const OUTPUT_MISSING: &str = "output-missing";
 
 /// How many cancels of ids not heard of yet are kept.
 const CANCELS_KEPT: usize = 64;
@@ -143,12 +150,14 @@ struct Turn {
 /// One call.
 #[derive(Debug)]
 pub(crate) struct Call {
-    config: VoiceConfig,
+    config: CallConfig,
     /// The prefix of every id this call makes.
     call_id: String,
     /// The Unix time of the call's millisecond 0.
     epoch_unix_ms: u64,
     started: bool,
+    /// Nothing new starts to be said while set.
+    held: bool,
     muted: bool,
     /// Whether the microphone's device gives no audio, until the call stops.
     microphone_muted: bool,
@@ -175,13 +184,14 @@ pub(crate) struct Call {
 }
 
 impl Call {
-    pub(crate) fn new(config: VoiceConfig, call_id: String, epoch_unix_ms: u64) -> Self {
+    pub(crate) fn new(config: CallConfig, call_id: String, epoch_unix_ms: u64) -> Self {
         Self {
             segmenter: Segmenter::new(segmentation(&config)),
             config,
             call_id,
             epoch_unix_ms,
             started: false,
+            held: false,
             muted: false,
             microphone_muted: false,
             open: None,
@@ -209,10 +219,8 @@ impl Call {
                 self.marks = take.then(Vec::new);
             }
             Input::Stop => self.stop(now, &mut out),
-            Input::Config(config) => {
-                self.segmenter.set_numbers(segmentation(&config));
-                self.config = *config;
-            }
+            Input::Config(config) => self.configure(*config, &mut out),
+            Input::HoldOutput(held) => self.held = held,
             Input::Window {
                 pcm,
                 speech,
@@ -305,6 +313,46 @@ impl Call {
         out
     }
 
+    /// Whether a change of the input half may take effect now: no turn is open and no speech is under way.
+    pub(crate) fn input_idle(&self) -> bool {
+        self.open.is_none() && !self.segmenter.speaking()
+    }
+
+    /// Whether a change of the output half may take effect now: nothing is being said.
+    pub(crate) fn output_idle(&self) -> bool {
+        !self.playback.busy()
+    }
+
+    fn configure(&mut self, config: CallConfig, out: &mut Vec<Effect>) {
+        if config.input.is_some() != self.config.input.is_some() {
+            self.segmenter = Segmenter::new(segmentation(&config));
+        } else {
+            self.segmenter.set_numbers(segmentation(&config));
+        }
+        let output_gone = config.output.is_none() && self.config.output.is_some();
+        self.config = config;
+        if output_gone {
+            let mut actions = Vec::new();
+            self.playback.interrupt(
+                StopReason::Failed {
+                    code: OUTPUT_MISSING.into(),
+                },
+                &mut actions,
+            );
+            self.continuing_chunk = None;
+            self.act(actions, out);
+        }
+    }
+
+    /// The input half's patience; the default without one.
+    fn patience(&self) -> crate::config::Patience {
+        self.config
+            .input
+            .as_ref()
+            .map(|input| input.patience)
+            .unwrap_or_default()
+    }
+
     /// The marks of the take being kept since the call started, which it stops keeping: where each turn's speech
     /// started, paused and was ended, in what was heard. Empty when the start asked for no take.
     pub(crate) fn take_marks(&mut self) -> Vec<TakeTurn> {
@@ -315,9 +363,12 @@ impl Call {
     pub(crate) fn deadline(&self) -> Option<u64> {
         let speaking = self.segmenter.speaking();
         // The grace is a deadline only when its end is all that holds the next one back.
-        let say = (self.playback.waiting() && !self.playback.busy() && self.quiet(speaking))
-            .then_some(self.quiet_until)
-            .filter(|&until| until > 0);
+        let say = (self.playback.waiting()
+            && !self.playback.busy()
+            && !self.held
+            && self.quiet(speaking))
+        .then_some(self.quiet_until)
+        .filter(|&until| until > 0);
         [
             self.segmenter.deadline(),
             self.recognition.deadline(speaking),
@@ -342,6 +393,9 @@ impl Call {
     /// One detector window: counted in what was heard whatever becomes of it, so that a take's positions follow its
     /// audio, muted windows included.
     fn window(&mut self, now: u64, pcm: &[f32], confidence: f32, out: &mut Vec<Effect>) {
+        if self.config.input.is_none() {
+            return;
+        }
         self.heard += pcm.len();
         if !self.started || self.muted {
             if self.started && self.muted {
@@ -479,7 +533,7 @@ impl Call {
             out.push(Effect::Transcribe {
                 turn: job.turn,
                 pcm: job.pcm,
-                language: self.config.language.clone(),
+                language: self.config.input_language(),
             });
         }
     }
@@ -495,7 +549,7 @@ impl Call {
             return;
         }
         let next = self.recognition.done();
-        let language = self.config.language.clone();
+        let language = self.config.input_language();
         let text = match result {
             Ok(text) => accepted(&text, language.as_deref()),
             Err(code) => {
@@ -509,7 +563,7 @@ impl Call {
                 if let Some(record) = self.turns.get_mut(&turn) {
                     record.recognised_ms = Some(now);
                 }
-                let merge = u64::from(self.config.patience.merge_window_ms());
+                let merge = u64::from(self.patience().merge_window_ms());
                 if merge == 0 {
                     self.close_turn(now, turn, Some(text), false, out);
                 } else if let Outcome::Joined(joined) =
@@ -574,6 +628,10 @@ impl Call {
             } else {
                 if !self.started {
                     Some(StopReason::Stopped)
+                } else if self.config.output.is_none() {
+                    Some(StopReason::Failed {
+                        code: OUTPUT_MISSING.into(),
+                    })
                 } else if !self.quiet(self.segmenter.speaking()) {
                     Some(StopReason::BargeIn)
                 } else {
@@ -592,7 +650,7 @@ impl Call {
             );
             return;
         }
-        let language = language.or_else(|| self.config.language.clone());
+        let language = language.or_else(|| self.config.say_language());
         let mut actions = Vec::new();
         self.playback.push(id, text, language, &mut actions);
         self.act(actions, out);
@@ -622,7 +680,7 @@ impl Call {
         if let Some(pending) = self.recognition.due(now, speaking) {
             self.finish_pending(now, pending, out);
         }
-        if self.quiet(speaking) && now >= self.quiet_until && !self.playback.busy() {
+        if self.quiet(speaking) && now >= self.quiet_until && !self.playback.busy() && !self.held {
             let mut actions = Vec::new();
             self.playback.start(&mut actions);
             self.act(actions, out);
@@ -630,6 +688,8 @@ impl Call {
         let state = CallState {
             listening: if !self.started {
                 Listening::Idle
+            } else if self.config.input.is_none() {
+                Listening::Off
             } else if self.muted {
                 Listening::Muted
             } else if speaking && !self.segmenter.paused() {
@@ -669,7 +729,7 @@ impl Call {
                 let ended = turn.ended_ms.unwrap_or(now);
                 TurnEvent::Finished {
                     turn_id: turn.id,
-                    language: self.config.language.clone(),
+                    language: self.config.input_language(),
                     text,
                     started_at: self.epoch_unix_ms + turn.started_ms,
                     ended_at: self.epoch_unix_ms + ended,
@@ -687,7 +747,7 @@ impl Call {
             },
         };
         out.push(Effect::Event(VoiceEvent::Turn(event)));
-        self.quiet_until = now + u64::from(self.config.audio_grace_ms);
+        self.quiet_until = now + u64::from(self.config.call.audio_grace_ms);
     }
 
     /// Turns the playback's actions into effects.
@@ -734,23 +794,27 @@ impl Call {
     }
 }
 
-/// The numbers segmentation takes from a configuration: with `smart-turn`, the patience's stop and longest pause;
-/// with `silence`, a short stop and the patience's silence after it.
-fn segmentation(config: &VoiceConfig) -> Segmentation {
+/// The numbers segmentation takes from a configuration's input half: with `smart`, the patience's stop and longest
+/// pause; with `silence`, a short stop and its own silence after it, or the patience's.
+fn segmentation(config: &CallConfig) -> Segmentation {
+    let config = config.input_or_default();
     let patience = config.patience;
-    let smart = config.end_of_turn == EndOfTurn::SmartTurn;
+    let (stop_ms, end_ms, ask) = match config.end_of_turn {
+        EndOfTurn::Smart {} => (
+            patience.smart_turn_stop_ms(),
+            patience.smart_turn_longest_ms(),
+            true,
+        ),
+        EndOfTurn::Silence { ms } => (
+            SILENCE_STOP_MS,
+            ms.unwrap_or_else(|| patience.silence_ms()),
+            false,
+        ),
+    };
     Segmentation {
-        stop_ms: if smart {
-            patience.smart_turn_stop_ms()
-        } else {
-            SILENCE_STOP_MS
-        },
-        end_ms: if smart {
-            patience.smart_turn_longest_ms()
-        } else {
-            patience.silence_ms()
-        },
-        ask: smart,
+        stop_ms,
+        end_ms,
+        ask,
         quiet_bar: config.listening_bar.quiet,
         playing_bar: config.listening_bar.playing,
         barge_in_min_ms: (config.barge_in_min_speech.seconds() * 1_000.0).ceil() as u32,

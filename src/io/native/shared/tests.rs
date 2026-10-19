@@ -16,6 +16,8 @@ use crate::io::native::playout::{Command, Playout};
 struct Recorded {
     starts: usize,
     stops: usize,
+    /// Whether the microphone was asked for: at each start, and at each change after.
+    inputs: Vec<bool>,
     sink: Option<IoSink>,
     played: Vec<(String, Vec<f32>)>,
 }
@@ -23,11 +25,15 @@ struct Recorded {
 struct Physical(Arc<Mutex<Recorded>>);
 
 impl AudioIo for Physical {
-    fn start(&mut self, sink: IoSink) -> Result<(), String> {
+    fn start(&mut self, sink: IoSink, input: bool) -> Result<(), String> {
         let mut recorded = self.0.lock().unwrap();
         recorded.starts += 1;
+        recorded.inputs.push(input);
         recorded.sink = Some(sink);
         Ok(())
+    }
+    fn set_input(&mut self, input: bool) {
+        self.0.lock().unwrap().inputs.push(input);
     }
     fn play(&mut self, utterance: &str, _: usize, samples: Vec<f32>, _: u32) {
         self.0
@@ -110,8 +116,8 @@ fn next_frame_goes_to_one_port_and_other_lanes_hear_silence() {
     let (mut b, b_port) = shared.attach();
     let (a_sink, mut a_events) = lane_sink();
     let (b_sink, mut b_events) = lane_sink();
-    a.start(a_sink).unwrap();
-    b.start(b_sink).unwrap();
+    a.start(a_sink, true).unwrap();
+    b.start(b_sink, true).unwrap();
     assert!(matches!(next_io(&mut a_events).await, IoEvent::Ready));
     assert!(matches!(next_io(&mut b_events).await, IoEvent::Ready));
     assert_eq!(recorded.lock().unwrap().starts, 1);
@@ -143,8 +149,8 @@ fn two_lanes_mix_once_and_keep_their_own_progress_and_rendered_frames() {
     let (b_sink, mut b_events) = lane_sink();
     let a_rendered = Arc::clone(&a_sink.rendered);
     let b_rendered = Arc::clone(&b_sink.rendered);
-    a.start(a_sink).unwrap();
-    b.start(b_sink).unwrap();
+    a.start(a_sink, true).unwrap();
+    b.start(b_sink, true).unwrap();
     next_io(&mut a_events).await;
     next_io(&mut b_events).await;
     // Queue both before the worker mixes; this also exercises the exact clipping scale.
@@ -186,7 +192,7 @@ fn a_delayed_mixed_frame_cannot_enter_a_restarted_lanes_sink() {
         let (mut b, _) = shared.attach();
         let (old_sink, mut old_events) = lane_sink();
         let (b_sink, mut b_events) = lane_sink();
-        a.start(old_sink).unwrap(); b.start(b_sink).unwrap();
+        a.start(old_sink, true).unwrap(); b.start(b_sink, true).unwrap();
         next_io(&mut old_events).await; next_io(&mut b_events).await;
         {
             let mut state = shared.inner.state.lock().unwrap();
@@ -204,7 +210,7 @@ fn a_delayed_mixed_frame_cannot_enter_a_restarted_lanes_sink() {
         assert_ne!(frame, old);
         assert!(mixed.iter().all(|sample| (*sample - 0.4).abs() < 0.001));
         let (new_sink, mut new_events) = lane_sink();
-        a.start(new_sink).unwrap();
+        a.start(new_sink, true).unwrap();
         assert!(matches!(next_io(&mut new_events).await, IoEvent::Ready));
         let physical = recorded.lock().unwrap().sink.as_ref().unwrap().clone();
         // The cut frame's late reports reach nobody.
@@ -233,7 +239,7 @@ fn rendered_levels_follow_partial_physical_consumption_and_never_anticipate_a_lo
         let (mut lane, _) = shared.attach();
         let (sink, mut events) = lane_sink();
         let mailbox = Arc::clone(&sink.rendered);
-        lane.start(sink).unwrap();
+        lane.start(sink, true).unwrap();
         next_io(&mut events).await;
         lane.play(
             "late-peak",
@@ -272,7 +278,7 @@ fn rendered_levels_follow_partial_physical_consumption_and_never_anticipate_a_lo
 
         let (new_sink, mut restarted) = lane_sink();
         let new_mailbox = Arc::clone(&new_sink.rendered);
-        lane.start(new_sink).unwrap();
+        lane.start(new_sink, true).unwrap();
         next_io(&mut restarted).await;
         lane.play(
             "late-peak-again",
@@ -317,7 +323,7 @@ fn rendered_before_start_preserves_a_queued_silent_prefix_and_its_peak() {
         let (mut lane, _) = shared.attach();
         let (sink, mut events) = lane_sink();
         let mailbox = Arc::clone(&sink.rendered);
-        lane.start(sink).unwrap();
+        lane.start(sink, true).unwrap();
         next_io(&mut events).await;
         lane.play(
             "silent-prefix",
@@ -411,11 +417,12 @@ impl Device {
 }
 
 impl AudioIo for Device {
-    fn start(&mut self, sink: IoSink) -> Result<(), String> {
+    fn start(&mut self, sink: IoSink, _: bool) -> Result<(), String> {
         sink.send(IoEvent::Ready);
         self.0.lock().unwrap().sink = Some(sink);
         Ok(())
     }
+    fn set_input(&mut self, _: bool) {}
     fn play(&mut self, utterance: &str, chunk: usize, samples: Vec<f32>, sample_rate: u32) {
         self.0.lock().unwrap().commands.push_back(Command::Play {
             utterance: utterance.into(),
@@ -529,7 +536,7 @@ fn a_sine_passes_through_mixing_and_the_speakers_resampling_without_seams() {
         let shared = SharedNativeAudio::with_physical(NativeDevices::default(), Box::new(device));
         let (mut lane, _) = shared.attach();
         let (sink, mut events) = lane_sink();
-        lane.start(sink).unwrap();
+        lane.start(sink, true).unwrap();
         // One second at 24 kHz, in chunks of uneven length, as a synthesizer hands them over.
         let (frequency, amplitude) = (440.0, 0.5);
         let speech = sine(24_000, 1.0, frequency, amplitude);
@@ -612,7 +619,7 @@ fn a_starved_speaker_neither_ends_the_playback_nor_loses_a_chunks_reports() {
         let shared = SharedNativeAudio::with_physical(NativeDevices::default(), Box::new(device));
         let (mut lane, _) = shared.attach();
         let (sink, mut events) = lane_sink();
-        lane.start(sink).unwrap();
+        lane.start(sink, true).unwrap();
         for chunk in 0..3 {
             lane.play("long", chunk, sine(RATE, 0.3, 300.0, 0.4), RATE);
         }
@@ -658,7 +665,7 @@ fn an_interruption_cuts_the_speaker_within_its_fade_despite_the_lead() {
         let shared = SharedNativeAudio::with_physical(NativeDevices::default(), Box::new(device));
         let (mut lane, _) = shared.attach();
         let (sink, mut events) = lane_sink();
-        lane.start(sink).unwrap();
+        lane.start(sink, true).unwrap();
         lane.play("cut", 0, sine(RATE, 2.0, 300.0, 0.4), RATE);
         let mut seen = Vec::new();
         for _ in 0..30 {
@@ -703,8 +710,8 @@ fn a_lane_that_is_interrupted_leaves_every_report_of_the_other_lane() {
         let (mut b, _) = shared.attach();
         let (a_sink, mut a_events) = lane_sink();
         let (b_sink, mut b_events) = lane_sink();
-        a.start(a_sink).unwrap();
-        b.start(b_sink).unwrap();
+        a.start(a_sink, true).unwrap();
+        b.start(b_sink, true).unwrap();
         a.play("a", 0, sine(RATE, 1.0, 300.0, 0.3), RATE);
         for chunk in 0..3 {
             b.play("b", chunk, sine(RATE, 0.2, 500.0, 0.3), RATE);
@@ -727,5 +734,48 @@ fn a_lane_that_is_interrupted_leaves_every_report_of_the_other_lane() {
         assert_eq!(b_seen, expected);
         a.stop();
         b.stop();
+    });
+}
+
+#[test]
+fn the_microphone_opens_only_while_a_started_lane_asks_for_it() {
+    runtime().block_on(async {
+        let recorded = Arc::new(Mutex::new(Recorded::default()));
+        let shared = SharedNativeAudio::with_physical(
+            NativeDevices::default(),
+            Box::new(Physical(Arc::clone(&recorded))),
+        );
+        let (mut speaking, _) = shared.attach();
+        let (mut listening, _) = shared.attach();
+        let (speaking_sink, mut speaking_events) = lane_sink();
+        let (listening_sink, mut listening_events) = lane_sink();
+        speaking.start(speaking_sink, false).unwrap();
+        assert!(matches!(
+            next_io(&mut speaking_events).await,
+            IoEvent::Ready
+        ));
+        assert_eq!(recorded.lock().unwrap().inputs, [false], "no microphone");
+        // A lane that listens opens it without opening the devices again.
+        listening.start(listening_sink, true).unwrap();
+        assert!(matches!(
+            next_io(&mut listening_events).await,
+            IoEvent::Ready
+        ));
+        assert_eq!(recorded.lock().unwrap().inputs, [false, true]);
+        assert_eq!(recorded.lock().unwrap().starts, 1);
+        // A lost microphone is told to the lanes that asked for it, and the speaker goes on.
+        let physical = recorded.lock().unwrap().sink.clone().unwrap();
+        physical.send(IoEvent::InputLost("microphone-lost".into()));
+        assert!(matches!(
+            next_io(&mut listening_events).await,
+            IoEvent::InputLost(code) if code == "microphone-lost"
+        ));
+        listening.set_input(true);
+        assert_eq!(recorded.lock().unwrap().inputs, [false, true, true]);
+        listening.set_input(false);
+        assert_eq!(recorded.lock().unwrap().inputs, [false, true, true, false]);
+        listening.stop();
+        speaking.stop();
+        assert_eq!(recorded.lock().unwrap().stops, 1);
     });
 }

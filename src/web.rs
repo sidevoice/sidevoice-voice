@@ -1,16 +1,18 @@
-//! The bridge to JavaScript, only in the wasm32 build (the npm package): `VoiceCall.create(models, io, config)`, the
-//! same call as the Rust [`VoiceCall`](crate::VoiceCall), on the page's models and a JavaScript microphone and speaker.
+//! The bridge to JavaScript, only in the wasm32 build (the npm package): `VoiceCall.create(io, setup)`, the same call as
+//! the Rust [`VoiceCall`](crate::VoiceCall), on the page's models and a JavaScript microphone and speaker.
 //!
-//! - `models` is the page's `VoiceModels` (`js/voice-models.d.ts`): `load()` answers `{createVad(), transcriber, speaker,
-//!   endOfTurn?}`, objects with the methods of [`Vad`](crate::Vad), [`Transcriber`](crate::Transcriber),
-//!   [`Speaker`](crate::Speaker) and [`EndOfTurnModel`](crate::EndOfTurnModel).
-//! - `io` is an object with `start(sink)`, `play(utterance, chunk, samples, sampleRate)`, `stopPlayback()` and
-//!   `stop()`; it reports through `sink` (an [`IoSink`](crate::IoSink): `ready()` once the microphone and the
-//!   speaker work, which is when the call listens, `captured(samples)`, with 16 kHz mono samples,
+//! - `setup` is the call's [`VoiceSetup`]: `{input?: {models, ...InputConfig}, output?: {models, ...OutputConfig},
+//!   ...VoiceConfig}`. A half that is absent (or null) is not there. Each half's `models` is the page's object
+//!   (`js/voice-models.d.ts`): the input's `{vad(), transcriber(), endOfTurn?()}`, the output's `{speaker()}`, each
+//!   answering the loaded model, an object with the methods of [`Vad`](crate::Vad), [`Transcriber`](crate::Transcriber),
+//!   [`EndOfTurnModel`](crate::EndOfTurnModel) or [`Speaker`](crate::Speaker). The rest is the configuration, as JSON
+//!   read strictly; a malformed one throws. The same `models` object in a later `update` is the same models.
+//! - `io` is an object with `start(sink, {input})`, `setInput(input)`, `play(utterance, chunk, samples, sampleRate)`,
+//!   `stopPlayback()` and `stop()`; it reports through `sink` (an [`IoSink`](crate::IoSink): `ready()` once what was
+//!   asked for works, which is when the call listens, `captured(samples)`, with 16 kHz mono samples,
 //!   `rendered(samples)` with 16 kHz post-gain speaker samples, `playbackEnded()` as the terminal playback marker,
-//!   `chunkStarted(utterance, chunk)`, `chunkPlayed(utterance, chunk)`, `failed(code)`). `start` may throw an error
-//!   with a `code`.
-//! - `config` is the configuration as JSON ([`VoiceConfig`]); a malformed one throws.
+//!   `chunkStarted(utterance, chunk)`, `chunkPlayed(utterance, chunk)`, `inputLost(code)`, `failed(code)`). `start`
+//!   may throw an error with a `code`.
 //!
 //! Every event reaches the callbacks given to `onEvent`, as `{ type, data }`, the JSON of
 //! [`VoiceEvent`](crate::VoiceEvent), but a take's samples, which are a `Float32Array` (`{type: "take", data: {sampleRate,
@@ -24,13 +26,15 @@ use futures_util::StreamExt;
 use js_sys::{Array, Float32Array, Function, Object, Promise, Reflect, JSON};
 use wasm_bindgen::prelude::*;
 
+use crate::config::{InputConfig, OutputConfig, VoiceConfig};
 use crate::io::{AudioIo, IoEvent, IoSink};
-use crate::models::JsVoiceModels;
+use crate::models::{InputModels, JsInputModels, JsOutputModels, OutputModels};
 use crate::runtime::spawn;
 use crate::say::{SayCancel, SayEvent, SayOptions, Saying};
+use crate::setup::{VoiceInput, VoiceOutput, VoiceSetup};
 use crate::take::Take;
 use crate::voice_call::{StartOptions, VoiceCall};
-use crate::{VoiceConfig, VoiceEvent};
+use crate::VoiceEvent;
 
 /// The Rust event keeps `StopReason` as a nested field. The page's `VoiceSayEvent` and
 /// `VoiceSayOutcome` put its `reason` (and failure `code`) beside `status`.
@@ -52,19 +56,25 @@ fn host_say_event_json(event: &SayEvent) -> String {
 pub struct WebVoiceCall {
     call: VoiceCall,
     listeners: Rc<RefCell<Vec<Function>>>,
+    /// The page's model objects of the last setup, and the models made of them: the same object is the same models.
+    kept: RefCell<Kept>,
+}
+
+/// The page's model objects each half was last given, with what the call was given for them.
+#[derive(Default)]
+struct Kept {
+    input: Option<(JsValue, Arc<dyn InputModels>)>,
+    output: Option<(JsValue, Arc<dyn OutputModels>)>,
 }
 
 #[wasm_bindgen(js_class = VoiceCall)]
 impl WebVoiceCall {
-    /// A call on the page's `models` and `io`'s microphone and speaker, set up with `config`. It does nothing until
+    /// A call with the halves of `setup`, on `io`'s microphone and speaker. It loads and opens nothing until
     /// `start()`.
-    pub fn create(models: JsValue, io: JsValue, config: JsValue) -> Result<WebVoiceCall, JsError> {
-        let config = read_config(&config)?;
-        let (call, mut events) = VoiceCall::new(
-            Arc::new(models.unchecked_into::<JsVoiceModels>()),
-            Box::new(JsIo(io)),
-            config,
-        );
+    pub fn create(io: JsValue, setup: JsValue) -> Result<WebVoiceCall, JsError> {
+        let mut kept = Kept::default();
+        let setup = read_setup(&setup, &mut kept)?;
+        let (call, mut events) = VoiceCall::new(Box::new(JsIo(io)), setup);
         let listeners: Rc<RefCell<Vec<Function>>> = Rc::default();
         let heard = Rc::clone(&listeners);
         spawn(async move {
@@ -81,7 +91,11 @@ impl WebVoiceCall {
                 }
             }
         });
-        Ok(Self { call, listeners })
+        Ok(Self {
+            call,
+            listeners,
+            kept: RefCell::new(kept),
+        })
     }
 
     /// Calls `listener` with every event from now on.
@@ -107,20 +121,16 @@ impl WebVoiceCall {
         self.call.stop();
     }
 
-    /// A new configuration, as JSON.
-    #[wasm_bindgen(js_name = setConfig)]
-    pub fn set_config(&self, config: JsValue) -> Result<(), JsError> {
-        self.call.set_config(read_config(&config)?);
-        Ok(())
-    }
-
-    /// Other models (`VoiceModels`) with the configuration they go with, as JSON, taken together: loaded at once if the
-    /// call is started, else at the next start. A malformed configuration throws and changes nothing.
-    #[wasm_bindgen(js_name = setModels)]
-    pub fn set_models(&self, models: JsValue, config: JsValue) -> Result<(), JsError> {
-        let config = read_config(&config)?;
-        self.call
-            .set_models(Arc::new(models.unchecked_into::<JsVoiceModels>()), config);
+    /// Another setup, the whole of it ([`VoiceCall::update`]). A malformed one throws and changes nothing.
+    pub fn update(&self, setup: JsValue) -> Result<(), JsError> {
+        let mut kept = self.kept.borrow_mut();
+        let mut next = Kept {
+            input: kept.input.clone(),
+            output: kept.output.clone(),
+        };
+        let setup = read_setup(&setup, &mut next)?;
+        *kept = next;
+        self.call.update(setup);
         Ok(())
     }
 
@@ -209,6 +219,68 @@ mod tests {
     use futures_channel::mpsc::unbounded;
     use wasm_bindgen_futures::JsFuture;
     use wasm_bindgen_test::wasm_bindgen_test as test;
+
+    /// `value`'s JSON as a JavaScript object, with `models` set to `models` in each half named.
+    fn setup_of(value: serde_json::Value, halves: &[(&str, &JsValue)]) -> JsValue {
+        let setup = JSON::parse(&value.to_string()).expect("JSON");
+        for (half, models) in halves {
+            let half = Reflect::get(&setup, &(*half).into()).expect("the half");
+            Reflect::set(&half, &"models".into(), models).expect("models set");
+        }
+        setup
+    }
+
+    #[test]
+    fn a_setup_reads_its_halves_and_the_same_models_object_is_the_same_models() {
+        let (input, output) = (Object::new().into(), Object::new().into());
+        let mut kept = Kept::default();
+        let setup = read_setup(
+            &setup_of(
+                serde_json::json!({"input": {"language": "es", "end_of_turn": {"kind": "silence", "ms": 1500}}}),
+                &[("input", &input)],
+            ),
+            &mut kept,
+        )
+        .expect("an input half");
+        assert!(setup.output.is_none());
+        let first = setup.input.expect("the input half");
+        assert_eq!(
+            first.config.end_of_turn,
+            crate::EndOfTurn::Silence { ms: Some(1_500) }
+        );
+        let both = serde_json::json!({"input": {}, "output": {"voice": "ef_dora"}, "idle_unload_minutes": 0});
+        let again = read_setup(
+            &setup_of(both.clone(), &[("input", &input), ("output", &output)]),
+            &mut kept,
+        )
+        .expect("both halves");
+        assert!(Arc::ptr_eq(
+            &first.models,
+            &again.input.expect("input").models
+        ));
+        assert_eq!(again.config.idle_unload_minutes, 0);
+        let other: JsValue = Object::new().into();
+        let changed = read_setup(
+            &setup_of(both, &[("input", &other), ("output", &output)]),
+            &mut kept,
+        )
+        .expect("other models");
+        assert!(!Arc::ptr_eq(
+            &first.models,
+            &changed.input.expect("input").models
+        ));
+        let unknown = serde_json::json!({"input": {"stt": {"model": "whisper"}}});
+        assert!(read_setup(
+            &setup_of(unknown, &[("input", &input)]),
+            &mut Kept::default()
+        )
+        .is_err());
+        let without = JSON::parse(r#"{"output": {"voice": "ef_dora"}}"#).expect("JSON");
+        assert!(
+            read_setup(&without, &mut Kept::default()).is_err(),
+            "a half needs its models"
+        );
+    }
 
     #[test]
     async fn real_say_serialization_reaches_the_flat_web_consumer() {
@@ -371,7 +443,13 @@ impl IoSink {
         self.send(IoEvent::MicrophoneMuted(muted));
     }
 
-    /// The microphone or the speaker failed, with a stable code; the call stops.
+    /// The microphone failed, went away, or could not open, with a stable code; the speaker goes on.
+    #[wasm_bindgen(js_name = inputLost)]
+    pub fn input_lost(&self, code: String) {
+        self.send(IoEvent::InputLost(code));
+    }
+
+    /// The speaker failed, or the devices could not open, with a stable code; the call stops.
     pub fn failed(&self, code: String) {
         self.send(IoEvent::Failed(code));
     }
@@ -381,8 +459,14 @@ impl IoSink {
 struct JsIo(JsValue);
 
 impl AudioIo for JsIo {
-    fn start(&mut self, sink: IoSink) -> Result<(), String> {
-        self.call("start", &[sink.into()])
+    fn start(&mut self, sink: IoSink, input: bool) -> Result<(), String> {
+        let options = Object::new();
+        let _ = Reflect::set(&options, &"input".into(), &input.into());
+        self.call("start", &[sink.into(), options.into()])
+    }
+
+    fn set_input(&mut self, input: bool) {
+        let _ = self.call("setInput", &[input.into()]);
     }
 
     fn play(&mut self, utterance: &str, chunk: usize, samples: Vec<f32>, sample_rate: u32) {
@@ -451,8 +535,76 @@ fn take_event(take: Take) -> JsValue {
     event.into()
 }
 
-fn read_config(config: &JsValue) -> Result<VoiceConfig, JsError> {
-    serde_json::from_value(json(config)?).map_err(|error| JsError::new(&error.to_string()))
+/// The setup in `setup`: each half's `models` taken as the page's object (the very object `kept` holds keeps the
+/// models made of it), the rest read strictly as the configuration. `kept` is left with this setup's objects.
+fn read_setup(setup: &JsValue, kept: &mut Kept) -> Result<VoiceSetup, JsError> {
+    if !setup.is_object() {
+        return Err(JsError::new("the setup is an object"));
+    }
+    let config: VoiceConfig = read(json_without(setup, &["input", "output"])?)?;
+    let input = match half(setup, "input")? {
+        None => None,
+        Some((object, config)) => {
+            let config: InputConfig = read(config)?;
+            let models = match &kept.input {
+                Some((kept, models)) if Object::is(kept, &object) => Arc::clone(models),
+                _ => Arc::new(object.clone().unchecked_into::<JsInputModels>())
+                    as Arc<dyn InputModels>,
+            };
+            Some((object, VoiceInput { models, config }))
+        }
+    };
+    let output = match half(setup, "output")? {
+        None => None,
+        Some((object, config)) => {
+            let config: OutputConfig = read(config)?;
+            let models = match &kept.output {
+                Some((kept, models)) if Object::is(kept, &object) => Arc::clone(models),
+                _ => Arc::new(object.clone().unchecked_into::<JsOutputModels>())
+                    as Arc<dyn OutputModels>,
+            };
+            Some((object, VoiceOutput { models, config }))
+        }
+    };
+    kept.input = input
+        .as_ref()
+        .map(|(object, input)| (object.clone(), Arc::clone(&input.models)));
+    kept.output = output
+        .as_ref()
+        .map(|(object, output)| (object.clone(), Arc::clone(&output.models)));
+    Ok(VoiceSetup {
+        input: input.map(|(_, input)| input),
+        output: output.map(|(_, output)| output),
+        config,
+    })
+}
+
+/// The half `name` of `setup`, if it is there: its page's models object, and the rest of it as JSON.
+fn half(setup: &JsValue, name: &str) -> Result<Option<(JsValue, serde_json::Value)>, JsError> {
+    let value = Reflect::get(setup, &name.into()).unwrap_or(JsValue::UNDEFINED);
+    if value.is_undefined() || value.is_null() {
+        return Ok(None);
+    }
+    let models = Reflect::get(&value, &"models".into()).unwrap_or(JsValue::UNDEFINED);
+    if !models.is_object() {
+        return Err(JsError::new(&format!(
+            "{name}.models is the page's models object"
+        )));
+    }
+    Ok(Some((models, json_without(&value, &["models"])?)))
+}
+
+/// `object`'s own fields but `left_out`, as JSON: what is data in it, never its models.
+fn json_without(object: &JsValue, left_out: &[&str]) -> Result<serde_json::Value, JsError> {
+    let copy = Object::assign(&Object::new(), object.unchecked_ref());
+    for key in left_out {
+        let _ = Reflect::delete_property(&copy, &(*key).into());
+    }
+    json(&copy)
+}
+
+fn read<T: serde::de::DeserializeOwned>(value: serde_json::Value) -> Result<T, JsError> {
+    serde_json::from_value(value).map_err(|error| JsError::new(&error.to_string()))
 }
 
 fn json(value: &JsValue) -> Result<serde_json::Value, JsError> {

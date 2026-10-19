@@ -24,7 +24,7 @@ async function openWithBrowserSetting(echoCancellation) {
     close() { return Promise.resolve(); }
   };
   const io = createWebAudioIo();
-  const code = await new Promise((resolve) => io.start({ failed: resolve }));
+  const code = await new Promise((resolve) => io.start({ failed: resolve, inputLost: resolve, microphoneMuted() {} }, { input: true }));
   return { code, requested, stopped };
 }
 
