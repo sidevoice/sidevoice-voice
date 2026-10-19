@@ -274,3 +274,123 @@ test("an update keeps the models object of a half whose choices stay, so the cal
   await call.stop();
   await assert.rejects(call.update({ output }), { code: "stopped" });
 });
+
+const minutes = (count) => count * 60_000;
+
+test("a preload loads what the halves use, and opens no lane", async () => {
+  const io = audio();
+  const source = counting();
+  const owner = createVoiceHost(source, { io });
+  const callsBefore = made.length;
+  await owner.preload({ output });
+  assert.deepEqual(source.loads, { vad: 0, stt: 0, tts: 1, turn: 0 }, "an absent input half loads no detector, transcriber or turn model");
+  await owner.preload({ input });
+  assert.deepEqual(source.loads, { vad: 1, stt: 1, tts: 1, turn: 0 }, "silence loads no end-of-turn model");
+  await owner.preload({ input: { ...input, endOfTurn: { kind: "smart", model: { model: "smart-turn-v3" } } } });
+  assert.deepEqual(source.loads, { vad: 1, stt: 1, tts: 1, turn: 1 }, "smart loads the one it names, the rest are held already");
+  await owner.preload(both);
+  assert.deepEqual(source.loads, { vad: 1, stt: 1, tts: 1, turn: 1 }, "a choice loaded is not loaded again");
+  assert.equal(io.attached.length, 0, "no audio lane is attached, so no microphone or speaker is opened");
+  assert.equal(made.length, callsBefore, "and no call is made");
+  await assert.rejects(owner.preload({}), TypeError);
+  await assert.rejects(owner.preload(), TypeError);
+  await assert.rejects(owner.preload({ input: null, output: null }), TypeError);
+});
+
+test("a call after a preload takes what it loaded, and a preload shares the load of a call", async () => {
+  const source = counting();
+  const owner = createVoiceHost(source, { io: audio() });
+  await owner.preload(both);
+  const call = owner.start(both);
+  await call.ready;
+  assert.deepEqual(source.loads, { vad: 1, stt: 1, tts: 1, turn: 0 }, "the call loads nothing: its models are the preload's");
+  assert.equal(made.at(-1).loaded.transcriber.choice.model, "whisper");
+  await call.stop();
+  // A preload that is still loading when a call asks for the same choice is the same load.
+  let finish;
+  const slow = counting({ transcriber: (choice) => { slow.loads.stt++; return new Promise((resolve) => { finish = () => resolve({ choice }); }); } });
+  const other = createVoiceHost(slow, { io: audio() });
+  const warming = other.preload({ input });
+  const starting = other.start({ input });
+  await new Promise((resolve) => setImmediate(resolve));
+  finish();
+  await Promise.all([warming, starting.ready]);
+  assert.equal(slow.loads.stt, 1);
+  await starting.stop();
+});
+
+test("a preloaded model is let go idle_unload_minutes after its load, and a call that holds it keeps it", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const source = counting();
+  const owner = createVoiceHost(source, { io: audio() });
+  await owner.preload({ ...both, idle_unload_minutes: 5 });
+  context.mock.timers.tick(minutes(5) - 1);
+  const held = owner.start(both);
+  await held.ready;
+  assert.deepEqual(source.loads, { vad: 1, stt: 1, tts: 1, turn: 0 }, "just before the end of the idle time, the preload is still there");
+  context.mock.timers.tick(minutes(60));
+  const sharing = owner.start(both);
+  await sharing.ready;
+  assert.deepEqual(source.loads, { vad: 1, stt: 1, tts: 1, turn: 0 }, "a running call holds what a preload loaded, however long it runs");
+  await Promise.all([held.stop(), sharing.stop()]);
+  // The idle time restarts when the last holder lets go, with the call's own (10 by default).
+  context.mock.timers.tick(minutes(10) - 1);
+  await owner.preload(both);
+  assert.deepEqual(source.loads, { vad: 1, stt: 1, tts: 1, turn: 0 });
+  context.mock.timers.tick(minutes(10));
+  const late = owner.start(both);
+  await late.ready;
+  assert.deepEqual(source.loads, { vad: 2, stt: 2, tts: 2, turn: 0 }, "after the idle time with no holder, the next ask loads again");
+  await late.stop();
+});
+
+test("a preload with the default idle time lets go after 10 minutes, and 0 holds nothing", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const source = counting();
+  const owner = createVoiceHost(source, { io: audio() });
+  await owner.preload({ output });
+  context.mock.timers.tick(minutes(10) - 1);
+  await owner.preload({ output });
+  assert.equal(source.loads.tts, 1, "10 minutes less a moment: held; a second preload counts the idle time again");
+  context.mock.timers.tick(minutes(10) - 1);
+  await owner.preload({ output });
+  assert.equal(source.loads.tts, 1);
+  context.mock.timers.tick(minutes(10));
+  await owner.preload({ output, idle_unload_minutes: 0 });
+  assert.equal(source.loads.tts, 2, "10 minutes with no holder: loaded again");
+  await owner.preload({ output });
+  assert.equal(source.loads.tts, 3, "0 idle minutes let it go as soon as it loaded");
+});
+
+test("a preload that cannot load rejects with the code of the slot, keeps what loaded and forgets the refused slot", async () => {
+  let refuse = true;
+  const source = counting({ transcriber: async (choice) => {
+    source.loads.stt++;
+    if (refuse) throw Object.assign(new Error("gone"), { code: "model-unknown" });
+    return { choice };
+  } });
+  const owner = createVoiceHost(source, { io: audio() });
+  await assert.rejects(owner.preload(both), { code: "model-unknown" });
+  assert.deepEqual(source.loads, { vad: 1, stt: 1, tts: 1, turn: 0 });
+  refuse = false;
+  await owner.preload(both);
+  assert.deepEqual(source.loads, { vad: 1, stt: 2, tts: 1, turn: 0 }, "the next ask loads the refused slot again and takes the others held");
+  const { endOfTurn: _none, ...withoutTurns } = counting();
+  await assert.rejects(createVoiceHost(withoutTurns, { io: audio() }).preload({ input: { ...input, endOfTurn: { kind: "smart" } } }), { code: "end-of-turn-missing" });
+});
+
+test("the idle time of a preload counts from the end of its load, however long that takes", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  let finish;
+  const source = counting({ transcriber: (choice) => { source.loads.stt++; return new Promise((resolve) => { finish = () => resolve({ choice }); }); } });
+  const owner = createVoiceHost(source, { io: audio() });
+  const warming = owner.preload({ input, idle_unload_minutes: 10 });
+  await new Promise((resolve) => setImmediate(resolve));
+  context.mock.timers.tick(minutes(30));
+  finish();
+  await warming;
+  const call = owner.start({ input });
+  await call.ready;
+  assert.equal(source.loads.stt, 1, "a download that took longer than the idle time is not let go as it ends");
+  await call.stop();
+});

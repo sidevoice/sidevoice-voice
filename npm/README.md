@@ -43,6 +43,12 @@ await call.update({ input: { stt, endOfTurn: { kind: "silence" } } }); // a micr
 await call.stop(); // ends the call; its models stay loaded for `idle_unload_minutes` (10) unless another call holds them
 ```
 
+`await voice.preload(settings)` loads what a call of those settings would, ahead of it (the same slots: an absent half
+loads none of its own, `silence` no end-of-turn model), and opens no microphone or speaker. A call that starts with the
+same choices, now or later, takes the models without loading them; they are let go `idle_unload_minutes` (10) after
+the last holder, counted from the end of the preload. A page preloads the model a person has just chosen or
+downloaded, so the first try or call does not wait for it; it rejects `{ code }` for a model that cannot load.
+
 A call without an input half says `listening: "off"` in its state and has no barge-in; one without an output half
 answers `say` with `not-played` (`failed`, `output-missing`). A microphone lost during a call (`onError`:
 `microphone-lost`, `microphone-denied`, ...) leaves it speaking, its input half gone, instead of failing it;

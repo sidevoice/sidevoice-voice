@@ -119,6 +119,15 @@ export interface VoiceHost {
    *  hands it to `onTake` then; never otherwise. Answers at once; `ready` says when it works. Malformed settings, or
    *  none of the halves, throw. */
   start(settings: VoiceSettings, options?: { take?: boolean }): VoiceCallHost;
+  /** Loads the models `settings` use into the host, ahead of a call: the slots a `start` of them would ask for (an
+   *  absent half loads none of its slots, `silence` no end-of-turn model), each once for a choice already loaded or
+   *  loading. It opens no microphone and no speaker. The models are held as a stopped call's are: a call that starts
+   *  with the same choices, now or later, takes them without loading, holds them while it runs, and they are let go
+   *  `idle_unload_minutes` (10 by default; the settings' own) after the last holder, counted from the end of the load
+   *  (from the call's stop, for one a call held). Resolves once every slot is loaded. Rejects `VoiceHostError` with the
+   *  code a slot's load refused (what else loaded stays; the refused slot is forgotten, so the next ask loads it
+   *  again), or a `TypeError` for malformed settings or none of the halves. */
+  preload(settings: VoiceSettings): Promise<void>;
   /** Acknowledged next-frame switch; null supplies silence to every call. */
   routeInput(target: VoiceCallHost | null): Promise<void>;
   audioDevices(): Promise<VoiceAudioDevices>;
