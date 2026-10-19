@@ -234,3 +234,62 @@ test("restarting one lane cannot deliver an old meter report to its new sink", a
   assert.equal(other.events.ready, 1);
   a.io.stop(); b.io.stop();
 });
+
+const settle = async (ready) => { for (let i = 0; i < 10 && !ready(); i++) await new Promise((resolve) => setTimeout(resolve, 0)); };
+
+test("a context the browser suspended is resumed once the page is shown again, and at the next tap", async () => {
+  browser();
+  const page = new EventTarget();
+  const doc = Object.assign(new EventTarget(), { visibilityState: "visible" });
+  Object.assign(globalThis, { document: doc, addEventListener: page.addEventListener.bind(page), removeEventListener: page.removeEventListener.bind(page) });
+  const Base = globalThis.AudioContext;
+  const made = [];
+  let resumes = 0;
+  globalThis.AudioContext = class extends Base {
+    constructor() { super(); this.state = "running"; made.push(this); }
+    async resume() { resumes++; this.state = "running"; }
+  };
+  try {
+    const audio = createSharedWebAudioIo();
+    const lane = audio.attach();
+    const listener = sink();
+    lane.io.start(listener);
+    await settle(() => listener.events.ready);
+    const [context] = made;
+    const before = resumes;
+    // Interrupted while the page is away (iOS: the background, a locked screen): nothing to do until it is back.
+    doc.visibilityState = "hidden"; context.state = "interrupted"; context.onstatechange();
+    assert.equal(resumes, before, "never resumed while hidden");
+    doc.visibilityState = "visible"; doc.dispatchEvent(new Event("visibilitychange"));
+    assert.deepEqual([resumes, context.state], [before + 1, "running"], "resumed once shown again");
+    context.state = "suspended"; page.dispatchEvent(new Event("pointerdown"));
+    assert.equal(resumes, before + 2, "and at the next tap");
+    page.dispatchEvent(new Event("pointerdown"));
+    assert.equal(resumes, before + 2, "a running context is left alone");
+    lane.io.stop();
+    context.state = "suspended"; page.dispatchEvent(new Event("focus"));
+    assert.equal(resumes, before + 2, "a released context is not woken");
+  } finally {
+    globalThis.AudioContext = Base;
+    delete globalThis.document; delete globalThis.addEventListener; delete globalThis.removeEventListener;
+  }
+});
+
+test("an ended microphone is opened again from the system's default; only one that cannot be opened fails the calls", async () => {
+  const physical = browser();
+  const tracks = [];
+  const open = navigator.mediaDevices.getUserMedia;
+  navigator.mediaDevices.getUserMedia = async (constraints) => { const stream = await open(constraints); tracks.push(stream.getAudioTracks()[0]); return stream; };
+  const audio = createSharedWebAudioIo();
+  const lane = audio.attach();
+  const failures = [];
+  const listener = { ...sink(), failed: (code) => failures.push(code) };
+  lane.io.start(listener);
+  await settle(() => listener.events.ready);
+  await tracks[0].onended();
+  assert.equal(physical.opens, 2, "the default microphone, opened again");
+  assert.deepEqual(failures, [], "the call goes on");
+  navigator.mediaDevices.getUserMedia = async () => { throw Object.assign(new Error("none"), { name: "NotFoundError" }); };
+  await tracks[1].onended();
+  assert.deepEqual(failures, ["microphone-lost"]);
+});

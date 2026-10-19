@@ -21,6 +21,22 @@ export function createSharedWebAudioIo(options = {}) {
   let inputDevice = options.inputDevice || null;
   let outputDevice = options.outputDevice || null;
   const frame = () => Math.ceil((context?.currentTime || 0) * (context?.sampleRate || 16000));
+  // The browser suspends or interrupts the context on its own (iOS when the page goes to the background or the screen
+  // locks, a system interruption) and does not always bring it back: the capture stops, an open turn ends for lack of
+  // audio, and nothing is heard or played after. It is resumed whenever it may be: as it changes state while shown,
+  // when the page is shown or focused again, at the person's next tap or key, and when the microphone gives audio again.
+  const wake = () => {
+    if (!context || context.state === "running" || context.state === "closed") return;
+    if (globalThis.document?.visibilityState === "hidden") return;
+    context.resume().catch(() => {});
+  };
+  const WAKERS = [["document", "visibilitychange"], ["window", "pageshow"], ["window", "focus"], ["window", "pointerdown"], ["window", "keydown"]];
+  const listen = (on) => {
+    for (const [where, type] of WAKERS) {
+      const target = where === "document" ? globalThis.document : globalThis;
+      target?.[on ? "addEventListener" : "removeEventListener"]?.(type, wake, true);
+    }
+  };
 
   function releaseDevices() {
     session++;
@@ -38,6 +54,8 @@ export function createSharedWebAudioIo(options = {}) {
       lane.sources.clear(); lane.queueEnd = 0;
       lane.active = null; lane.closing.clear(); lane.deferred = null; lane.rendering = false;
     }
+    listen(false);
+    if (context) context.onstatechange = null;
     context?.close().catch(() => {}); context = null;
     opening = null;
   }
@@ -64,15 +82,16 @@ export function createSharedWebAudioIo(options = {}) {
     for (const track of stream?.getTracks() ?? []) { track.onended = track.onmute = track.onunmute = null; track.stop(); }
     stream = next;
     for (const track of next.getAudioTracks()) {
+      // The microphone went (unplugged, a route change, taken by the system): the system's default takes its place, as
+      // the native capture does; only when none opens do the calls fail.
       track.onended = async () => {
         if (opened !== session) return;
-        if (!inputDevice) return failAll("microphone-lost");
         const old = inputDevice; inputDevice = null;
-        try { useStream(await media(null), opened); options.onDeviceLost?.("input", old); }
+        try { useStream(await media(null), opened); if (old) options.onDeviceLost?.("input", old); }
         catch (_) { failAll("microphone-lost"); }
       };
       track.onmute = () => { if (opened === session) for (const lane of lanes.values()) lane.sink?.microphoneMuted(true); };
-      track.onunmute = () => { if (opened === session) for (const lane of lanes.values()) lane.sink?.microphoneMuted(false); };
+      track.onunmute = () => { if (opened !== session) return; wake(); for (const lane of lanes.values()) lane.sink?.microphoneMuted(false); };
     }
     if (capture) { microphone?.disconnect(); microphone = context.createMediaStreamSource(next); microphone.connect(capture); }
   }
@@ -81,6 +100,8 @@ export function createSharedWebAudioIo(options = {}) {
     if (opened !== session) { mediaStream.getTracks().forEach((track) => track.stop()); return; }
     useStream(mediaStream, opened);
     context = new AudioContext();
+    context.onstatechange = wake;
+    listen(true);
     await context.audioWorklet.addModule(new URL("./capture-worklet.js", import.meta.url).href);
     await context.audioWorklet.addModule(new URL("./playback-worklet.js", import.meta.url).href);
     if (opened !== session) return;
