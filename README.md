@@ -57,7 +57,7 @@ implement them with the re-exported `#[async_trait]`):
 | `Transcriber` | `transcribe(pcm, sample_rate, language?)` → the text. |
 | `Speaker` | `speak(text, voice?, language?, speed)` → mono samples and their rate. |
 | `EndOfTurnModel` | `end_of_turn(pcm, sample_rate)` → the probability that the turn is over, for `smart`. |
-| `InputModels` | The input half's slots, each loaded on its own: `vad()` (a fresh stream for the call), `transcriber()`, and `end_of_turn()` (asked only for `smart`; `end-of-turn-missing` by default). |
+| `InputModels` | The input half's slots, each loaded on its own: `vad()` (a fresh stream for the call, which the call warms up on 0.1 s of silence and resets), `transcriber()`, and `end_of_turn()` (asked only for `smart`; `end-of-turn-missing` by default). |
 | `OutputModels` | The output half's slot: `speaker()`. |
 
 What the call loaded is dropped once it has been stopped for `idle_unload_minutes`.
@@ -160,7 +160,9 @@ is the default). The microphone is opened only with `input`. Their failures are 
   `language` of what is said when `say` gives none (the input's when absent). The call's (`VoiceConfig`): the grace
   before anything is said (`audio_grace_ms`, 1 s), and how long the models stay loaded with the call stopped
   (`idle_unload_minutes`, 10; 0 drops them as it stops).
-- **`start` loads the models its halves use** if they are not loaded, every slot at once. They stay across stops, and
+- **`start` loads the models its halves use** if they are not loaded, every slot at once. The detector is warmed up as
+  it loads, while the others still do: its first windows (a runtime's first inference is the slow one) run on 0.1 s
+  of silence, then it starts over, so the first real window does not wait on it. They stay across stops, and
   are dropped once the call has been stopped for `idle_unload_minutes`; the next start loads them again, on the web as
   natively. `smart` without an end-of-turn model refuses to start with `end-of-turn-missing`. A model that cannot load,
   and every other failure a person may be told of, is a `VoiceEvent::Error` with a stable code.

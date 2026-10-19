@@ -1466,3 +1466,76 @@ fn a_lost_microphone_ends_a_call_that_only_listens() {
         drop(call);
     });
 }
+
+/// Input models whose transcriber loads only when the test says, with a detector that logs what it is fed.
+struct Warming {
+    log: Arc<Mutex<Vec<String>>>,
+    gate: Arc<tokio::sync::Notify>,
+}
+
+struct LoggedDetector(Arc<Mutex<Vec<String>>>);
+
+#[async_trait]
+impl Vad for LoggedDetector {
+    async fn accept(&mut self, pcm: &[f32]) -> Result<Vec<VadFrame>, String> {
+        let silent = pcm.iter().all(|sample| *sample == 0.0);
+        self.0
+            .lock()
+            .unwrap()
+            .push(format!("accept {} silent {silent}", pcm.len()));
+        Ok(Vec::new())
+    }
+
+    async fn reset(&mut self) {
+        self.0.lock().unwrap().push("reset".into());
+    }
+}
+
+#[async_trait]
+impl InputModels for Warming {
+    async fn vad(&self) -> Result<Box<dyn Vad>, String> {
+        self.log.lock().unwrap().push("vad loaded".into());
+        Ok(Box::new(LoggedDetector(Arc::clone(&self.log))))
+    }
+
+    async fn transcriber(&self) -> Result<Arc<dyn Transcriber>, String> {
+        self.gate.notified().await;
+        self.log.lock().unwrap().push("transcriber loaded".into());
+        Ok(Arc::new(FakeTranscriber))
+    }
+}
+
+#[test]
+fn the_detector_warms_up_while_the_other_models_load() {
+    runtime().block_on(async {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let input = Arc::new(Warming {
+            log: Arc::clone(&log),
+            gate: Arc::clone(&gate),
+        });
+        let config = fast();
+        let setup = VoiceSetup {
+            input: config.input.map(|config| VoiceInput {
+                models: input as Arc<dyn InputModels>,
+                config,
+            }),
+            output: config.output.map(|config| VoiceOutput {
+                models: Arc::new(FakeModels::default()) as Arc<dyn OutputModels>,
+                config,
+            }),
+            config: config.call,
+        };
+        let (call, mut events, _speakers) = with_setup(setup);
+        call.start(StartOptions::default());
+        // The transcriber still loads: the detector has run its first windows on silence and started over.
+        until(|| log.lock().unwrap().iter().any(|entry| entry == "reset")).await;
+        assert_eq!(
+            *log.lock().unwrap(),
+            ["vad loaded", "accept 1600 silent true", "reset"]
+        );
+        gate.notify_one();
+        assert_eq!(started(&mut events).await, crate::Listening::Listening);
+        assert_eq!(log.lock().unwrap().last().unwrap(), "transcriber loaded");
+    });
+}
