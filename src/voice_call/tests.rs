@@ -1222,10 +1222,21 @@ fn an_update_keeps_what_the_same_models_loaded() {
         let (call, mut events, _speakers) = with_setup(setup(&models, try_config));
         call.start(StartOptions::default());
         started(&mut events).await;
-        // The output half joins on the same models, then the end of turn turns smart: nothing loads twice.
+        // The output half joins on the same models: only the speaker loads, and what is said is heard.
         call.update(setup(&models, fast()));
+        // It restarts once on the new halves.
+        next(&mut events, |event| match event {
+            VoiceEvent::State(state) if state.listening == crate::Listening::Idle => Some(()),
+            _ => None,
+        })
+        .await;
+        started(&mut events).await;
+        let saying = call.say("Now it speaks.", SayOptions::default());
+        assert_eq!(outcome(saying).await, SayOutcome::Heard);
+        // The end of turn turns smart and back: only the end-of-turn model loads, once.
         let smart = config_with(|input| input.end_of_turn = crate::EndOfTurn::Smart {});
         call.update(setup(&models, smart));
+        until(|| models.classifiers.load(Ordering::SeqCst) == 1).await;
         call.update(setup(&models, fast()));
         call.stop();
         next(&mut events, |event| match event {
