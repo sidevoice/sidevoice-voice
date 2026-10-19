@@ -68,9 +68,12 @@ export interface VoiceCall {
   start(options?: { take?: boolean }): void;
   /** Stops listening and speaking; the models stay loaded. */
   stop(): void;
-  /** Another setup, the whole of it. A half whose `models` is the same object keeps what it loaded. A change of
-   *  configuration only is in effect at once; one of halves or models restarts a started call once. A malformed one
-   *  throws and changes nothing. */
+  /** Another setup, the whole of it. A half whose `models` is the same object keeps what it loaded. Stopped, it is in
+   *  effect at once. Running, the call's own configuration is in effect at once, and each half's change loads what it
+   *  needs while the half works on as it was, then takes effect at its safe point without a restart: the input's at
+   *  the next turn, the output's at the next utterance, never cutting what plays. A half added opens what it needs (the
+   *  microphone, for the input); one removed closes it. A model that cannot load is an `error` event, and the half
+   *  stays as it was. A malformed setup throws and changes nothing. */
   update(setup: VoiceSetup): void;
   /** Says `text` after whatever is being said; the handle tells how it goes and cancels it. Without an output half its
    *  outcome is `not-played` (`failed`, `output-missing`). */
@@ -124,5 +127,6 @@ export type {
   VoiceModelSource,
   VoiceOutputSettings,
   VoiceSettings,
+  VoiceSettingsChange,
   VoiceVadModel,
 } from "./voice-host.js";

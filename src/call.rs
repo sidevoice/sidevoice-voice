@@ -32,8 +32,12 @@ pub(crate) enum Input {
     Start { take: bool },
     /// Stop: the open turn and the turns not yet transcribed are cancelled, and what is being said stops.
     Stop,
-    /// A new configuration: its halves, and how each works.
+    /// A new configuration: its halves, and how each works. A half that goes or comes starts its region over: an output
+    /// half that goes ends what waits to be said (`failed`, `output-missing`); an input half starts segmentation anew.
     Config(Box<CallConfig>),
+    /// Whether nothing new may start to be said: what is being said goes on, and the next waits until this is lifted
+    /// (the output half is about to change).
+    HoldOutput(bool),
     /// One detector window: 16 kHz mono samples after echo cancellation, whether the detector holds it for speech, and
     /// its probability that the window is speech. The probability decides; a detector that gives none is taken at its
     /// word, window by window.
@@ -152,6 +156,8 @@ pub(crate) struct Call {
     /// The Unix time of the call's millisecond 0.
     epoch_unix_ms: u64,
     started: bool,
+    /// Nothing new starts to be said while set.
+    held: bool,
     muted: bool,
     /// Whether the microphone's device gives no audio, until the call stops.
     microphone_muted: bool,
@@ -185,6 +191,7 @@ impl Call {
             call_id,
             epoch_unix_ms,
             started: false,
+            held: false,
             muted: false,
             microphone_muted: false,
             open: None,
@@ -212,10 +219,8 @@ impl Call {
                 self.marks = take.then(Vec::new);
             }
             Input::Stop => self.stop(now, &mut out),
-            Input::Config(config) => {
-                self.segmenter.set_numbers(segmentation(&config));
-                self.config = *config;
-            }
+            Input::Config(config) => self.configure(*config, &mut out),
+            Input::HoldOutput(held) => self.held = held,
             Input::Window {
                 pcm,
                 speech,
@@ -308,6 +313,37 @@ impl Call {
         out
     }
 
+    /// Whether a change of the input half may take effect now: no turn is open and no speech is under way.
+    pub(crate) fn input_idle(&self) -> bool {
+        self.open.is_none() && !self.segmenter.speaking()
+    }
+
+    /// Whether a change of the output half may take effect now: nothing is being said.
+    pub(crate) fn output_idle(&self) -> bool {
+        !self.playback.busy()
+    }
+
+    fn configure(&mut self, config: CallConfig, out: &mut Vec<Effect>) {
+        if config.input.is_some() != self.config.input.is_some() {
+            self.segmenter = Segmenter::new(segmentation(&config));
+        } else {
+            self.segmenter.set_numbers(segmentation(&config));
+        }
+        let output_gone = config.output.is_none() && self.config.output.is_some();
+        self.config = config;
+        if output_gone {
+            let mut actions = Vec::new();
+            self.playback.interrupt(
+                StopReason::Failed {
+                    code: OUTPUT_MISSING.into(),
+                },
+                &mut actions,
+            );
+            self.continuing_chunk = None;
+            self.act(actions, out);
+        }
+    }
+
     /// The input half's patience; the default without one.
     fn patience(&self) -> crate::config::Patience {
         self.config
@@ -327,9 +363,12 @@ impl Call {
     pub(crate) fn deadline(&self) -> Option<u64> {
         let speaking = self.segmenter.speaking();
         // The grace is a deadline only when its end is all that holds the next one back.
-        let say = (self.playback.waiting() && !self.playback.busy() && self.quiet(speaking))
-            .then_some(self.quiet_until)
-            .filter(|&until| until > 0);
+        let say = (self.playback.waiting()
+            && !self.playback.busy()
+            && !self.held
+            && self.quiet(speaking))
+        .then_some(self.quiet_until)
+        .filter(|&until| until > 0);
         [
             self.segmenter.deadline(),
             self.recognition.deadline(speaking),
@@ -641,7 +680,7 @@ impl Call {
         if let Some(pending) = self.recognition.due(now, speaking) {
             self.finish_pending(now, pending, out);
         }
-        if self.quiet(speaking) && now >= self.quiet_until && !self.playback.busy() {
+        if self.quiet(speaking) && now >= self.quiet_until && !self.playback.busy() && !self.held {
             let mut actions = Vec::new();
             self.playback.start(&mut actions);
             self.act(actions, out);

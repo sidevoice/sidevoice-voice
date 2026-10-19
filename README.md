@@ -99,9 +99,18 @@ while let Some(step) = saying.next().await {
         SayEvent::Done { outcome } => report(outcome), // heard, heard up to N, or not played, and why
     }
 }
-// Another setup: call.update(setup). A half with the same models (the same Arc) keeps what it loaded; a change of
-// configuration only is in effect at once, one of halves or models restarts a running call once.
+// Another setup, live: call.update(setup). A half with the same models (the same Arc) keeps what it loaded; a running
+// call loads what changes beside what it uses and swaps it at the half's safe point, with no restart (below).
 ```
+
+**A running call changes without a restart** (`update`): other models, another end of turn, another voice, a half
+added or removed. A half's new models load while it goes on as it was, then take over at its safe point: the input
+half's at the next turn (no turn open), the output half's at the next utterance (what is being said ends in its own
+voice; what is asked meanwhile waits for the new one). Nothing playing is cut. An input half added later (a microphone
+appeared, the permission was granted) opens the microphone (`AudioIo::set_input`); one removed closes it. A
+microphone lost under the call (`IoEvent::InputLost`: it failed or went away and no other opened, or it could not open
+at all) ends the open turn with what it holds, says its code as an error, and leaves the call speaking, its input half
+gone (`listening: off`), instead of failing it; without an output half there is nothing left, and the call stops.
 
 Which microphone and speaker it uses is a `NativeDevices` handle: `NativeIo::with_devices(devices.clone())`, and the
 app keeps the other clone. `devices.list()` gives the system's inputs and outputs (`{id, label}`, the id cpal's) and
@@ -158,9 +167,10 @@ is the default). The microphone is opened only with `input`. Their failures are 
 - **A stop, or dropping the call, never waits on a model that does not answer**: after half a second behind one, the
   call closes the microphone and the speaker, drops the models and the tasks it started, and says it is idle; the next
   start loads the models again.
-- **`AudioIo`** is the microphone and the speaker: capture arrives as 16 kHz mono samples with the echo of the call's
-  own playback already cancelled, and the speaker plays the chunks of what is said in order and says when each
-  starts and ends (that is the clock of the heard position). It says when both are ready (`IoEvent::Ready`), and
+- **`AudioIo`** is the microphone and the speaker: `start(sink, input)` opens the speaker and, with `input`, the
+  microphone; `set_input` opens or closes the microphone while the speaker goes on. Capture arrives as 16 kHz mono
+  samples with the echo of the call's own playback already cancelled, and the speaker plays the chunks of what is
+  said in order and says when each starts and ends (that is the clock of the heard position). It says when both are ready (`IoEvent::Ready`), and
   only then does the call listen.
 - **Which models are the app's; when speech starts and stops is the call's.** The call times speech itself on each
   window's probability (Silero's, say), so the detector's own options only shape `speech`, which counts where a
