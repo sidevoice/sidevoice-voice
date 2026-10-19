@@ -1644,3 +1644,40 @@ fn silence_ends_a_turn_after_its_own_pause_or_the_patience_s() {
     let smart = numbers(EndOfTurn::Smart {});
     assert_eq!((smart.stop_ms, smart.end_ms, smart.ask), (900, 3_000, true));
 }
+
+#[test]
+fn a_held_output_starts_nothing_new_and_one_that_goes_ends_what_waits() {
+    let mut run = Run::new(config());
+    run.take();
+    run.input(Input::HoldOutput(true));
+    run.reply("u1", "Waits for the hold to lift.");
+    run.wait(2_000);
+    assert!(Run::synthesize(&run.take()).is_empty(), "held");
+    assert!(run.call.output_idle());
+    run.input(Input::HoldOutput(false));
+    assert_eq!(Run::synthesize(&run.take()).len(), 1, "lifted: it starts");
+    run.reply("u2", "Never said.");
+    run.input(Input::Config(Box::new(CallConfig {
+        output: None,
+        ..config()
+    })));
+    let outcomes = Run::outcomes(&run.take());
+    assert!(outcomes.contains(&(
+        "u2".into(),
+        SayOutcome::NotPlayed {
+            reason: StopReason::Failed {
+                code: "output-missing".into()
+            }
+        }
+    )));
+}
+
+#[test]
+fn an_input_change_waits_for_no_turn_to_be_open() {
+    let mut run = Run::new(config());
+    assert!(run.call.input_idle());
+    run.hear(&speech());
+    assert!(!run.call.input_idle(), "a turn is open");
+    run.hear(&silence(3_000));
+    assert!(run.call.input_idle());
+}

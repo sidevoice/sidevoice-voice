@@ -73,6 +73,14 @@ export interface VoiceSettings {
   idle_unload_minutes?: number;
 }
 
+/** A change of a running call's settings: a half that is absent stays as it is, `null` removes it, and settings
+ *  replace it (or add it). */
+export interface VoiceSettingsChange {
+  input?: VoiceInputSettings | null;
+  output?: VoiceOutputSettings | null;
+  idle_unload_minutes?: number;
+}
+
 /** What a failed call rejects with, and what `onError` hears: rely on `code`. */
 export interface VoiceHostError {
   /** `microphone-denied`, `microphone-unavailable`, `microphone-lost`, `speaker-unavailable`,
@@ -125,6 +133,19 @@ export interface VoiceCallHost {
    *  input half). Rejects `VoiceHostError`: a model that cannot load, the devices refused, `smart` without an
    *  end-of-turn classifier (`end-of-turn-missing`), or `{code: "stopped"}` when `stop()` comes first. */
   readonly ready: Promise<void>;
+  /** Changes the call while it runs, without restarting it: other models, another end of turn, another voice, a half
+   *  added or removed. A half whose model choices stay keeps what it loaded; one with other choices loads them while
+   *  the call goes on as it was. Each change takes effect at its safe point, never cutting what is playing: the input
+   *  half's at the next turn (no turn open), the output half's at the next utterance (what is being said ends in the
+   *  old voice; what is asked meanwhile waits for the new one). Adding `input` (a microphone appeared, the permission
+   *  was granted) opens the microphone then; removing it closes it. A model that cannot load is an `onError` with its
+   *  code, and that half stays as it was. Resolves once the change is accepted, not applied; malformed settings, or
+   *  none of the halves left, reject and change nothing.
+   *
+   *  A call whose microphone is lost (`microphone-lost`, `microphone-denied`, ... through `onError`) goes on with its
+   *  output half only, its state's `listening` `off`; `update({input})` adds the microphone back. A call without an
+   *  output half has nothing left then, and stops. */
+  update(change: VoiceSettingsChange): Promise<void>;
   /** Ends the call: the turn not told yet is cancelled, what is being said or waits to be ends (`stopped`), its audio
    *  lane is released, and the models it held are let go `idle_unload_minutes` later unless another call holds them.
    *  After a start that asked for a take, it resolves once the take was handed to `onTake`. A second call answers the

@@ -177,6 +177,11 @@ await owner.routeInput(voice);
 host.handed = asked.transcriber.at(-1);
 host.flags = [states.find((listening) => listening !== "idle")];
 voice.mute(false);
+// Another voice and speed, live: the output half's configuration only; the source is asked nothing again.
+const asks = asked.speaker + asked.transcriber.length + asked.vad;
+await voice.update({ output: { ...settings.output, voice: "other", speed: 1.2 } });
+await new Promise((resolve) => setTimeout(resolve, 20));
+host.voiceOnly = asked.speaker + asked.transcriber.length + asked.vad - asks;
 speaker.rendered(new Float32Array(512).fill(0.5));
 speaker.captured(new Float32Array(512));
 await until(() => playbackLevels.some((level) => level > 0));

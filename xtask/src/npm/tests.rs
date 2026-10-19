@@ -105,7 +105,7 @@ fn a_smoke_report_must_show_a_running_call() {
             "started": "resolved", "errors": [],
             "voiceTry": ["resolved", 0, 0, false, "off"],
             "states": ["idle", "muted", "listening", "idle"],
-            "handed": {"catalog": "smoke", "model": "smoke-stt"},
+            "handed": {"catalog": "smoke", "model": "smoke-stt"}, "voiceOnly": 0,
         "devices": [["mic-a"], ["Speakers B"], null, true],
         "chosen": ["mic-a", "out-b", [["input", "mic-a"], ["output", "out-b"]]],
         "deviceGone": [null, "mic-a", ["input", null], null],
@@ -155,6 +155,7 @@ fn a_smoke_report_must_show_a_running_call() {
         ("states", json!(["muted", "listening"])),
         ("handed", json!({"model": "smoke-stt", "language": "es"})),
         ("reused", json!([1, 1, 1])),
+        ("voiceOnly", json!(1)),
         ("voiceTry", json!(["resolved", 1, 1, true, "listening"])),
         (
             "deviceGone",

@@ -36,11 +36,17 @@ const call = voice.start({ input: { stt, endOfTurn: { kind: "smart" }, patience:
 call.onTurn((turn) => { /* started, then finished (the words) or cancelled */ });
 await call.ready; // the first state that is not idle; rejects { code } (a model that cannot load, the microphone, ...)
 const saying = call.say("Hecho."); // a handle: saying.cancel(), saying.onEvent(step), saying.outcome
+// Live, without a restart: what changes loads beside what runs and takes over at the half's safe point.
+await call.update({ output: { tts, voice: "ef_other" } }); // from the next utterance; nothing playing is cut
+await call.update({ input: null }); // from the next turn: the microphone closes, the call only speaks
+await call.update({ input: { stt, endOfTurn: { kind: "silence" } } }); // a microphone appeared: it listens again
 await call.stop(); // ends the call; its models stay loaded for `idle_unload_minutes` (10) unless another call holds them
 ```
 
 A call without an input half says `listening: "off"` in its state and has no barge-in; one without an output half
-answers `say` with `not-played` (`failed`, `output-missing`).
+answers `say` with `not-played` (`failed`, `output-missing`). A microphone lost during a call (`onError`:
+`microphone-lost`, `microphone-denied`, ...) leaves it speaking, its input half gone, instead of failing it;
+`update({input})` adds the microphone back.
 
 The lower level is one call on the page's models, `VoiceCall.create(setup, options)`:
 

@@ -32,6 +32,15 @@ class FakeCall {
     }, (error) => this.listener({ type: "error", data: { code: error.code } }));
   }
   stop() { this.io.stop(); this.listener({ type: "state", data: { listening: "idle" } }); }
+  // As the call does at its safe points: a half on other models loads them; the same models object loads nothing.
+  update(setup) {
+    if (setup.input && setup.input.end_of_turn?.kind === "bogus") throw new Error("unknown variant");
+    const before = this.setup;
+    (this.updates ??= []).push(setup);
+    this.setup = setup;
+    if (setup.input && setup.input.models !== before.input?.models) { setup.input.models.vad(); setup.input.models.transcriber(); }
+    if (setup.output && setup.output.models !== before.output?.models) setup.output.models.speaker();
+  }
   free() { this.freed = true; }
   cancelInput() {}
   endInput() { this.ended = (this.ended ?? 0) + 1; return Promise.resolve(); }
@@ -126,7 +135,6 @@ test("silence loads no end-of-turn model; smart loads the one it names", async (
   const silent = owner.start(both);
   await silent.ready;
   assert.equal(source.loads.turn, 0);
-  assert.equal(made.at(-1).setup.input.models.endOfTurn, undefined);
   const smart = owner.start({ ...both, input: { ...input, endOfTurn: { kind: "smart", model: { model: "smart-turn-v3" } } } });
   await smart.ready;
   assert.equal(source.loads.turn, 1);
@@ -233,4 +241,36 @@ test("endInput reaches only its own call, and resolves at once after stop", asyn
   await b.stop();
   await a.endInput();
   assert.equal(nativeA.ended, 3, "nothing reaches a stopped call");
+});
+
+test("an update keeps the models object of a half whose choices stay, so the call loads nothing again", async () => {
+  const source = counting();
+  const owner = createVoiceHost(source, { io: audio() });
+  const call = owner.start(both);
+  await call.ready;
+  const native = made.at(-1);
+  const { input: first, output: speaking } = native.setup;
+  // Another voice: the output half's configuration only; the input half is not in the change, and stays.
+  await call.update({ output: { ...output, voice: "other", speed: 1.2 } });
+  assert.equal(native.setup.output.models, speaking.models);
+  assert.equal(native.setup.input.models, first.models);
+  assert.deepEqual([native.setup.output.voice, native.setup.output.speed], ["other", 1.2]);
+  // Silence to smart on the same transcriber: the same input models; only the end-of-turn model will load.
+  await call.update({ input: { ...input, endOfTurn: { kind: "smart" } } });
+  assert.equal(native.setup.input.models, first.models);
+  assert.deepEqual(native.setup.input.end_of_turn, { kind: "smart" });
+  // The input half goes (the microphone lost, say), then comes back: the transcriber held is not loaded again.
+  await call.update({ input: null });
+  assert.equal(native.setup.input, undefined);
+  await call.update({ input });
+  assert.deepEqual(source.loads, { vad: 1, stt: 1, tts: 1, turn: 0 });
+  // Another transcriber: a new models object, loaded once.
+  await call.update({ input: { ...input, stt: { model: "other" } } });
+  assert.notEqual(native.setup.input.models, first.models);
+  assert.equal(source.loads.stt, 2);
+  await assert.rejects(call.update({ input: null, output: null }), TypeError);
+  await assert.rejects(call.update({ input: { ...input, endOfTurn: { kind: "bogus" } } }));
+  assert.deepEqual(native.setup.input.end_of_turn, { kind: "silence" }, "a refused update changes nothing");
+  await call.stop();
+  await assert.rejects(call.update({ output }), { code: "stopped" });
 });

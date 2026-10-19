@@ -30,7 +30,7 @@ const SEAM: [&str; 5] = [
     "setAudioDevices",
     "start",
 ];
-const CALL_SEAM: [&str; 13] = [
+const CALL_SEAM: [&str; 14] = [
     "cancelInput",
     "endInput",
     "id",
@@ -44,6 +44,7 @@ const CALL_SEAM: [&str; 13] = [
     "ready",
     "say",
     "stop",
+    "update",
 ];
 
 fn parse(bytes: &[u8], what: &str) -> Result<Value> {
@@ -205,7 +206,7 @@ fn check_smoke(report: &Value) -> Result<()> {
         // A voice try: ready, no detector, no transcriber, no microphone, `off`.
         "voiceTry": ["resolved", 0, 0, false, "off"],
         "states": host["states"],
-        "handed": {"catalog": "smoke", "model": "smoke-stt"},
+        "handed": {"catalog": "smoke", "model": "smoke-stt"}, "voiceOnly": 0,
         "devices": [["mic-a"], ["Speakers B"], null, true],
         "chosen": ["mic-a", "out-b", [["input", "mic-a"], ["output", "out-b"]]],
         "deviceGone": [null, "mic-a", ["input", null], null],

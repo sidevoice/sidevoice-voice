@@ -81,50 +81,82 @@ export function createVoiceHost(source, options = {}) {
     entry.users.add(id);
     return entry.model;
   }
-  // Call `id` holds nothing from now: what no other call holds is let go after `minutes` (at once with 0).
-  function releaseAll(id, minutes) {
-    for (const [key, entry] of loads) {
-      if (!entry.users.delete(id) || entry.users.size) continue;
-      clearTimeout(entry.timer);
-      const evict = () => { if (loads.get(key) === entry && !entry.users.size) loads.delete(key); };
-      if (minutes <= 0) evict();
-      else {
-        entry.timer = setTimeout(evict, minutes * 60_000);
-        entry.timer.unref?.();
-      }
+  // Call `id` holds the model filed under `key` no longer: unless another call holds it, it is let go after `minutes`
+  // (at once with 0).
+  function release(key, entry, id, minutes) {
+    if (!entry.users.delete(id) || entry.users.size) return;
+    clearTimeout(entry.timer);
+    const evict = () => { if (loads.get(key) === entry && !entry.users.size) loads.delete(key); };
+    if (minutes <= 0) evict();
+    else {
+      entry.timer = setTimeout(evict, minutes * 60_000);
+      entry.timer.unref?.();
     }
   }
+  // Call `id` holds nothing from now.
+  function releaseAll(id, minutes) {
+    for (const [key, entry] of loads) release(key, entry, id, minutes);
+  }
+  // The model choices of an input half: its transcriber (its language is no part of it) and end-of-turn model.
+  function inputChoices(input) {
+    const { language: _language, ...stt } = input.stt ?? {};
+    return { stt, turn: input.endOfTurn?.model ?? null };
+  }
+  // The keys of the models `settings` use, as `acquire` files them.
+  function keysOf(settings) {
+    const keys = [];
+    if (settings.input) {
+      const { stt, turn } = inputChoices(settings.input);
+      keys.push(`vad ${canonical(null)}`, `stt ${canonical(stt)}`);
+      if (settings.input.endOfTurn?.kind === "smart") keys.push(`end-of-turn ${canonical(turn)}`);
+    }
+    if (settings.output) keys.push(`tts ${canonical(settings.output.tts ?? {})}`);
+    return new Set(keys);
+  }
+  // Call `id` holds only what `keys` names from now.
+  function releaseUnused(id, keys, minutes) {
+    for (const [key, entry] of loads) if (!keys.has(key)) release(key, entry, id, minutes);
+  }
   // The input half as the call takes it: its models, each slot asked for when the call needs it, and its configuration.
-  function inputOf(id, input) {
-    const { language = null, ...stt } = input.stt ?? {};
-    const endOfTurn = input.endOfTurn ?? { kind: "silence" };
-    const smart = endOfTurn.kind === "smart";
-    const { kind, model: chosen = null, ...turn } = endOfTurn;
-    return {
-      models: {
+  // The same choices keep the same models object (`kept`), which the call takes for the same models: it loads nothing
+  // again for them.
+  function inputOf(id, input, kept) {
+    const { language = null } = input.stt ?? {};
+    const { stt, turn: chosen } = inputChoices(input);
+    const key = canonical([stt, chosen]);
+    if (kept.inputKey !== key) {
+      kept.inputKey = key;
+      kept.input = {
         vad: () => acquire(id, "vad", null).then((detector) => detector.createVad()),
         transcriber: () => acquire(id, "stt", stt),
-        ...(smart ? { endOfTurn: () => acquire(id, "end-of-turn", chosen) } : {}),
-      },
+        endOfTurn: () => acquire(id, "end-of-turn", chosen),
+      };
+    }
+    const { kind, model: _model, ...turn } = input.endOfTurn ?? { kind: "silence" };
+    return {
+      models: kept.input,
       language,
       end_of_turn: { kind, ...turn },
       ...(input.patience ? { patience: input.patience } : {}),
       ...(input.barge_in_min_speech != null ? { barge_in_min_speech: input.barge_in_min_speech } : {}),
     };
   }
-  function outputOf(id, output) {
+  function outputOf(id, output, kept) {
     const { voice = null, speed, language = null } = output;
-    return {
-      models: { speaker: () => acquire(id, "tts", output.tts ?? {}) },
-      voice,
-      language,
-      ...(speed != null ? { speed } : {}),
-    };
+    const tts = output.tts ?? {};
+    const key = canonical(tts);
+    if (kept.outputKey !== key) {
+      kept.outputKey = key;
+      kept.output = { speaker: () => acquire(id, "tts", tts) };
+    }
+    return { models: kept.output, voice, language, ...(speed != null ? { speed } : {}) };
   }
-  function setupOf(id, settings) {
+  function setupOf(id, settings, kept) {
+    if (!settings.input) kept.inputKey = null;
+    if (!settings.output) kept.outputKey = null;
     return {
-      ...(settings.input ? { input: inputOf(id, settings.input) } : {}),
-      ...(settings.output ? { output: outputOf(id, settings.output) } : {}),
+      ...(settings.input ? { input: inputOf(id, settings.input, kept) } : {}),
+      ...(settings.output ? { output: outputOf(id, settings.output, kept) } : {}),
       // The host keeps what a stopped call loaded (`releaseAll`); the call itself drops it as it stops.
       idle_unload_minutes: 0,
     };
@@ -134,11 +166,13 @@ export function createVoiceHost(source, options = {}) {
       throw new TypeError("voice settings with an input or an output half");
     }
     const id = `call-${++nextId}`;
-    const minutes = settings.idle_unload_minutes ?? 10;
+    let current = settings;
+    let minutes = settings.idle_unload_minutes ?? 10;
+    const kept = {};
     const { io, input: port } = audio.attach();
     let call;
     try {
-      call = WasmVoiceCall.create(io, setupOf(id, settings));
+      call = WasmVoiceCall.create(io, setupOf(id, settings, kept));
     } catch (error) {
       io.dispose?.();
       throw error;
@@ -182,6 +216,23 @@ export function createVoiceHost(source, options = {}) {
           calls.delete(id);
         });
         return stopping;
+      },
+      async update(change = {}) {
+        if (stopped) throw fail("stopped");
+        const next = { ...current };
+        for (const half of ["input", "output"]) if (half in change) next[half] = change[half] ?? null;
+        if ("idle_unload_minutes" in change) next.idle_unload_minutes = change.idle_unload_minutes;
+        if (!next.input && !next.output) throw new TypeError("voice settings with an input or an output half");
+        const before = { ...kept };
+        try {
+          call.update(setupOf(id, next, kept));
+        } catch (error) {
+          Object.assign(kept, before);
+          throw error;
+        }
+        current = next;
+        minutes = next.idle_unload_minutes ?? 10;
+        releaseUnused(id, keysOf(next), minutes);
       },
       say(text, options = {}) { return stopped ? notPlayed() : call.say(String(text), options); },
       mute(value) { if (!stopped) call.mute(!!value); },
