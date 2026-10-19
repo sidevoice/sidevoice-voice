@@ -304,6 +304,14 @@ fn speech() -> Vec<f32> {
     clip(QUILTER, 0.9)
 }
 
+/// Speech at −46.5 LUFS: over the bar in silence and the detector's probable level, under the one a reply raises.
+fn faint_speech(windows: usize) -> Vec<f32> {
+    continuous_loud_speech(windows)
+        .iter()
+        .map(|sample| sample * 0.022)
+        .collect()
+}
+
 fn continuous_loud_speech(windows: usize) -> Vec<f32> {
     (0..windows * WINDOW)
         .map(|sample| {
@@ -646,7 +654,7 @@ fn mute_and_playback_restart_reset_only_a_tentative_overlap_without_capture() {
             });
         }
         run.take();
-        run.hear(&continuous_loud_speech(31));
+        run.hear(&continuous_loud_speech(18));
         assert!(Run::turns(&run.take()).is_empty());
         if mute {
             run.input(Input::Mute(true));
@@ -663,7 +671,7 @@ fn mute_and_playback_restart_reset_only_a_tentative_overlap_without_capture() {
             Run::turns(&run.take()).is_empty(),
             "old candidate survived boundary"
         );
-        run.hear(&continuous_loud_speech(31));
+        run.hear(&continuous_loud_speech(18));
         assert_eq!(Run::turns(&run.take())[0].phase, TurnPhase::Started);
         run.hear(&silence(3_000));
         let effects = run.take();
@@ -672,7 +680,7 @@ fn mute_and_playback_restart_reset_only_a_tentative_overlap_without_capture() {
         let marks = run.call.take_marks();
         assert_eq!(marks.len(), 1);
         assert!(
-            marks[0].speech_ms >= (32 + 31) * WINDOW_MS,
+            marks[0].speech_ms >= (32 + 18) * WINDOW_MS,
             "old candidate moved the take mark"
         );
     }
@@ -696,7 +704,7 @@ fn continuous_sentence_chunks_preserve_overlap_but_a_real_output_end_resets_it()
                 probability: Some(0.02),
             });
         }
-        run.hear(&continuous_loud_speech(20));
+        run.hear(&continuous_loud_speech(12));
         assert!(Run::turns(&run.take()).is_empty());
         run.played("u", 0);
         if output_ended {
@@ -723,9 +731,9 @@ fn the_listening_bar_rises_while_a_reply_plays() {
     );
     run.sound("u1", 0);
     run.take();
-    // Speech at −36 dBFS, as the echo canceller leaves a voice from across the room: under −30 LUFS, not loud enough to
-    // barge in.
-    run.hear(&clip(QUILTER, 0.1));
+    // Speech at −46.5 LUFS, as the echo canceller leaves a voice from across the room: under the −45 LUFS bar a reply raises, not
+    // loud enough to barge in.
+    run.hear(&faint_speech(96));
     let effects = run.take();
     assert!(Run::turns(&effects).is_empty());
     assert!(!effects.contains(&Effect::StopPlayback));
@@ -734,7 +742,7 @@ fn the_listening_bar_rises_while_a_reply_plays() {
     run.played("u1", 0);
     run.take();
     run.hear(&silence(1_000));
-    run.hear(&clip(QUILTER, 0.1));
+    run.hear(&faint_speech(96));
     assert_eq!(Run::turns(&run.take())[0].phase, TurnPhase::Started);
 }
 
@@ -758,7 +766,7 @@ fn short_overlap_is_discarded_without_turn_transcription_or_playback_cut() {
         });
     }
     run.take();
-    for window in continuous_loud_speech(31).chunks(WINDOW) {
+    for window in continuous_loud_speech(18).chunks(WINDOW) {
         run.now += WINDOW_MS;
         run.input(Input::Window {
             pcm: window.to_vec(),

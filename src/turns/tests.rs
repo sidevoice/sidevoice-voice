@@ -1,6 +1,8 @@
 //! Segmentation on synthetic windows: a 1 kHz tone at a chosen amplitude (whose loudness BS.1770 knows: 20·log10(a)
 //! − 3 LUFS), silence, and the detector's confidence for each, 32 ms apart.
 
+use crate::test_support::{clip, EnergyVad, FLEURS_ES, QUILTER};
+
 use super::{
     instant, loudness, Segment, Segmentation, Segmenter, AUDIO_IDLE_MS, MAX_TURN, PRE_ROLL,
     PRE_SPEECH,
@@ -18,8 +20,8 @@ const SMART: Segmentation = Segmentation {
     end_ms: 3_000,
     ask: true,
     quiet_bar: 0.5,
-    playing_bar: 0.7,
-    barge_in_min_ms: 1_000,
+    playing_bar: 0.65,
+    barge_in_min_ms: 600,
 };
 
 /// `silence` at normal patience: speech stops after 0.2 s, a pause ends the turn 2.5 s after that.
@@ -34,6 +36,8 @@ const SILENCE: Segmentation = Segmentation {
 const LOUD: f32 = 0.1;
 /// Soft speech: −43 LUFS (a volume of 0.67), its RMS at −43 dBFS.
 const SOFT: f32 = 0.01;
+/// Faint speech: −49 LUFS (a volume of 0.61), under the bar while a reply plays but over the one in silence.
+const FAINT: f32 = 0.005;
 /// A murmur under the bar: −69 LUFS, a volume of 0.41.
 const MURMUR: f32 = 0.000_5;
 
@@ -206,13 +210,13 @@ fn with_silence_a_pause_ends_the_turn_2_5_s_after_speech_stopped_and_asks_nothin
 #[test]
 fn the_bar_rises_while_a_reply_plays() {
     let mut segmenter = Segmenter::new(SMART);
-    let mut windows = times(Heard(tone(SOFT), 0.02), 32);
-    windows.extend(times(speech(SOFT), 40));
+    let mut windows = times(Heard(tone(FAINT), 0.02), 32);
+    windows.extend(times(speech(FAINT), 40));
     assert!(
         hear(&mut segmenter, &windows, true).is_empty(),
         "soft speech over a reply"
     );
-    let segments = hear(&mut segmenter, &times(speech(SOFT), 12), false);
+    let segments = hear(&mut segmenter, &times(speech(FAINT), 12), false);
     assert!(
         matches!(segments[..], [(11, Segment::Started)]),
         "{segments:?}"
@@ -223,46 +227,102 @@ fn the_bar_rises_while_a_reply_plays() {
     windows.extend(times(speech(LOUD), 32));
     let segments = hear(&mut segmenter, &windows, true);
     assert!(
-        matches!(segments[..], [(63, Segment::Started)]),
+        matches!(segments[..], [(50, Segment::Started)]),
         "{segments:?}"
     );
 }
 
+/// The windows of a person who speaks in bursts over a reply: `speech` windows of speech at `amplitude`, then
+/// `gap` of silence, `count` times.
+fn bursts(amplitude: f32, speech_windows: usize, gap: usize, count: usize) -> Vec<Heard> {
+    let mut windows = Vec::new();
+    for _ in 0..count {
+        windows.extend(times(speech(amplitude), speech_windows));
+        windows.extend(times(silence(), gap));
+    }
+    windows
+}
+
+/// A segmenter that has heard a second of room tone at a normal level, with a reply sounding.
+fn playing(numbers: Segmentation) -> Segmenter {
+    let mut segmenter = Segmenter::new(numbers);
+    assert!(hear(&mut segmenter, &times(Heard(tone(LOUD), 0.02), 32), true).is_empty());
+    segmenter
+}
+
 #[test]
-fn overlap_needs_the_first_full_threshold_window_and_discards_short_preroll() {
-    let mut segmenter = Segmenter::new(SMART);
-    hear(&mut segmenter, &times(Heard(tone(LOUD), 0.02), 32), true);
-    assert!(hear(&mut segmenter, &times(speech(LOUD), 31), true).is_empty());
-    assert_eq!(segmenter.start_run(), 0);
-    assert!(hear(&mut segmenter, &times(silence(), 1), true).is_empty());
-    assert!(hear(&mut segmenter, &times(speech(LOUD), 31), true).is_empty());
+fn speech_over_a_reply_interrupts_after_the_minimum_of_it() {
+    // 0.6 s is 18.75 windows of 32 ms.
+    let mut segmenter = playing(SMART);
+    assert!(hear(&mut segmenter, &times(speech(LOUD), 18), true).is_empty());
     let started = hear(&mut segmenter, &times(speech(LOUD), 1), true);
     assert!(
         matches!(started[..], [(0, Segment::Started)]),
         "{started:?}"
     );
-    assert_eq!(segmenter.start_run(), 32 * WINDOW);
+    assert_eq!(segmenter.start_run(), 19 * WINDOW);
+}
+
+#[test]
+fn bursts_with_pauses_over_a_reply_add_up_to_an_interruption() {
+    // "vale, para… espera… para": 450 ms of speech, 250 ms of pause. Each burst is short of the minimum.
+    let mut segmenter = playing(SMART);
+    let started = hear(&mut segmenter, &bursts(LOUD, 14, 8, 3), true);
+    let [(at, Segment::Started)] = started[..] else {
+        panic!("{started:?}")
+    };
+    assert_eq!(at, 14 + 8 + 4, "the second burst completes the 19 windows");
+    // The turn keeps the first burst and the pause: it opens at the first speech heard.
+    assert_eq!(segmenter.start_run(), (14 + 8 + 4 + 1) * WINDOW);
+}
+
+#[test]
+fn short_bursts_with_longer_pauses_do_not_add_up() {
+    // Each burst falls out of the 1.5 s window before the next one is heard.
+    let mut segmenter = playing(SMART);
+    assert!(hear(&mut segmenter, &bursts(LOUD, 8, 50, 6), true).is_empty());
+}
+
+#[test]
+fn a_backchannel_over_a_reply_does_not_interrupt() {
+    let mut segmenter = playing(SMART);
+    assert!(hear(&mut segmenter, &times(speech(LOUD), 12), true).is_empty());
+    assert!(hear(&mut segmenter, &times(silence(), 60), true).is_empty());
+    assert!(hear(&mut segmenter, &bursts(LOUD, 5, 25, 6), true).is_empty());
+}
+
+#[test]
+fn the_audio_before_a_failed_overlap_never_reaches_a_turn() {
+    let mut segmenter = playing(SMART);
+    assert!(hear(&mut segmenter, &times(speech(LOUD), 10), true).is_empty());
+    assert!(hear(&mut segmenter, &times(silence(), 50), true).is_empty());
+    assert!(
+        segmenter.recent.is_empty(),
+        "audio older than the window is forgotten"
+    );
+    // The volume climbs again from the pause, so speech qualifies a few windows after it starts.
+    let started = hear(&mut segmenter, &times(speech(LOUD), 40), true);
+    let [(at, Segment::Started)] = started[..] else {
+        panic!("{started:?}")
+    };
+    assert!(at >= 18, "{started:?}");
+    // Exactly the qualified windows: the ones the volume had not yet raised, and the old overlap, are left out.
+    assert_eq!(segmenter.start_run(), 19 * WINDOW);
     let Some(Segment::Ended(ended)) = segmenter.poll(AUDIO_IDLE_MS) else {
         panic!("turn")
     };
     assert_eq!(
         ended.pcm.len(),
-        32 * WINDOW,
-        "short overlap leaked into pre-roll"
+        (19 + 40 - (at + 1)) * WINDOW,
+        "the earlier overlap leaked"
     );
 }
 
 #[test]
-fn overlap_resets_on_low_volume_and_when_output_stops() {
-    let mut segmenter = Segmenter::new(SMART);
-    hear(&mut segmenter, &times(Heard(tone(LOUD), 0.02), 32), true);
-    assert!(hear(&mut segmenter, &times(speech(LOUD), 20), true).is_empty());
-    assert!(hear(&mut segmenter, &times(Heard(tone(LOUD), 0.02), 1), true).is_empty());
-    assert!(hear(&mut segmenter, &times(speech(LOUD), 31), true).is_empty());
+fn overlap_is_forgotten_when_output_stops() {
     // A candidate heard while output sounded cannot finish under the ordinary 400 ms bar.
-    let mut segmenter = Segmenter::new(SMART);
-    hear(&mut segmenter, &times(Heard(tone(LOUD), 0.02), 32), true);
-    assert!(hear(&mut segmenter, &times(speech(LOUD), 20), true).is_empty());
+    let mut segmenter = playing(SMART);
+    assert!(hear(&mut segmenter, &times(speech(LOUD), 18), true).is_empty());
     assert!(hear(&mut segmenter, &times(speech(LOUD), 11), false).is_empty());
     assert!(matches!(
         hear(&mut segmenter, &times(speech(LOUD), 1), false)[..],
@@ -271,29 +331,19 @@ fn overlap_resets_on_low_volume_and_when_output_stops() {
 }
 
 #[test]
-fn below_volume_windows_reset_an_overlap_candidate() {
+fn speech_under_the_raised_bar_adds_nothing() {
     let mut segmenter = Segmenter::new(SMART);
-    hear(&mut segmenter, &times(Heard(tone(LOUD), 0.02), 32), true);
-    assert!(hear(&mut segmenter, &times(speech(LOUD), 10), true).is_empty());
-    // Confidence remains high: the level alone falls below the raised bar.
-    assert!(hear(&mut segmenter, &times(speech(MURMUR), 25), true).is_empty());
-    assert_eq!(
-        segmenter.barge_run, 0,
-        "the raised volume bar reset the candidate"
-    );
-    assert!(
-        segmenter.recent.is_empty(),
-        "failed overlap must not enter pre-roll"
-    );
-    assert!(hear(&mut segmenter, &times(speech(LOUD), 1), true).is_empty());
-    assert!(hear(&mut segmenter, &times(speech(LOUD), 64), true)
-        .iter()
-        .any(|(_, event)| event == &Segment::Started));
+    hear(&mut segmenter, &times(Heard(tone(MURMUR), 0.02), 32), true);
+    // Confidence is high: the volume alone falls below the raised bar.
+    assert!(hear(&mut segmenter, &times(speech(MURMUR), 100), true).is_empty());
+    assert_eq!(segmenter.overlap.speech(), 0);
+    assert!(segmenter.recent.is_empty());
 }
 
 #[test]
-fn raised_bar_rejects_speech_just_below_point_seven_and_accepts_above_it() {
-    for (amplitude, accepted) in [(0.013_8, false), (0.014_5, true)] {
+fn the_raised_bar_rejects_speech_just_below_point_six_five_and_accepts_above_it() {
+    // A volume of 0.65 is −45 LUFS: a tone of amplitude 0.0079.
+    for (amplitude, accepted) in [(0.007_5, false), (0.008_4, true)] {
         let mut segmenter = Segmenter::new(SMART);
         hear(
             &mut segmenter,
@@ -304,26 +354,97 @@ fn raised_bar_rejects_speech_just_below_point_seven_and_accepts_above_it() {
         assert_eq!(
             events.iter().any(|(_, event)| event == &Segment::Started),
             accepted,
-            "volume {} at the 0.7 bar: {events:?}",
-            amplitude
+            "volume {amplitude} at the 0.65 bar: {events:?}"
         );
     }
 }
 
 #[test]
-fn attenuated_normal_speech_interrupts_but_echo_and_backchannels_do_not() {
-    // The same normal voice after a 14 dB double-talk loss is about −37 LUFS. The
-    // detector still recognizes it, but the old −30 LUFS floor discarded it.
-    let voice = 0.02;
-    let mut segmenter = Segmenter::new(SMART);
-    assert!(hear(&mut segmenter, &times(Heard(tone(LOUD), 0.02), 64), true).is_empty());
-    assert!(hear(&mut segmenter, &times(speech(voice), 12), true).is_empty());
-    assert!(hear(&mut segmenter, &times(Heard(tone(LOUD), 0.02), 1), true).is_empty());
-    assert!(hear(&mut segmenter, &times(speech(voice), 31), true).is_empty());
-    assert!(matches!(
-        hear(&mut segmenter, &times(speech(voice), 1), true)[..],
-        [(0, Segment::Started)]
-    ));
+fn the_minimum_and_its_window_follow_the_configuration() {
+    let mut segmenter = playing(Segmentation {
+        barge_in_min_ms: 1_250,
+        ..SMART
+    });
+    // 40 windows of speech are needed within 3.125 s (97 windows): 20 and a pause of 20 fall short of them.
+    assert!(hear(&mut segmenter, &bursts(LOUD, 20, 20, 1), true).is_empty());
+    let started = hear(&mut segmenter, &times(speech(LOUD), 30), true);
+    let [(at, Segment::Started)] = started[..] else {
+        panic!("{started:?}")
+    };
+    assert!((19..30).contains(&at), "{started:?}");
+    assert_eq!(segmenter.start_run(), (40 + at + 1) * WINDOW);
+}
+
+/// Speech from the recorded clips over a reply, after a second of room tone: the milliseconds from the first sample of
+/// `audio` to the interruption, if it comes.
+fn interrupted_at(
+    numbers: Segmentation,
+    audio: &[f32],
+    confidence: impl Fn(&[f32]) -> f32,
+) -> Option<usize> {
+    let mut segmenter = playing(numbers);
+    audio
+        .as_chunks::<WINDOW>()
+        .0
+        .iter()
+        .enumerate()
+        .find_map(|(at, pcm)| {
+            matches!(
+                segmenter.window(0, pcm, confidence(pcm), true),
+                Some(Segment::Started)
+            )
+            .then_some((at + 1) * WINDOW / 16)
+        })
+}
+
+/// The recorded Spanish clip as a person speaking it in bursts of `burst_ms` with `gap_ms` between them.
+fn spoken_in_bursts(peak: f32, burst_ms: usize, gap_ms: usize) -> Vec<f32> {
+    let voice = clip(FLEURS_ES, peak);
+    let mut audio = Vec::new();
+    // The clip starts with a second of near silence.
+    let mut from = 16_000;
+    for _ in 0..6 {
+        audio.extend_from_slice(&voice[from..from + burst_ms * 16]);
+        audio.extend(silence_ms(gap_ms));
+        from += burst_ms * 16 + 300 * 16;
+    }
+    audio
+}
+
+fn silence_ms(ms: usize) -> Vec<f32> {
+    vec![0.0; ms * 16]
+}
+
+#[test]
+fn recorded_speech_in_bursts_interrupts_a_reply() {
+    // Real speech dips below the bar between words, so even unbroken talking is a series of bursts.
+    for (peak, burst, gap) in [(0.3, 450, 250), (0.2, 350, 300), (0.15, 450, 250)] {
+        let audio = spoken_in_bursts(peak, burst, gap);
+        let at = interrupted_at(SMART, &audio, EnergyVad::probability);
+        assert!(
+            at.is_some_and(|ms| ms <= 2_000),
+            "peak {peak}, bursts {burst}/{gap}: {at:?}"
+        );
+    }
+    let talking = clip(FLEURS_ES, 0.3);
+    assert!(interrupted_at(SMART, &talking, EnergyVad::probability).is_some_and(|ms| ms <= 2_000));
+}
+
+#[test]
+fn recorded_echo_of_the_reply_does_not_interrupt_it() {
+    // The reply as the canceller leaves it: far below the person's voice. The detector is fooled into calling it
+    // speech, so only the raised bar stands in the way.
+    for peak in [0.02, 0.03] {
+        let echo = clip(QUILTER, peak);
+        assert_eq!(
+            interrupted_at(SMART, &echo, EnergyVad::probability),
+            None,
+            "echo at a peak of {peak}"
+        );
+    }
+    // A detector that does not take it for speech stops it however loud it is.
+    let loud = clip(QUILTER, 0.3);
+    assert_eq!(interrupted_at(SMART, &loud, |_| 0.05), None);
 }
 
 #[test]
@@ -334,21 +455,6 @@ fn a_lone_short_word_in_silence_uses_the_normal_start_detector() {
         hear(&mut segmenter, &times(speech(LOUD), 12), false)[..],
         [(11, Segment::Started)]
     ));
-}
-
-#[test]
-fn configured_overlap_duration_counts_capture_samples() {
-    let mut segmenter = Segmenter::new(Segmentation {
-        barge_in_min_ms: 1_250,
-        ..SMART
-    });
-    hear(&mut segmenter, &times(Heard(tone(LOUD), 0.02), 32), true);
-    assert!(hear(&mut segmenter, &times(speech(LOUD), 39), true).is_empty());
-    assert!(matches!(
-        hear(&mut segmenter, &times(speech(LOUD), 1), true)[..],
-        [(0, Segment::Started)]
-    ));
-    assert_eq!(segmenter.start_run(), 40 * WINDOW);
 }
 
 #[test]

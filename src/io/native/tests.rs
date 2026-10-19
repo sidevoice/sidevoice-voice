@@ -241,8 +241,8 @@ fn rendered_boundaries_precede_qualifying_capture_even_when_the_driver_is_delaye
                     captured * 32,
                     Input::Window {
                         pcm,
-                        speech: captured > 32,
-                        probability: Some(if captured > 32 { 0.9 } else { 0.02 }),
+                        speech: captured > 45,
+                        probability: Some(if captured > 45 { 0.9 } else { 0.02 }),
                     },
                 ));
             }

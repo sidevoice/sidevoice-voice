@@ -4,7 +4,8 @@
 //!
 //! - A window is speech when the detector's confidence is at least [`CONFIDENCE`] and the volume (`volume`) clears the
 //!   listening bar, raised while a reply sounds. In silence speech starts after [`START_MS`] of such windows; over
-//!   sounding audio it starts only after the configured continuous capture duration. It stops after the
+//!   sounding audio it starts only once the configured minimum of such windows has been heard within a sliding window two and
+//!   a half times as long (`overlap`), wherever they fall in it, so bursts with pauses add up. It stops after the
 //!   segmentation's `stop_ms` without one (`activity`).
 //! - A turn opens where speech starts, with the second of audio before it (the pre-roll).
 //! - Where speech stops inside a turn, a pause begins. With `smart-turn` the turn's audio so far is offered to an
@@ -15,6 +16,7 @@
 //!   audio: what comes after is not kept.
 
 mod activity;
+mod overlap;
 mod volume;
 
 #[cfg(test)]
@@ -26,6 +28,7 @@ use std::collections::VecDeque;
 pub(crate) use crate::level::instant;
 use crate::level::Level;
 use activity::{Activity, Change};
+use overlap::Overlap;
 #[cfg(test)]
 pub(crate) use volume::loudness;
 use volume::Volume;
@@ -118,8 +121,8 @@ pub(crate) struct Segmenter {
     start_run: usize,
     /// Whether the preceding window was gated by audible playback.
     was_playing: bool,
-    /// Qualified capture samples in the current overlap candidate.
-    barge_run: usize,
+    /// The speech heard over playback while no turn is open, in a sliding window.
+    overlap: Overlap,
     /// The last audio heard, as much as an end-of-turn model is given: since the last turn ended, at most.
     recent: VecDeque<f32>,
     open: Option<Open>,
@@ -134,7 +137,7 @@ impl Segmenter {
             activity: Activity::default(),
             start_run: 0,
             was_playing: false,
-            barge_run: 0,
+            overlap: Overlap::default(),
             recent: VecDeque::with_capacity(END_OF_TURN_AUDIO),
             open: None,
         }
@@ -183,7 +186,7 @@ impl Segmenter {
         if self.was_playing != playing && self.open.is_none() {
             self.activity.reset();
             self.recent.clear();
-            self.barge_run = 0;
+            self.overlap.clear();
         }
         self.was_playing = playing;
         self.level.take(pcm);
@@ -195,13 +198,11 @@ impl Segmenter {
         };
         let speech = confidence >= CONFIDENCE && volume >= bar;
         let gated = playing && self.open.is_none();
+        let min_speech = self.numbers.barge_in_min_ms as usize * PER_MS as usize;
         let change = if gated {
-            self.barge_run = if speech {
-                self.barge_run.saturating_add(pcm.len())
-            } else {
-                0
-            };
-            if self.barge_run >= self.numbers.barge_in_min_ms as usize * PER_MS as usize {
+            self.overlap
+                .take(pcm.len(), speech, overlap::window(min_speech));
+            if speech && self.overlap.speech() >= min_speech {
                 // The duration is counted from capture samples. Only now does VAD open a turn.
                 self.activity.take(true, pcm.len(), 0, self.numbers.stop_ms)
             } else {
@@ -209,32 +210,29 @@ impl Segmenter {
                 None
             }
         } else {
-            self.barge_run = 0;
+            self.overlap.clear();
             self.activity
                 .take(speech, pcm.len(), START_MS, self.numbers.stop_ms)
         };
         if change == Some(Change::Started) {
             self.start_run = if gated {
-                self.barge_run
+                self.overlap.total()
             } else {
                 activity::windows(START_MS, pcm.len()).max(1) as usize * pcm.len()
             };
         }
-        // Only the qualified run is eligible for pre-roll while playback sounds. Failed overlap has no path to
-        // recognition or take marks; the microphone level still reports normally.
-        if gated && !speech {
-            self.recent.clear();
+        // Only the audio from the first qualified window of the sliding window is eligible for pre-roll while playback
+        // sounds. Overlap that never qualifies has no path to recognition or take marks; the microphone level still
+        // reports normally.
+        if gated {
+            self.recent.extend(pcm);
+            let excess = self.recent.len().saturating_sub(self.overlap.total());
+            self.recent.drain(..excess);
         } else {
             self.recent.extend(pcm);
+            let excess = self.recent.len().saturating_sub(END_OF_TURN_AUDIO);
+            self.recent.drain(..excess);
         }
-        let limit = if gated {
-            END_OF_TURN_AUDIO
-                .max(self.numbers.barge_in_min_ms as usize * PER_MS as usize + pcm.len())
-        } else {
-            END_OF_TURN_AUDIO
-        };
-        let excess = self.recent.len().saturating_sub(limit);
-        self.recent.drain(..excess);
         let Some(open) = &mut self.open else {
             if change != Some(Change::Started) {
                 return None;
@@ -329,7 +327,7 @@ impl Segmenter {
         self.recent.clear();
         self.activity.reset();
         self.was_playing = false;
-        self.barge_run = 0;
+        self.overlap.clear();
     }
 
     /// Forget a tentative speech run when the input or output changes without a detector window.
@@ -338,7 +336,7 @@ impl Segmenter {
         if self.open.is_none() {
             self.activity.reset();
             self.recent.clear();
-            self.barge_run = 0;
+            self.overlap.clear();
             self.was_playing = false;
             self.start_run = 0;
         }
