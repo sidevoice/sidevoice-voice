@@ -110,6 +110,7 @@ fn a_smoke_report_must_show_a_running_call() {
         "chosen": ["mic-a", "out-b", [["input", "mic-a"], ["output", "out-b"]]],
         "deviceGone": [null, "mic-a", ["input", null], null],
             "take": [[16_000, "Float32Array", 1_760, 110, 0]],
+            "preloaded": [[1, 1, 1], [0, 0, 0]],
             "seam": SEAM,
             "callSeam": CALL_SEAM,
             "playbackLevels": [true, 0, true],
@@ -162,6 +163,9 @@ fn a_smoke_report_must_show_a_running_call() {
             json!(["mic-a", null, ["input", "mic-a"], null]),
         ),
         ("seam", json!(["start"])),
+        // A preload that loaded nothing, or a call after it that loaded again.
+        ("preloaded", json!([[0, 0, 0], [0, 0, 0]])),
+        ("preloaded", json!([[1, 1, 1], [1, 1, 1]])),
         ("reloaded", json!(0)),
         ("flags", json!(["listening"])),
         ("said", json!(["function", "not-played"])),

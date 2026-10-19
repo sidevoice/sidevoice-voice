@@ -236,6 +236,13 @@ await Promise.all([trying.stop(), listening.stop(), first.stop(), second.stop()]
 A call's state says `listening: "off"` without an input half; `say` without an output half is `not-played`
 (`failed`, `output-missing`).
 
+`host.preload(settings)` loads the models a call of `settings` would use, ahead of it: the same slots (an absent half loads
+none of its own, `silence` no end-of-turn model), once for a choice already loaded or loading, with no microphone or
+speaker opened. The pool holds them like a stopped call's: a call that starts with the same choices takes them without
+loading, and they are let go `idle_unload_minutes` (10 by default, the settings' own) after the last holder, counted from
+the end of the load. It resolves once every slot is loaded and rejects `{code}` for one that cannot load, keeping what
+loaded.
+
 `createSharedWebAudioIo(options)` is the browser's shared audio factory. `attach()` returns `{io, input}`;
 `routeInput(input | null)` acknowledges a next-frame switch. One `getUserMedia` track and `AudioContext` serve
 all lanes, the track open only while a started lane asks for the microphone; each lane has its own playback gain and telemetry processor, mixed at the context destination for the

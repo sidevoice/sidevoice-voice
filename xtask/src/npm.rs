@@ -23,9 +23,10 @@ const SMOKE_JS: &str = include_str!("../npm/smoke.mjs");
 /// The slots the smoke test's models fill, recorded each time the call loads one: a call with both halves.
 const SMOKE_SLOTS: [&str; 3] = ["vad", "transcriber", "speaker"];
 /// The calls of the voice seam, `VoiceHost` (js/voice-host.d.ts), sorted.
-const SEAM: [&str; 5] = [
+const SEAM: [&str; 6] = [
     "audioDevices",
     "onAudioDevices",
+    "preload",
     "routeInput",
     "setAudioDevices",
     "start",
@@ -213,6 +214,8 @@ fn check_smoke(report: &Value) -> Result<()> {
         // A start with a take: what the microphone gave (the io's first frame and the one sent after), as a
         // Float32Array, handed over before the stop resolved; no turn in it.
         "take": [[16_000, "Float32Array", 1_760, 110, 0]],
+        // A preload loads each slot once; the call after it loads none.
+        "preloaded": [[1, 1, 1], [0, 0, 0]],
         "seam": SEAM,
         "callSeam": CALL_SEAM,
         "playbackLevels": [true, 0, true],

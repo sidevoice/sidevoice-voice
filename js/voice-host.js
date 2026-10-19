@@ -1,7 +1,8 @@
 // The voice seam: `createVoiceHost(source, options)`, an owner of the shared microphone and speaker and of the models its
 // calls load, slot by slot. `host.start(settings)` starts a call with the halves the settings have, and loads only what
 // they use. A model one call loaded is reused by every other that asks for the same choice while any holds it, and
-// let go `idle_unload_minutes` after the last one stopped. Call ids are local and opaque.
+// let go `idle_unload_minutes` after the last one stopped. `host.preload(settings)` loads the same models ahead of a
+// call, held the same way. Call ids are local and opaque.
 import { VoiceCall as WasmVoiceCall } from "../dist/sidevoice_voice.js";
 import { createSharedWebAudioIo } from "./shared-web-audio-io.js";
 
@@ -64,8 +65,9 @@ export function createVoiceHost(source, options = {}) {
   }
   // The model of `slot` for `choice`, held by call `id` from now: the one loaded, or loaded now. A rejected load is
   // forgotten, so the next ask loads again.
+  const keyOf = (slot, choice) => `${slot} ${canonical(choice)}`;
   function acquire(id, slot, choice) {
-    const key = `${slot} ${canonical(choice)}`;
+    const key = keyOf(slot, choice);
     let entry = loads.get(key);
     if (!entry) {
       entry = { users: new Set(), timer: null, model: null };
@@ -102,17 +104,18 @@ export function createVoiceHost(source, options = {}) {
     const { language: _language, ...stt } = input.stt ?? {};
     return { stt, turn: input.endOfTurn?.model ?? null };
   }
-  // The keys of the models `settings` use, as `acquire` files them.
-  function keysOf(settings) {
-    const keys = [];
+  // The models `settings` use, each as the slot and choice `acquire` files it under.
+  function slotsOf(settings) {
+    const slots = [];
     if (settings.input) {
       const { stt, turn } = inputChoices(settings.input);
-      keys.push(`vad ${canonical(null)}`, `stt ${canonical(stt)}`);
-      if (settings.input.endOfTurn?.kind === "smart") keys.push(`end-of-turn ${canonical(turn)}`);
+      slots.push(["vad", null], ["stt", stt]);
+      if (settings.input.endOfTurn?.kind === "smart") slots.push(["end-of-turn", turn]);
     }
-    if (settings.output) keys.push(`tts ${canonical(settings.output.tts ?? {})}`);
-    return new Set(keys);
+    if (settings.output) slots.push(["tts", settings.output.tts ?? {}]);
+    return slots;
   }
+  const keysOf = (settings) => new Set(slotsOf(settings).map(([slot, choice]) => keyOf(slot, choice)));
   // Call `id` holds only what `keys` names from now.
   function releaseUnused(id, keys, minutes) {
     for (const [key, entry] of loads) if (!keys.has(key)) release(key, entry, id, minutes);
@@ -161,10 +164,24 @@ export function createVoiceHost(source, options = {}) {
       idle_unload_minutes: 0,
     };
   }
-  function start(settings, options = {}) {
+  function requireHalf(settings) {
     if (!settings || typeof settings !== "object" || (!settings.input && !settings.output)) {
       throw new TypeError("voice settings with an input or an output half");
     }
+  }
+  // Loads the models `settings` use, as a start of them would, and holds them as a stopped call does: let go
+  // `idle_unload_minutes` after the last holder, counted from the end of the load. A call that starts meanwhile shares
+  // the load.
+  async function preload(settings) {
+    requireHalf(settings);
+    const id = `preload-${++nextId}`;
+    const settled = await Promise.allSettled(slotsOf(settings).map(([slot, choice]) => acquire(id, slot, choice)));
+    releaseAll(id, settings.idle_unload_minutes ?? 10);
+    const refused = settled.find(({ status }) => status === "rejected");
+    if (refused) throw refused.reason;
+  }
+  function start(settings, options = {}) {
+    requireHalf(settings);
     const id = `call-${++nextId}`;
     let current = settings;
     let minutes = settings.idle_unload_minutes ?? 10;
@@ -247,6 +264,7 @@ export function createVoiceHost(source, options = {}) {
   }
   return Object.freeze({
     start,
+    preload,
     routeInput(target) {
       if (target !== null && ![...calls.values()].some(({ hostCall }) => hostCall === target)) return Promise.reject(new TypeError("a call from this host"));
       return audio.routeInput(target === null ? null : calls.get(target.id).port);

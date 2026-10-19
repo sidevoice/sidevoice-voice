@@ -248,6 +248,15 @@ const { endOfTurn: _none, ...withoutTurns } = source;
 const refusing = createVoiceHost(withoutTurns, { io: sharedIo }).start({ ...settings, input: { ...settings.input, endOfTurn: { kind: "smart" } } });
 host.smartMissing = await code(refusing.ready);
 await refusing.stop();
+// A preload loads what the halves use before any call, once; the call that follows takes it and loads nothing.
+const slotLoads = () => [asked.vad, asked.transcriber.length, asked.speaker];
+const beforePreload = slotLoads();
+await owner.preload({ ...settings, idle_unload_minutes: 10 });
+const afterPreload = slotLoads();
+const warm = owner.start(settings);
+await warm.ready;
+host.preloaded = [afterPreload.map((count, slot) => count - beforePreload[slot]), slotLoads().map((count, slot) => count - afterPreload[slot])];
+await warm.stop();
 host.states = states;
 host.errors = hostErrors;
 host.seam = Object.keys(owner).sort();
