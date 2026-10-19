@@ -48,7 +48,8 @@ pub struct InputConfig {
     /// How loud speech must be to count.
     #[serde(default)]
     pub listening_bar: ListeningBar,
-    /// Continuous qualified speech required to interrupt sounding audio, in seconds.
+    /// How much qualified speech interrupts sounding audio, in seconds, counted wherever it falls in the last two and a
+    /// half times as long: 0.6 s by default, so bursts with pauses between them add up.
     #[serde(default)]
     pub barge_in_min_speech: BargeInMinSpeech,
 }
@@ -199,7 +200,7 @@ impl Patience {
 pub struct ListeningBar {
     /// The bar while nothing plays: −60 LUFS by default.
     pub quiet: f32,
-    /// The bar while something plays, when it is higher: what a barge-in must clear, −40 LUFS by default.
+    /// The bar while something plays, when it is higher: what a barge-in must clear, −45 LUFS by default.
     pub playing: f32,
 }
 
@@ -207,7 +208,7 @@ impl Default for ListeningBar {
     fn default() -> Self {
         Self {
             quiet: 0.5,
-            playing: 0.7,
+            playing: 0.65,
         }
     }
 }
@@ -247,7 +248,7 @@ impl BargeInMinSpeech {
 
 impl Default for BargeInMinSpeech {
     fn default() -> Self {
-        Self(1.0)
+        Self(0.6)
     }
 }
 

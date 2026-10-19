@@ -14,10 +14,10 @@ fn each_half_reads_with_its_defaults_and_names_no_model() {
     .unwrap();
     assert_eq!(input.end_of_turn, EndOfTurn::Silence { ms: None });
     assert_eq!(input.patience, Patience::Calm);
-    assert_eq!(input.barge_in_min_speech.seconds(), 1.0);
+    assert_eq!(input.barge_in_min_speech.seconds(), 0.6);
     assert_eq!(
         (input.listening_bar.quiet, input.listening_bar.playing),
-        (0.5, 0.7)
+        (0.5, 0.65)
     );
     assert_eq!(input.language.as_deref(), Some("es"));
     let output: OutputConfig = serde_json::from_value(json!({"voice": "ef_dora"})).unwrap();

@@ -155,8 +155,8 @@ is the default). The microphone is opened only with `input`. Their failures are 
 - **The configuration** is data read strictly from JSON, and names no model. The input half's (`InputConfig`): the
   `language` the transcriber is given, what ends a turn (`end_of_turn`: `{"kind": "silence", "ms"?}`, a pause of `ms`
   after speech stopped, the patience's when absent; or `{"kind": "smart"}`, which needs an `EndOfTurnModel`), the
-  `patience` (`fast`, `normal`, `calm`), the listening bar, and `barge_in_min_speech` (1.0 s of continuous qualified
-  capture while audio sounds). The output half's (`OutputConfig`): the speaker's `voice` and `speed`, and the
+  `patience` (`fast`, `normal`, `calm`), the listening bar, and `barge_in_min_speech` (0.6 s of qualified speech within a sliding window 2.5 times as
+  long, while audio sounds). The output half's (`OutputConfig`): the speaker's `voice` and `speed`, and the
   `language` of what is said when `say` gives none (the input's when absent). The call's (`VoiceConfig`): the grace
   before anything is said (`audio_grace_ms`, 1 s), and how long the models stay loaded with the call stopped
   (`idle_unload_minutes`, 10; 0 drops them as it stops).
