@@ -44,7 +44,20 @@ impl InputSlots {
     }
 }
 
-/// Loads, all at once, the detector and the transcriber (`whole`) and the end-of-turn model (`end_of_turn`).
+/// How much silence warms a detector up, in 16 kHz samples: 0.1 s, a whole window of any common detector.
+pub(super) const WARM_UP_SAMPLES: usize = 1_600;
+
+/// A fresh detector, warmed up: its first windows (a runtime's first inference is the slow one) run on silence, and it
+/// starts over from sample 0, with no speech.
+async fn warm(models: &dyn InputModels) -> Result<Box<dyn Vad>, String> {
+    let mut vad = models.vad().await?;
+    vad.accept(&[0.0; WARM_UP_SAMPLES]).await?;
+    vad.reset().await;
+    Ok(vad)
+}
+
+/// Loads, all at once, the detector and the transcriber (`whole`) and the end-of-turn model (`end_of_turn`). The
+/// detector is warmed up as it loads, while the others still do.
 pub(super) async fn load_input(
     models: Arc<dyn InputModels>,
     whole: bool,
@@ -52,7 +65,7 @@ pub(super) async fn load_input(
 ) -> InputSlots {
     let detector = async {
         match whole {
-            true => Some(models.vad().await),
+            true => Some(warm(models.as_ref()).await),
             false => None,
         }
     };

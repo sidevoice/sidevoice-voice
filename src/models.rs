@@ -35,7 +35,8 @@ pub(crate) const END_OF_TURN_MISSING: &str = "end-of-turn-missing";
 #[cfg_attr(native, async_trait)]
 #[cfg_attr(web, async_trait(?Send))]
 pub trait InputModels: MaybeSend + MaybeSync {
-    /// A fresh detector stream, loaded and ready: each call its own (the weights behind it may be shared).
+    /// A fresh detector stream, loaded and ready: each call its own (the weights behind it may be shared). The call
+    /// warms it up as the other slots load: 0.1 s of silence, then a reset.
     async fn vad(&self) -> Result<Box<dyn Vad>, String>;
     /// The transcriber, loaded and ready.
     async fn transcriber(&self) -> Result<Arc<dyn Transcriber>, String>;

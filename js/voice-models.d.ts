@@ -54,7 +54,8 @@ export interface VoiceEndOfTurn {
  *  transcriber as the input half starts, the end-of-turn classifier only for `{kind: "smart"}`), each answering the
  *  loaded model or a promise of it. A failure is a throw or a rejection with a stable `code`. */
 export interface VoiceInputModels {
-  /** A fresh detector stream for this call (the weights behind it may be shared). */
+  /** A fresh detector stream for this call (the weights behind it may be shared). The call warms it up as the other
+   *  models load: it feeds it 0.1 s of silence, then `reset()`s it. */
   vad(): VoiceVad | Promise<VoiceVad>;
   transcriber(): VoiceTranscriber | Promise<VoiceTranscriber>;
   /** Absent: `{kind: "smart"}` refuses to start (`end-of-turn-missing`). */
