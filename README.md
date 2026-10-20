@@ -155,10 +155,13 @@ is the default). The microphone is opened only with `input`. Their failures are 
 - **The configuration** is data read strictly from JSON, and names no model. The input half's (`InputConfig`): the
   `language` the transcriber is given, what ends a turn (`end_of_turn`: `{"kind": "silence", "ms"?}`, a pause of `ms`
   after speech stopped, the patience's when absent; or `{"kind": "smart"}`, which needs an `EndOfTurnModel`), the
-  `patience` (`fast`, `normal`, `calm`), the listening bar, and `barge_in_min_speech` (0.6 s of qualified speech within a sliding window 2.5 times as
-  long, while audio sounds). The output half's (`OutputConfig`): the speaker's `voice` and `speed`, and the
+  `patience` (`fast`, `normal`, `calm`), and the numbers of segmentation, each validated when read and each the host's to set
+  (the app owns the values it runs with; these are the library's defaults): `listening_bar` (`{quiet: 0.5, playing: 0.65}`, 0 to 1),
+  `barge_in_min_speech` (0.6 s of qualified speech, above 0 and up to 60) within a sliding window of `barge_in_window` times as
+  much (2.5, from 1 to 10), while audio sounds, `vad_confidence` (0.6, above 0 and up to 1), `speech_start_ms` (400, up to 5000) and
+  `pre_roll_ms` (1000, up to 5000). The output half's (`OutputConfig`): the speaker's `voice` and `speed`, and the
   `language` of what is said when `say` gives none (the input's when absent). The call's (`VoiceConfig`): the grace
-  before anything is said (`audio_grace_ms`, 1 s), and how long the models stay loaded with the call stopped
+  before anything is said (`audio_grace_ms`, 1 s, up to 60 s), and how long the models stay loaded with the call stopped
   (`idle_unload_minutes`, 10; 0 drops them as it stops).
 - **`start` loads the models its halves use** if they are not loaded, every slot at once. The detector is warmed up as
   it loads, while the others still do: its first windows (a runtime's first inference is the slow one) run on 0.1 s
@@ -283,7 +286,7 @@ time; a task around it (`src/voice_call.rs`) feeds it and does what it answers.
 - **Listening** is Pipecat's, as the Python core ran it (Silero, `VADParams`, smart-turn v3 and the two stop
   strategies of `pipecat-ai` 1.10.0). A window of the app's detector is speech when its probability is at least 0.6
   and the volume clears the listening bar: the loudness of the last 400 ms (ITU-R BS.1770), from −110 LUFS (0) to −10
-  LUFS (1), smoothed, at least 0.5 (−60 LUFS), and 0.8 (−30 LUFS) while something plays. Speech starts after 400 ms of
+  LUFS (1), smoothed, at least 0.5 (−60 LUFS), and 0.65 (−45 LUFS) while something plays. Speech starts after 400 ms of
   such windows and stops after a stretch without any: 0.6, 0.9 or 1.3 s by patience with `smart`, 0.2 s with
   `silence`; a breath or a click shorter than that changes nothing. A turn opens where speech starts, with the second
   of audio before it. Where speech stops a pause begins: with `smart` the end-of-turn model is asked, at every
@@ -302,7 +305,7 @@ time; a task around it (`src/voice_call.rs`) feeds it and does what it answers.
 - **Playback.** What the app asks to say is cut into sentence chunks, each synthesized while the one before plays and
   never further ahead (two chunks at most at the speaker unplayed). It waits while the person's turn is open or being
   transcribed, and for the grace after it. A turn that opens while something is on its way is a barge-in: the speaker
-  stops with a short fade, what sounded is heard up to where it got, and everything queued is not played
+  stops with a short fade (the host's `output.fade_ms`, 30 ms), what sounded is heard up to where it got, and everything queued is not played
   (`barge-in`). A cancel through the handle does the same to it alone (`cancelled`); a stop, to all (`stopped`), and
   what is asked while the call is stopped is not played. What cannot be spoken ends `failed` with its code, which is
   also an error, and what of it was at the speaker is flushed.

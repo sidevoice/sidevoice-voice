@@ -328,3 +328,26 @@ test("a microphone that cannot open is lost to the lanes that asked for it, and 
   assert.equal(ss.events.lost, undefined);
   speaking.io.stop(); listening.io.stop();
 });
+
+test("a cut fades out over the lane's fade time, 30 ms by default", async () => {
+  browser();
+  const ramps = [];
+  const create = AudioContext.prototype.createGain;
+  AudioContext.prototype.createGain = function () {
+    const gain = create.call(this);
+    gain.gain.linearRampToValueAtTime = (value, at) => ramps.push([value, at]);
+    return gain;
+  };
+  const audio = createSharedWebAudioIo();
+  const lane = audio.attach();
+  const heard = sink();
+  lane.io.start(heard, { input: true });
+  for (let i = 0; i < 5 && !heard.events.ready; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+  lane.io.play("first", 0, new Float32Array(160), 16000);
+  lane.io.stopPlayback();
+  lane.io.setFadeMs(120);
+  lane.io.play("second", 0, new Float32Array(160), 16000);
+  lane.io.stopPlayback();
+  assert.deepEqual(ramps, [[0, 0.03], [0, 0.12]]);
+  lane.io.stop();
+});

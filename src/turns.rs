@@ -2,8 +2,8 @@
 //! (`pipecat-ai` 1.10.0: `VADAnalyzer`, `BaseSmartTurn`, `TurnAnalyzerUserTurnStopStrategy`,
 //! `SpeechTimeoutUserTurnStopStrategy`).
 //!
-//! - A window is speech when the detector's confidence is at least [`CONFIDENCE`] and the volume (`volume`) clears the
-//!   listening bar, raised while a reply sounds. In silence speech starts after [`START_MS`] of such windows; over
+//! - A window is speech when the detector's confidence is at least the configured confidence and the volume (`volume`) clears the
+//!   listening bar, raised while a reply sounds. In silence speech starts after the configured start time of such windows; over
 //!   sounding audio it starts only once the configured minimum of such windows has been heard within a sliding window two and
 //!   a half times as long (`overlap`), wherever they fall in it, so bursts with pauses add up. It stops after the
 //!   segmentation's `stop_ms` without one (`activity`).
@@ -37,17 +37,11 @@ use volume::Volume;
 pub(crate) const RATE: u32 = 16_000;
 /// Samples per millisecond.
 const PER_MS: u64 = RATE as u64 / 1000;
-/// The detector's confidence from which a window is speech.
-const CONFIDENCE: f32 = 0.6;
-/// How long speech must go on before it starts, in milliseconds.
-const START_MS: u32 = 400;
 /// With `silence`, how long the detector must hear no speech before it says speech stopped, in milliseconds.
 pub(crate) const SILENCE_STOP_MS: u32 = 200;
-/// The audio kept before a turn opens.
-const PRE_ROLL: usize = RATE as usize;
-/// The audio an end-of-turn model is given from before speech started: half a second, and the speech it took to
-/// start.
-const PRE_SPEECH: usize = (500 + START_MS as usize) * PER_MS as usize;
+/// The audio an end-of-turn model is given from before speech started, besides the speech it took to start: half a
+/// second, in milliseconds.
+const PRE_SPEECH_MS: usize = 500;
 /// The most audio an end-of-turn model is given: the last eight seconds.
 const END_OF_TURN_AUDIO: usize = RATE as usize * 8;
 /// The most audio one turn keeps.
@@ -68,8 +62,16 @@ pub(crate) struct Segmentation {
     pub(crate) quiet_bar: f32,
     /// The volume speech needs while a reply plays, if higher.
     pub(crate) playing_bar: f32,
-    /// Continuous raised-bar speech required while output is sounding.
+    /// Qualified speech required while output is sounding, in milliseconds.
     pub(crate) barge_in_min_ms: u32,
+    /// The sliding window that speech falls in, as a multiple of the minimum.
+    pub(crate) barge_in_window: f32,
+    /// The detector's confidence from which a window is speech.
+    pub(crate) confidence: f32,
+    /// How long speech must go on before it starts, in milliseconds.
+    pub(crate) start_ms: u32,
+    /// The audio kept before a turn opens, in milliseconds.
+    pub(crate) pre_roll_ms: u32,
 }
 
 /// What one window did to the turn.
@@ -196,12 +198,15 @@ impl Segmenter {
         } else {
             self.numbers.quiet_bar
         };
-        let speech = confidence >= CONFIDENCE && volume >= bar;
+        let speech = confidence >= self.numbers.confidence && volume >= bar;
         let gated = playing && self.open.is_none();
         let min_speech = self.numbers.barge_in_min_ms as usize * PER_MS as usize;
         let change = if gated {
-            self.overlap
-                .take(pcm.len(), speech, overlap::window(min_speech));
+            self.overlap.take(
+                pcm.len(),
+                speech,
+                overlap::window(min_speech, self.numbers.barge_in_window),
+            );
             if speech && self.overlap.speech() >= min_speech {
                 // The duration is counted from capture samples. Only now does VAD open a turn.
                 self.activity.take(true, pcm.len(), 0, self.numbers.stop_ms)
@@ -211,14 +216,18 @@ impl Segmenter {
             }
         } else {
             self.overlap.clear();
-            self.activity
-                .take(speech, pcm.len(), START_MS, self.numbers.stop_ms)
+            self.activity.take(
+                speech,
+                pcm.len(),
+                self.numbers.start_ms,
+                self.numbers.stop_ms,
+            )
         };
         if change == Some(Change::Started) {
             self.start_run = if gated {
                 self.overlap.total()
             } else {
-                activity::windows(START_MS, pcm.len()).max(1) as usize * pcm.len()
+                activity::windows(self.numbers.start_ms, pcm.len()).max(1) as usize * pcm.len()
             };
         }
         // Only the audio from the first qualified window of the sliding window is eligible for pre-roll while playback
@@ -237,10 +246,11 @@ impl Segmenter {
             if change != Some(Change::Started) {
                 return None;
             }
+            let pre_roll = self.numbers.pre_roll_ms as usize * PER_MS as usize;
             let from = self
                 .recent
                 .len()
-                .saturating_sub(PRE_ROLL.max(self.start_run) + pcm.len());
+                .saturating_sub(pre_roll.max(self.start_run) + pcm.len());
             self.open = Some(Open {
                 pcm: self.recent.range(from..).copied().collect(),
                 heard: 0,
@@ -266,7 +276,9 @@ impl Segmenter {
                 open.pauses += 1;
                 open.paused = Some(0);
                 if self.numbers.ask {
-                    let length = (open.heard + PRE_SPEECH).min(END_OF_TURN_AUDIO);
+                    let pre_speech =
+                        (PRE_SPEECH_MS + self.numbers.start_ms as usize) * PER_MS as usize;
+                    let length = (open.heard + pre_speech).min(END_OF_TURN_AUDIO);
                     let from = self.recent.len().saturating_sub(length);
                     return Some(Segment::Paused {
                         pcm: self.recent.range(from..).copied().collect(),

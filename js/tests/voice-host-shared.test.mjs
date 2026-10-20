@@ -394,3 +394,55 @@ test("the idle time of a preload counts from the end of its load, however long t
   assert.equal(source.loads.stt, 1, "a download that took longer than the idle time is not let go as it ends");
   await call.stop();
 });
+
+test("every turn number the host is given reaches the call, and an absent one is left to the call's default", async () => {
+  const io = audio();
+  const owner = createVoiceHost(counting(), { io });
+  const numbers = {
+    listening_bar: { quiet: 0.4, playing: 0.9 },
+    barge_in_min_speech: 0.3,
+    barge_in_window: 4,
+    vad_confidence: 0.75,
+    speech_start_ms: 250,
+    pre_roll_ms: 500,
+  };
+  const tuned = owner.start({ input: { ...input, ...numbers }, output, audio_grace_ms: 300 });
+  await tuned.ready;
+  assert.deepEqual(made.at(-1).setup.input.listening_bar, numbers.listening_bar);
+  for (const key of ["barge_in_min_speech", "barge_in_window", "vad_confidence", "speech_start_ms", "pre_roll_ms"]) {
+    assert.equal(made.at(-1).setup.input[key], numbers[key], key);
+  }
+  assert.equal(made.at(-1).setup.audio_grace_ms, 300);
+  await tuned.update({ input: { ...input, speech_start_ms: 100 }, audio_grace_ms: 50 });
+  assert.equal(made.at(-1).updates.at(-1).input.speech_start_ms, 100);
+  assert.equal(made.at(-1).updates.at(-1).audio_grace_ms, 50);
+  assert.equal("vad_confidence" in made.at(-1).updates.at(-1).input, false);
+
+  const plain = owner.start(both);
+  await plain.ready;
+  for (const key of [...Object.keys(numbers), "audio_grace_ms"]) {
+    assert.equal(key in made.at(-1).setup.input || key in made.at(-1).setup, false, `${key} stays absent`);
+  }
+  await Promise.all([tuned.stop(), plain.stop()]);
+});
+
+test("the output fade is the lane's, 30 ms unless the settings say, and a bad one is refused", async () => {
+  const fades = [];
+  const io = audio();
+  const attach = io.attach;
+  io.attach = () => {
+    const attached = attach();
+    attached.io.setFadeMs = (ms) => fades.push(ms);
+    return attached;
+  };
+  const owner = createVoiceHost(counting(), { io });
+  const call = owner.start({ input, output: { ...output, fade_ms: 80 } });
+  await call.ready;
+  assert.deepEqual(fades, [80]);
+  await call.update({ output: { ...output } });
+  assert.deepEqual(fades, [80, 30]);
+  await assert.rejects(call.update({ output: { ...output, fade_ms: -1 } }), TypeError);
+  assert.throws(() => owner.start({ output: { ...output, fade_ms: "slow" } }), TypeError);
+  assert.deepEqual(fades, [80, 30], "a refused value changes nothing");
+  await call.stop();
+});

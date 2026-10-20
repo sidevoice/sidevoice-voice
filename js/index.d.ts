@@ -32,10 +32,19 @@ export interface VoiceInputSetup {
   /** `{kind: "silence"}` by default; only `smart` asks for the end-of-turn classifier. */
   end_of_turn?: VoiceEndOfTurnConfig;
   patience?: "fast" | "normal" | "calm";
-  /** How loud speech must be to count, from 0 to 1, while nothing plays and while something does. */
+  /** How loud speech must be to count, as a volume from 0 to 1 (Pipecat's: the last 400 ms's loudness, −110 LUFS to −10
+   *  LUFS), while nothing plays and while something does (the bar a barge-in must clear). `{quiet: 0.5, playing: 0.65}`. */
   listening_bar?: { quiet: number; playing: number };
-  /** Continuous speech, in seconds, before sounding audio is cut (1.0 by default). */
+  /** Qualified speech, in seconds above 0 and up to 60, before sounding agent audio is cut (0.6). */
   barge_in_min_speech?: number;
+  /** The sliding window that speech falls in, as a multiple of `barge_in_min_speech`, from 1 to 10 (2.5). */
+  barge_in_window?: number;
+  /** The detector's confidence from which a window is speech, above 0 and up to 1 (0.6). */
+  vad_confidence?: number;
+  /** How long speech must go on before it starts a turn in silence, in milliseconds, 0 to 5000 (400). */
+  speech_start_ms?: number;
+  /** The audio kept before a turn opens, in milliseconds, 0 to 5000 (1000). */
+  pre_roll_ms?: number;
 }
 
 /** The output half of a call: the speaker model and the playback. */

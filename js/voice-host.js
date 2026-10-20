@@ -6,6 +6,16 @@
 import { VoiceCall as WasmVoiceCall } from "../dist/sidevoice_voice.js";
 import { createSharedWebAudioIo } from "./shared-web-audio-io.js";
 
+// The input half's numbers that cross as they are; the call validates them (ranges in src/config.rs) and applies its own
+// default to an absent one. The fade is the host's own, so its range is checked here.
+const TURN_NUMBERS = ["listening_bar", "barge_in_min_speech", "barge_in_window", "vad_confidence", "speech_start_ms", "pre_roll_ms"];
+const FADE_MS = { name: "output.fade_ms", min: 0, max: 1000 };
+function requireNumber({ name, min, max }, value) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < min || value > max) {
+    throw new TypeError(`${name} must be a number between ${min} and ${max}`);
+  }
+  return value;
+}
 const fail = (code, message) => Object.assign(new Error(message || code), { code });
 const canonical = (value) => Array.isArray(value) ? `[${value.map(canonical).join(",")}]`
   : value && typeof value === "object" ? `{${Object.keys(value).sort().filter((key) => value[key] !== undefined).map((key) => `${JSON.stringify(key)}:${canonical(value[key])}`).join(",")}}`
@@ -141,7 +151,7 @@ export function createVoiceHost(source, options = {}) {
       language,
       end_of_turn: { kind, ...turn },
       ...(input.patience ? { patience: input.patience } : {}),
-      ...(input.barge_in_min_speech != null ? { barge_in_min_speech: input.barge_in_min_speech } : {}),
+      ...Object.fromEntries(TURN_NUMBERS.filter((key) => input[key] != null).map((key) => [key, input[key]])),
     };
   }
   function outputOf(id, output, kept) {
@@ -154,12 +164,14 @@ export function createVoiceHost(source, options = {}) {
     }
     return { models: kept.output, voice, language, ...(speed != null ? { speed } : {}) };
   }
-  function setupOf(id, settings, kept) {
+  function setupOf(id, settings, kept, io) {
+    io.setFadeMs?.(settings.output?.fade_ms == null ? 30 : requireNumber(FADE_MS, settings.output.fade_ms));
     if (!settings.input) kept.inputKey = null;
     if (!settings.output) kept.outputKey = null;
     return {
       ...(settings.input ? { input: inputOf(id, settings.input, kept) } : {}),
       ...(settings.output ? { output: outputOf(id, settings.output, kept) } : {}),
+      ...(settings.audio_grace_ms != null ? { audio_grace_ms: settings.audio_grace_ms } : {}),
       // The host keeps what a stopped call loaded (`releaseAll`); the call itself drops it as it stops.
       idle_unload_minutes: 0,
     };
@@ -189,7 +201,7 @@ export function createVoiceHost(source, options = {}) {
     const { io, input: port } = audio.attach();
     let call;
     try {
-      call = WasmVoiceCall.create(io, setupOf(id, settings, kept));
+      call = WasmVoiceCall.create(io, setupOf(id, settings, kept, io));
     } catch (error) {
       io.dispose?.();
       throw error;
@@ -239,10 +251,11 @@ export function createVoiceHost(source, options = {}) {
         const next = { ...current };
         for (const half of ["input", "output"]) if (half in change) next[half] = change[half] ?? null;
         if ("idle_unload_minutes" in change) next.idle_unload_minutes = change.idle_unload_minutes;
+        if ("audio_grace_ms" in change) next.audio_grace_ms = change.audio_grace_ms;
         if (!next.input && !next.output) throw new TypeError("voice settings with an input or an output half");
         const before = { ...kept };
         try {
-          call.update(setupOf(id, next, kept));
+          call.update(setupOf(id, next, kept, io));
         } catch (error) {
           Object.assign(kept, before);
           throw error;

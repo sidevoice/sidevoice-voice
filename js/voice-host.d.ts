@@ -48,8 +48,19 @@ export interface VoiceInputSettings {
   /** `{kind: "silence"}` when absent. */
   endOfTurn?: VoiceEndOfTurnSettings;
   patience?: "fast" | "normal" | "calm";
-  /** Continuous raised-bar speech, in seconds, before sounding agent audio is cut (default 1.0). */
+  /** How loud speech must be to count, as a volume from 0 to 1 (Pipecat's: the last 400 ms's loudness, −110 LUFS to −10
+   *  LUFS), while nothing plays and while something does (the bar a barge-in must clear). `{quiet: 0.5, playing: 0.65}`. */
+  listening_bar?: { quiet: number; playing: number };
+  /** Qualified speech, in seconds above 0 and up to 60, before sounding agent audio is cut (0.6). */
   barge_in_min_speech?: number;
+  /** The sliding window that speech falls in, as a multiple of `barge_in_min_speech`, from 1 to 10 (2.5). */
+  barge_in_window?: number;
+  /** The detector's confidence from which a window is speech, above 0 and up to 1 (0.6). */
+  vad_confidence?: number;
+  /** How long speech must go on before it starts a turn in silence, in milliseconds, 0 to 5000 (400). */
+  speech_start_ms?: number;
+  /** The audio kept before a turn opens, in milliseconds, 0 to 5000 (1000). */
+  pre_roll_ms?: number;
 }
 
 /** The output half: the speaker model and the playback. */
@@ -59,6 +70,8 @@ export interface VoiceOutputSettings {
   /** One of the model's voices; null or absent for the speaker's own choice. */
   voice?: string | null;
   speed?: number;
+  /** How long the speaker fades out when playback is cut, in milliseconds, 0 to 1000 (30). */
+  fade_ms?: number;
   /** The language of what is said when `say` gives none; absent: the input's. */
   language?: string | null;
 }
@@ -69,6 +82,8 @@ export interface VoiceOutputSettings {
 export interface VoiceSettings {
   input?: VoiceInputSettings | null;
   output?: VoiceOutputSettings | null;
+  /** How long after a turn ends what is to be said waits, in milliseconds, 0 to 60000 (1000). */
+  audio_grace_ms?: number;
   /** How long a model no call holds stays loaded, in minutes (10 by default; 0: let go at once). */
   idle_unload_minutes?: number;
 }
@@ -78,6 +93,7 @@ export interface VoiceSettings {
 export interface VoiceSettingsChange {
   input?: VoiceInputSettings | null;
   output?: VoiceOutputSettings | null;
+  audio_grace_ms?: number;
   idle_unload_minutes?: number;
 }
 

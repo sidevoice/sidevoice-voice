@@ -818,5 +818,9 @@ fn segmentation(config: &CallConfig) -> Segmentation {
         quiet_bar: config.listening_bar.quiet,
         playing_bar: config.listening_bar.playing,
         barge_in_min_ms: (config.barge_in_min_speech.seconds() * 1_000.0).ceil() as u32,
+        barge_in_window: config.barge_in_window,
+        confidence: config.vad_confidence,
+        start_ms: config.speech_start_ms,
+        pre_roll_ms: config.pre_roll_ms,
     }
 }

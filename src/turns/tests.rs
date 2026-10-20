@@ -3,16 +3,17 @@
 
 use crate::test_support::{clip, EnergyVad, FLEURS_ES, QUILTER};
 
-use super::{
-    instant, loudness, Segment, Segmentation, Segmenter, AUDIO_IDLE_MS, MAX_TURN, PRE_ROLL,
-    PRE_SPEECH,
-};
+use super::{instant, loudness, Segment, Segmentation, Segmenter, AUDIO_IDLE_MS, MAX_TURN};
 
 #[cfg(web)]
 use wasm_bindgen_test::wasm_bindgen_test as test;
 
 /// Samples in one detector window.
 const WINDOW: usize = 512;
+/// The default pre-roll: a second of audio.
+const PRE_ROLL_SAMPLES: usize = 16_000;
+/// The audio an end-of-turn model is given from before speech started: 500 ms and the 400 ms it took to start.
+const PRE_SPEECH_SAMPLES: usize = 14_400;
 
 /// `smart-turn` at normal patience: speech stops after 0.9 s, a pause ends the turn 3 s after that.
 const SMART: Segmentation = Segmentation {
@@ -22,6 +23,10 @@ const SMART: Segmentation = Segmentation {
     quiet_bar: 0.5,
     playing_bar: 0.65,
     barge_in_min_ms: 600,
+    barge_in_window: 2.5,
+    confidence: 0.6,
+    start_ms: 400,
+    pre_roll_ms: 1_000,
 };
 
 /// `silence` at normal patience: speech stops after 0.2 s, a pause ends the turn 2.5 s after that.
@@ -467,12 +472,12 @@ fn a_turn_opens_with_its_pre_roll_and_the_model_hears_it_from_before_its_speech(
         panic!("{segments:?}")
     };
     // 0.9 s before the window speech started with, and all after it.
-    assert_eq!(pcm.len(), PRE_SPEECH + 88 * WINDOW);
+    assert_eq!(pcm.len(), PRE_SPEECH_SAMPLES + 88 * WINDOW);
     let Some(Segment::Ended(ended)) = segmenter.end_paused(1) else {
         panic!("ended")
     };
     // The second before that window, the window, and all after it.
-    assert_eq!(ended.pcm.len(), PRE_ROLL + WINDOW + 88 * WINDOW);
+    assert_eq!(ended.pcm.len(), PRE_ROLL_SAMPLES + WINDOW + 88 * WINDOW);
 
     // A long turn: the model hears its last 8 s.
     let mut segmenter = speaking(SMART);
@@ -521,4 +526,85 @@ fn speech_that_stops_in_a_turn_is_a_pause_until_it_starts_again() {
     // Speech that starts again ends the pause.
     hear(&mut segmenter, &times(speech(LOUD), 12), false);
     assert!(!segmenter.paused() && segmenter.speaking());
+}
+
+#[test]
+fn the_sliding_window_is_a_multiple_of_the_minimum_that_follows_the_configuration() {
+    // A window as long as the minimum leaves no room for a pause between bursts.
+    let mut segmenter = playing(Segmentation {
+        barge_in_window: 1.0,
+        ..SMART
+    });
+    assert!(hear(&mut segmenter, &bursts(LOUD, 14, 8, 3), true).is_empty());
+    // Bursts too far apart for 2.5 times the minimum add up in ten times as long a window.
+    let mut segmenter = playing(Segmentation {
+        barge_in_window: 10.0,
+        ..SMART
+    });
+    let started = hear(&mut segmenter, &bursts(LOUD, 14, 50, 3), true);
+    assert!(
+        started
+            .iter()
+            .any(|(_, segment)| segment == &Segment::Started),
+        "{started:?}"
+    );
+}
+
+#[test]
+fn the_detector_confidence_is_the_configured_one() {
+    let mut windows = times(Heard(tone(LOUD), 0.02), 32);
+    windows.extend(times(Heard(tone(LOUD), 0.7), 20));
+    let mut segmenter = Segmenter::new(SMART);
+    assert!(!hear(&mut segmenter, &windows, false).is_empty());
+    let mut segmenter = Segmenter::new(Segmentation {
+        confidence: 0.8,
+        ..SMART
+    });
+    assert!(hear(&mut segmenter, &windows, false).is_empty());
+    let mut segmenter = Segmenter::new(Segmentation {
+        confidence: 0.3,
+        ..SMART
+    });
+    let mut windows = times(Heard(tone(LOUD), 0.02), 32);
+    windows.extend(times(Heard(tone(LOUD), 0.4), 20));
+    assert!(!hear(&mut segmenter, &windows, false).is_empty());
+}
+
+#[test]
+fn speech_starts_after_the_configured_time_of_it() {
+    let started_at = |start_ms| {
+        let mut segmenter = Segmenter::new(Segmentation { start_ms, ..SMART });
+        let mut windows = times(Heard(tone(LOUD), 0.02), 32);
+        windows.extend(times(speech(LOUD), 40));
+        let segments = hear(&mut segmenter, &windows, false);
+        let [(at, Segment::Started)] = segments[..] else {
+            panic!("{segments:?}")
+        };
+        at
+    };
+    assert_eq!(started_at(400), 43);
+    assert_eq!(started_at(100), 34);
+    assert!(started_at(1_000) > 60);
+}
+
+#[test]
+fn a_turn_opens_with_the_configured_pre_roll() {
+    let ended_with = |pre_roll_ms| {
+        let mut segmenter = Segmenter::new(Segmentation {
+            pre_roll_ms,
+            ..SMART
+        });
+        let mut windows = times(Heard(tone(LOUD), 0.02), 100);
+        windows.extend(times(speech(LOUD), 60));
+        windows.extend(times(silence(), 28));
+        hear(&mut segmenter, &windows, false);
+        let Some(Segment::Ended(ended)) = segmenter.end_paused(1) else {
+            panic!("ended")
+        };
+        ended.pcm.len()
+    };
+    // The speech that started the turn (400 ms is 12 windows, rounded half to even) is kept whatever the pre-roll, so a
+    // short one cannot cut into it; a longer one adds what it has beyond that.
+    let kept = ended_with(0);
+    assert_eq!(ended_with(2_000), kept + 32_000 - 12 * WINDOW);
 }
