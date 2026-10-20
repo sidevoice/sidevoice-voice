@@ -50,7 +50,7 @@ export interface VoiceInputSettings {
   patience?: "fast" | "normal" | "calm";
   /** How loud speech must be to count, as a volume from 0 to 1 (Pipecat's: the last 400 ms's loudness, −110 LUFS to −10
    *  LUFS), while nothing plays and while something does (the bar a barge-in must clear). `{quiet: 0.5, playing: 0.65}`. */
-  listening_bar?: { quiet: number; playing: number };
+  listening_bar?: { quiet?: number; playing?: number };
   /** Qualified speech, in seconds above 0 and up to 60, before sounding agent audio is cut (0.6). */
   barge_in_min_speech?: number;
   /** The sliding window that speech falls in, as a multiple of `barge_in_min_speech`, from 1 to 10 (2.5). */

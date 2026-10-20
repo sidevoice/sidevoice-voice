@@ -16,6 +16,9 @@ function requireNumber({ name, min, max }, value) {
   }
   return value;
 }
+// A number the host gave, without the members of an object it left null: the call fills those with its own defaults.
+const withoutNulls = (value) => value && typeof value === "object" && !Array.isArray(value)
+  ? Object.fromEntries(Object.entries(value).filter(([, member]) => member != null)) : value;
 const fail = (code, message) => Object.assign(new Error(message || code), { code });
 const canonical = (value) => Array.isArray(value) ? `[${value.map(canonical).join(",")}]`
   : value && typeof value === "object" ? `{${Object.keys(value).sort().filter((key) => value[key] !== undefined).map((key) => `${JSON.stringify(key)}:${canonical(value[key])}`).join(",")}}`
@@ -145,13 +148,13 @@ export function createVoiceHost(source, options = {}) {
         endOfTurn: () => acquire(id, "end-of-turn", chosen),
       };
     }
-    const { kind, model: _model, ...turn } = input.endOfTurn ?? { kind: "silence" };
+    const { kind = "silence", model: _model, ...turn } = input.endOfTurn ?? {};
     return {
       models: kept.input,
       language,
       end_of_turn: { kind, ...turn },
       ...(input.patience ? { patience: input.patience } : {}),
-      ...Object.fromEntries(TURN_NUMBERS.filter((key) => input[key] != null).map((key) => [key, input[key]])),
+      ...Object.fromEntries(TURN_NUMBERS.filter((key) => input[key] != null).map((key) => [key, withoutNulls(input[key])])),
     };
   }
   function outputOf(id, output, kept) {

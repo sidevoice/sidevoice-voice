@@ -245,8 +245,8 @@ pub struct ListeningBar {
 impl Default for ListeningBar {
     fn default() -> Self {
         Self {
-            quiet: 0.5,
-            playing: 0.65,
+            quiet: default_quiet_bar(),
+            playing: default_playing_bar(),
         }
     }
 }
@@ -255,7 +255,9 @@ impl Default for ListeningBar {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawListeningBar {
+    #[serde(default = "default_quiet_bar")]
     quiet: f32,
+    #[serde(default = "default_playing_bar")]
     playing: f32,
 }
 
@@ -334,6 +336,14 @@ fn speech_start_ms<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<
 
 fn pre_roll_ms<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u32, D::Error> {
     ranged(deserializer, "pre_roll_ms", 0, 5_000)
+}
+
+fn default_quiet_bar() -> f32 {
+    0.5
+}
+
+fn default_playing_bar() -> f32 {
+    0.65
 }
 
 fn default_barge_in_window() -> f32 {
