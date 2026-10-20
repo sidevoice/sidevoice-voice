@@ -446,3 +446,22 @@ test("the output fade is the lane's, 30 ms unless the settings say, and a bad on
   assert.deepEqual(fades, [80, 30], "a refused value changes nothing");
   await call.stop();
 });
+
+test("every setting may be left out: the call gets only what the host gave, and a partial listening bar crosses as given", async () => {
+  const owner = createVoiceHost(counting(), { io: audio() });
+  const bare = owner.start({ input: { stt: {} }, output: {} });
+  await bare.ready;
+  const { input: bareInput, output: bareOutput, ...bareRest } = made.at(-1).setup;
+  assert.deepEqual(Object.keys(bareInput).sort(), ["end_of_turn", "language", "models"]);
+  assert.deepEqual(bareInput.end_of_turn, { kind: "silence" });
+  assert.deepEqual(Object.keys(bareOutput).sort(), ["language", "models", "voice"]);
+  assert.deepEqual(bareRest, { idle_unload_minutes: 0 });
+  await bare.stop();
+  const partial = owner.start({ input: { stt: {}, endOfTurn: {}, listening_bar: { quiet: 0.3, playing: null }, pre_roll_ms: null } });
+  await partial.ready;
+  const setup = made.at(-1).setup.input;
+  assert.deepEqual(setup.listening_bar, { quiet: 0.3 });
+  assert.deepEqual(setup.end_of_turn, { kind: "silence" });
+  assert.equal("pre_roll_ms" in setup, false);
+  await partial.stop();
+});
