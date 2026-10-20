@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.1](https://github.com/sidevoice/sidevoice-voice/compare/v0.7.0...v0.7.1) (2026-10-20)
+
+
+### Bug Fixes
+
+* **config:** every setting has a default ([#63](https://github.com/sidevoice/sidevoice-voice/issues/63)) ([a7f76ae](https://github.com/sidevoice/sidevoice-voice/commit/a7f76ae9797e59c401d6e0fbbd7974ebc4bc4ce5))
+
 ## [0.7.0](https://github.com/sidevoice/sidevoice-voice/compare/v0.6.0...v0.7.0) (2026-10-20)
 
 
