@@ -20,7 +20,7 @@
 //   (`setInputDevice`, `setOutputDevice`): a call that runs switches without ending. A chosen microphone that goes
 //   away falls back to the default one, and `onDeviceLost` hears it; the default one going away is `inputLost`.
 
-const FADE_SECONDS = 0.03;
+const DEFAULT_FADE_MS = 30;
 
 /** Whether this browser lets an `AudioContext` choose its output. */
 const outputSelectable = () => typeof AudioContext !== "undefined" && typeof AudioContext.prototype.setSinkId === "function";
@@ -50,6 +50,8 @@ export function createWebAudioIo(options = {}) {
   let inputDevice = options.inputDevice || null;
   let outputDevice = options.outputDevice || null;
   let sink = null;
+  // How long the speaker fades out when playback is stopped, in milliseconds.
+  let fadeMs = options.fadeMs ?? DEFAULT_FADE_MS;
   // Whether the microphone is asked for.
   let input = false;
   let context = null;
@@ -451,6 +453,10 @@ export function createWebAudioIo(options = {}) {
       started();
     },
 
+    setFadeMs(ms) {
+      fadeMs = ms;
+    },
+
     stopPlayback() {
       if (!context || !output) {
         return;
@@ -458,18 +464,18 @@ export function createWebAudioIo(options = {}) {
       playback++;
       const now = context.currentTime;
       output.gain.setValueAtTime(output.gain.value, now);
-      output.gain.linearRampToValueAtTime(0, now + FADE_SECONDS);
+      output.gain.linearRampToValueAtTime(0, now + fadeMs / 1000);
       for (const source of sources) {
         source.onended = null;
-        source.stop(now + FADE_SECONDS);
+        source.stop(now + fadeMs / 1000);
       }
       sources = new Set();
       const faded = output;
       const epoch = active;
-      closePlayback(epoch, now + FADE_SECONDS, FADE_SECONDS * 2000);
+      closePlayback(epoch, now + fadeMs / 1000, fadeMs * 2);
       setTimeout(() => {
         faded.disconnect();
-      }, FADE_SECONDS * 2000);
+      }, fadeMs * 2);
       newOutput();
       queueEnd = 0;
     },

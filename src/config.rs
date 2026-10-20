@@ -14,7 +14,7 @@ mod tests;
 #[serde(deny_unknown_fields)]
 pub struct VoiceConfig {
     /// How long after a turn ends what is to be said waits before it starts, in milliseconds.
-    #[serde(default = "default_audio_grace_ms")]
+    #[serde(default = "default_audio_grace_ms", deserialize_with = "grace_ms")]
     pub audio_grace_ms: u32,
     /// How long the models stay loaded while the call is stopped, in minutes (0: they are dropped as it stops). The
     /// next start loads them again.
@@ -33,7 +33,7 @@ impl Default for VoiceConfig {
 
 /// How the input half listens: the microphone, the detector, the transcriber and, with [`EndOfTurn::Smart`], the
 /// end-of-turn model.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InputConfig {
     /// The language spoken, as a BCP 47 tag (`es`, `en-US`), given to the transcriber; `None` for it to detect it.
@@ -52,6 +52,44 @@ pub struct InputConfig {
     /// half times as long: 0.6 s by default, so bursts with pauses between them add up.
     #[serde(default)]
     pub barge_in_min_speech: BargeInMinSpeech,
+    /// The sliding window the minimum interrupting speech falls in, as a multiple of that minimum, from 1 to 10: 2.5 by
+    /// default.
+    #[serde(
+        default = "default_barge_in_window",
+        deserialize_with = "barge_in_window"
+    )]
+    pub barge_in_window: f32,
+    /// The detector's confidence from which a window is speech, above 0 and at most 1: 0.6 by default.
+    #[serde(
+        default = "default_vad_confidence",
+        deserialize_with = "vad_confidence"
+    )]
+    pub vad_confidence: f32,
+    /// How long speech must go on before it starts a turn in silence, in milliseconds, at most 5000: 400 by default.
+    #[serde(
+        default = "default_speech_start_ms",
+        deserialize_with = "speech_start_ms"
+    )]
+    pub speech_start_ms: u32,
+    /// The audio kept before a turn opens, in milliseconds, at most 5000: 1000 by default.
+    #[serde(default = "default_pre_roll_ms", deserialize_with = "pre_roll_ms")]
+    pub pre_roll_ms: u32,
+}
+
+impl Default for InputConfig {
+    fn default() -> Self {
+        Self {
+            language: None,
+            end_of_turn: EndOfTurn::default(),
+            patience: Patience::default(),
+            listening_bar: ListeningBar::default(),
+            barge_in_min_speech: BargeInMinSpeech::default(),
+            barge_in_window: default_barge_in_window(),
+            vad_confidence: default_vad_confidence(),
+            speech_start_ms: default_speech_start_ms(),
+            pre_roll_ms: default_pre_roll_ms(),
+        }
+    }
 }
 
 /// How the output half speaks: the speaker model and the playback.
@@ -196,7 +234,7 @@ impl Patience {
 /// the last 400 ms (ITU-R BS.1770), from −110 LUFS (0) to −10 LUFS (1), smoothed. A window the detector holds for
 /// speech under the bar is silence.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, try_from = "RawListeningBar")]
 pub struct ListeningBar {
     /// The bar while nothing plays: −60 LUFS by default.
     pub quiet: f32,
@@ -211,6 +249,107 @@ impl Default for ListeningBar {
             playing: 0.65,
         }
     }
+}
+
+/// A listening bar as read, before its volumes are checked.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawListeningBar {
+    quiet: f32,
+    playing: f32,
+}
+
+impl TryFrom<RawListeningBar> for ListeningBar {
+    type Error = String;
+
+    fn try_from(raw: RawListeningBar) -> Result<Self, String> {
+        for (name, value) in [("quiet", raw.quiet), ("playing", raw.playing)] {
+            if !(value.is_finite() && (0.0..=1.0).contains(&value)) {
+                return Err(format!("listening_bar.{name} must be between 0 and 1"));
+            }
+        }
+        Ok(Self {
+            quiet: raw.quiet,
+            playing: raw.playing,
+        })
+    }
+}
+
+/// Reads a number that must lie in `low..=high` (and be finite), or fails naming `name`.
+fn ranged<'de, D, T>(deserializer: D, name: &str, low: T, high: T) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + PartialOrd + Copy + std::fmt::Display + Finite,
+{
+    let value = T::deserialize(deserializer)?;
+    if value.finite() && value >= low && value <= high {
+        Ok(value)
+    } else {
+        Err(serde::de::Error::custom(format!(
+            "{name} must be between {low} and {high}"
+        )))
+    }
+}
+
+/// Whether a number is a number: floats are not NaN or infinite, integers always are.
+trait Finite {
+    fn finite(&self) -> bool;
+}
+
+impl Finite for f32 {
+    fn finite(&self) -> bool {
+        self.is_finite()
+    }
+}
+
+impl Finite for u32 {
+    fn finite(&self) -> bool {
+        true
+    }
+}
+
+fn grace_ms<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u32, D::Error> {
+    ranged(deserializer, "audio_grace_ms", 0, 60_000)
+}
+
+fn barge_in_window<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<f32, D::Error> {
+    ranged(deserializer, "barge_in_window", 1.0, 10.0)
+}
+
+/// Above zero: a confidence of 0 would make every window speech.
+fn vad_confidence<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<f32, D::Error> {
+    let value = ranged(deserializer, "vad_confidence", 0.0, 1.0)?;
+    if value > 0.0 {
+        Ok(value)
+    } else {
+        Err(serde::de::Error::custom(
+            "vad_confidence must be above 0 and at most 1",
+        ))
+    }
+}
+
+fn speech_start_ms<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u32, D::Error> {
+    ranged(deserializer, "speech_start_ms", 0, 5_000)
+}
+
+fn pre_roll_ms<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u32, D::Error> {
+    ranged(deserializer, "pre_roll_ms", 0, 5_000)
+}
+
+fn default_barge_in_window() -> f32 {
+    2.5
+}
+
+fn default_vad_confidence() -> f32 {
+    0.6
+}
+
+fn default_speech_start_ms() -> u32 {
+    400
+}
+
+fn default_pre_roll_ms() -> u32 {
+    1_000
 }
 
 fn default_audio_grace_ms() -> u32 {

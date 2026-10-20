@@ -91,3 +91,65 @@ fn patience_sets_the_silence_the_smart_turn_pauses_and_the_merge_window() {
         ]
     );
 }
+
+#[test]
+fn every_turn_number_is_a_setting_with_its_documented_default() {
+    let input: InputConfig = serde_json::from_value(json!({})).unwrap();
+    assert_eq!(
+        (
+            input.barge_in_window,
+            input.vad_confidence,
+            input.speech_start_ms,
+            input.pre_roll_ms
+        ),
+        (2.5, 0.6, 400, 1_000)
+    );
+    let custom: InputConfig = serde_json::from_value(json!({
+        "listening_bar": {"quiet": 0.4, "playing": 0.9},
+        "barge_in_min_speech": 0.3,
+        "barge_in_window": 4,
+        "vad_confidence": 0.75,
+        "speech_start_ms": 250,
+        "pre_roll_ms": 0,
+    }))
+    .unwrap();
+    assert_eq!(
+        (custom.listening_bar.quiet, custom.listening_bar.playing),
+        (0.4, 0.9)
+    );
+    assert_eq!(
+        (
+            custom.barge_in_window,
+            custom.vad_confidence,
+            custom.speech_start_ms,
+            custom.pre_roll_ms
+        ),
+        (4.0, 0.75, 250, 0)
+    );
+    let call: VoiceConfig = serde_json::from_value(json!({"audio_grace_ms": 300})).unwrap();
+    assert_eq!(call.audio_grace_ms, 300);
+}
+
+#[test]
+fn turn_numbers_out_of_range_are_refused() {
+    for value in [
+        json!({"barge_in_window": 0.5}),
+        json!({"barge_in_window": 11}),
+        json!({"vad_confidence": 0}),
+        json!({"vad_confidence": 1.5}),
+        json!({"speech_start_ms": 5001}),
+        json!({"speech_start_ms": -1}),
+        json!({"speech_start_ms": 1.5}),
+        json!({"pre_roll_ms": 5001}),
+        json!({"pre_roll_ms": "1000"}),
+        json!({"listening_bar": {"quiet": -0.1, "playing": 0.8}}),
+        json!({"listening_bar": {"quiet": 0.5, "playing": 1.2}}),
+        json!({"listening_bar": {"quiet": 0.5}}),
+    ] {
+        assert!(
+            serde_json::from_value::<InputConfig>(value.clone()).is_err(),
+            "{value}"
+        );
+    }
+    assert!(serde_json::from_value::<VoiceConfig>(json!({"audio_grace_ms": 60_001})).is_err());
+}

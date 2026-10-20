@@ -36,6 +36,8 @@ export interface AudioIo {
   play(utterance: string, chunk: number, samples: Float32Array, sampleRate: number): void;
   /** Stops the speaker at once, with a short fade, and drops every queued chunk. */
   stopPlayback(): void;
+  /** Optional: how long that fade lasts from now, in milliseconds (30 by default). */
+  setFadeMs?(ms: number): void;
   /** Stops capturing and closes the speaker. */
   stop(): void;
   /** Optional: the microphone from now, by id (null: the default); a running one switches without ending. Rejects with
@@ -57,6 +59,8 @@ export interface WebAudioIoOptions {
    * choose; the default output otherwise. A non-default output may escape the browser's echo canceller.
    */
   outputDevice?: string;
+  /** How long the speaker fades out when playback is stopped, in milliseconds (30 by default). */
+  fadeMs?: number;
 }
 
 /**

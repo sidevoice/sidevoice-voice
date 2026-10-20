@@ -3,7 +3,7 @@
 // blocked one cannot fail it.
 const CAPTURE = { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 };
 const FRAME = 160;
-const FADE_SECONDS = 0.03;
+const DEFAULT_FADE_MS = 30;
 const selectable = () => typeof AudioContext !== "undefined" && typeof AudioContext.prototype.setSinkId === "function";
 const failure = (code, message) => Object.assign(new Error(message || code), { code });
 
@@ -224,12 +224,13 @@ export function createSharedWebAudioIo(options = {}) {
     lane.playback++;
     const now = context.currentTime;
     lane.gain.gain.setValueAtTime(lane.gain.gain.value, now);
-    lane.gain.gain.linearRampToValueAtTime(0, now + FADE_SECONDS);
-    for (const source of lane.sources) { source.onended = null; source.stop(now + FADE_SECONDS); }
+    const fade = lane.fadeMs / 1000;
+    lane.gain.gain.linearRampToValueAtTime(0, now + fade);
+    for (const source of lane.sources) { source.onended = null; source.stop(now + fade); }
     lane.sources.clear();
     const old = lane.gain;
-    closePlayback(lane, lane.active, now + FADE_SECONDS, FADE_SECONDS * 2000);
-    setTimeout(() => old.disconnect(), FADE_SECONDS * 2000);
+    closePlayback(lane, lane.active, now + fade, lane.fadeMs * 2);
+    setTimeout(() => old.disconnect(), lane.fadeMs * 2);
     lane.gain = context.createGain(); lane.gain.connect(lane.meter);
     lane.queueEnd = 0;
   }
@@ -238,7 +239,7 @@ export function createSharedWebAudioIo(options = {}) {
     attach() {
       const port = Object.freeze({ id: ++nextPort });
       const lane = { port, sink: null, input: false, meter: null, gain: null, sources: new Set(), queueEnd: 0, playback: 0,
-        active: null, closing: new Map(), deferred: null, rendering: false };
+        active: null, closing: new Map(), deferred: null, rendering: false, fadeMs: DEFAULT_FADE_MS };
       const io = {
         start(sink, { input = false } = {}) {
           lane.sink = sink;
@@ -250,6 +251,7 @@ export function createSharedWebAudioIo(options = {}) {
             if (lane.input && stream?.getAudioTracks().some((track) => track.muted)) sink.microphoneMuted(true);
           }, (error) => { if (lane.sink === sink) sink.failed(error?.code || "audio-output-failed"); });
         },
+        setFadeMs(ms) { lane.fadeMs = ms; },
         setInput(input) {
           if (!lane.sink) return;
           lane.input = input === true;
@@ -306,7 +308,7 @@ export function createSharedWebAudioIo(options = {}) {
           lane.gain?.disconnect();
           lane.gain = lane.meter = null;
           lane.active = null; lane.closing.clear(); lane.deferred = null; lane.rendering = false;
-          setTimeout(() => { meter?.disconnect(); meter?.port.close(); }, FADE_SECONDS * 2000);
+          setTimeout(() => { meter?.disconnect(); meter?.port.close(); }, lane.fadeMs * 2);
           lane.input = false;
           if (![...lanes.values()].some((other) => other.sink)) releaseDevices();
           else {

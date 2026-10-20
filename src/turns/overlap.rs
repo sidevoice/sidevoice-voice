@@ -5,10 +5,10 @@
 
 use std::collections::VecDeque;
 
-/// The window the minimum speech has to fall in, in samples: two and a half times the minimum, so that speech makes up
-/// two fifths of it.
-pub(super) fn window(min_speech: usize) -> usize {
-    min_speech * 5 / 2
+/// The window the minimum speech has to fall in, in samples: `factor` times the minimum (2.5 by default, so that speech
+/// makes up two fifths of it).
+pub(super) fn window(min_speech: usize, factor: f32) -> usize {
+    (min_speech as f64 * f64::from(factor)).round() as usize
 }
 
 /// The windows of capture since the first qualified one still inside the sliding window.
