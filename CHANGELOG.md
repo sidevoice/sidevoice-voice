@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/sidevoice/sidevoice-voice/compare/v0.6.0...v0.7.0) (2026-10-20)
+
+
+### Features
+
+* **turns:** every turn parameter is a host setting ([#61](https://github.com/sidevoice/sidevoice-voice/issues/61)) ([b62fb4a](https://github.com/sidevoice/sidevoice-voice/commit/b62fb4a4664a0505cc9c19a9f53a9a82c7a34dcd))
+
 ## [0.6.0](https://github.com/sidevoice/sidevoice-voice/compare/v0.5.2...v0.6.0) (2026-10-19)
 
 
