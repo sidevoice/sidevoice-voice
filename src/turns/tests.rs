@@ -387,16 +387,90 @@ fn the_opening_before_the_first_qualified_window_is_bounded_by_the_pre_roll() {
     assert_eq!(segmenter.start_run(), 19 * WINDOW + 3_200);
 }
 
+/// Hears `speech_windows` of loud speech, each under playback (`true`) or in a gap (`false`) as `sounding` says, and
+/// returns the segmenter and the index of the window that opened the turn.
+fn straddled(sounding: &[bool]) -> (Segmenter, usize) {
+    let mut segmenter = playing(SMART);
+    let started: Vec<usize> = sounding
+        .iter()
+        .enumerate()
+        .filter_map(|(at, playing)| {
+            let segments = hear(&mut segmenter, &[speech(LOUD)], *playing);
+            matches!(segments[..], [(_, Segment::Started)]).then_some(at)
+        })
+        .collect();
+    let [at] = started[..] else {
+        panic!("{started:?}")
+    };
+    (segmenter, at)
+}
+
+/// `count` windows under playback (`true`) or in a gap (`false`).
+fn run_of(playing: bool, count: usize) -> Vec<bool> {
+    vec![playing; count]
+}
+
 #[test]
-fn overlap_is_forgotten_when_output_stops() {
-    // A candidate heard while output sounded cannot finish under the ordinary 400 ms bar.
+fn speech_over_a_reply_counts_when_the_reply_stops() {
+    // 18 windows under playback are short of the 19 the minimum needs but over the 12 that starting needs in silence:
+    // the first window in the gap opens the turn.
+    let (segmenter, at) = straddled(&[run_of(true, 18), run_of(false, 20)].concat());
+    assert_eq!(at, 18);
+    assert_eq!(segmenter.start_run(), 19 * WINDOW);
+
+    // Speech that did not go on up to the gap does not count in it.
     let mut segmenter = playing(SMART);
     assert!(hear(&mut segmenter, &times(speech(LOUD), 18), true).is_empty());
+    assert!(hear(&mut segmenter, &times(silence(), 3), true).is_empty());
     assert!(hear(&mut segmenter, &times(speech(LOUD), 11), false).is_empty());
-    assert!(matches!(
-        hear(&mut segmenter, &times(speech(LOUD), 1), false)[..],
-        [(0, Segment::Started)]
-    ));
+}
+
+#[test]
+fn an_interruption_that_straddles_the_end_of_playback_opens_no_later_than_one_that_does_not() {
+    let in_the_gap = straddled(&run_of(false, 40)).1;
+    let under_playback = straddled(&run_of(true, 40)).1;
+    for under in [1, 5, 12, 17] {
+        let (segmenter, at) = straddled(&[run_of(true, under), run_of(false, 40 - under)].concat());
+        // Where it could open: when the gap alone would have, or at the first window of the gap if playback held it.
+        assert!(
+            at <= in_the_gap.max(under),
+            "{under} windows under playback: {at}"
+        );
+        assert!(at <= under_playback, "{under} windows under playback: {at}");
+        // The turn keeps all the speech: it began with the first window.
+        assert_eq!(segmenter.start_run(), (at + 1) * WINDOW);
+    }
+}
+
+#[test]
+fn an_interruption_that_straddles_the_start_of_playback_opens_no_later_than_one_under_it() {
+    let under_playback = straddled(&run_of(true, 40)).1;
+    for in_the_gap in [1, 5, 12] {
+        let (mut segmenter, at) =
+            straddled(&[run_of(false, in_the_gap), run_of(true, 40 - in_the_gap)].concat());
+        assert!(
+            at <= under_playback,
+            "{in_the_gap} windows in the gap: {at}"
+        );
+        assert_eq!(segmenter.start_run(), (at + 1) * WINDOW);
+        let Some(Segment::Ended(ended)) = segmenter.poll(AUDIO_IDLE_MS) else {
+            panic!("turn")
+        };
+        assert_eq!(
+            ended.pcm.len(),
+            40 * WINDOW,
+            "the speech in the gap is kept"
+        );
+    }
+}
+
+#[test]
+fn an_interruption_that_goes_in_and_out_of_playback_keeps_counting() {
+    let under_playback = straddled(&run_of(true, 40)).1;
+    let (segmenter, at) =
+        straddled(&[run_of(true, 6), run_of(false, 3), run_of(true, 31)].concat());
+    assert!(at <= under_playback, "{at}");
+    assert_eq!(segmenter.start_run(), (at + 1) * WINDOW);
 }
 
 #[test]

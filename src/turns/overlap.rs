@@ -3,7 +3,8 @@
 //! in the last stretch of audio, so short bursts with pauses between them add up where one unbroken run would never
 //! reach the minimum. The window starts at the first window the detector holds for speech, however soft, so the
 //! opening word of an interruption that is under the playing bar is kept; audio before that is forgotten at once, so
-//! playback the detector never took for speech never lingers.
+//! playback the detector never took for speech never lingers. When playback stops, or starts, in the middle of an
+//! interruption, what was heard on one side is credited to the other (`credit`, `Overlap::speaking`).
 
 use std::collections::VecDeque;
 
@@ -62,6 +63,11 @@ impl Overlap {
     /// The qualified samples in the window.
     pub(super) fn speech(&self) -> usize {
         self.speech
+    }
+
+    /// Whether the last window qualified: speech goes on up to now.
+    pub(super) fn speaking(&self) -> bool {
+        self.windows.back().is_some_and(|window| window.qualified)
     }
 
     /// The samples from the first window held for speech to the end.

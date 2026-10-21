@@ -61,6 +61,22 @@ impl Activity {
         }
     }
 
+    /// The windows of speech counted towards starting, none unless speech is starting.
+    pub(crate) fn starting(self) -> usize {
+        match self.state {
+            State::Starting(count) => count as usize,
+            _ => 0,
+        }
+    }
+
+    /// Starts counting from `windows` windows of speech already heard.
+    pub(crate) fn credit(&mut self, windows: usize) {
+        self.state = match u32::try_from(windows) {
+            Ok(count) if count > 0 => State::Starting(count),
+            _ => State::Quiet,
+        };
+    }
+
     /// Whether speech is going on and has not started to stop: the last window was speech, or the one that resumed it.
     pub(crate) fn speaking(self) -> bool {
         self.state == State::Speaking
