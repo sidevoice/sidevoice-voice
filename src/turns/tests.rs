@@ -311,16 +311,80 @@ fn the_audio_before_a_failed_overlap_never_reaches_a_turn() {
         panic!("{started:?}")
     };
     assert!(at >= 18, "{started:?}");
-    // Exactly the qualified windows: the ones the volume had not yet raised, and the old overlap, are left out.
-    assert_eq!(segmenter.start_run(), 19 * WINDOW);
+    // From the first window the detector held for speech, the ones the volume had not yet raised included; the old
+    // overlap, forgotten in the silence, is left out.
+    assert_eq!(segmenter.start_run(), (at + 1) * WINDOW);
     let Some(Segment::Ended(ended)) = segmenter.poll(AUDIO_IDLE_MS) else {
         panic!("turn")
     };
-    assert_eq!(
-        ended.pcm.len(),
-        (19 + 40 - (at + 1)) * WINDOW,
-        "the earlier overlap leaked"
+    assert_eq!(ended.pcm.len(), 40 * WINDOW, "the earlier overlap leaked");
+}
+
+/// Plays `first` windows of a soft opening word, held for speech under the playing bar, then loud speech, over a reply
+/// whose room tone is as soft as the word; the windows heard, and where the turn opened.
+fn interrupted_softly(numbers: Segmentation, first: usize) -> (Segmenter, usize) {
+    let mut segmenter = Segmenter::new(numbers);
+    hear(&mut segmenter, &times(Heard(tone(FAINT), 0.02), 80), true);
+    let mut windows = times(speech(FAINT), first);
+    windows.extend(times(speech(LOUD), 60));
+    let started = hear(&mut segmenter, &windows, true);
+    let [(at, Segment::Started)] = started[..] else {
+        panic!("{started:?}")
+    };
+    (segmenter, at)
+}
+
+#[test]
+fn the_first_word_under_the_playing_bar_is_kept_when_the_next_words_clear_it() {
+    // "pero" is held for speech but under the bar: alone it interrupts nothing, and the words that follow do.
+    let mut segmenter = Segmenter::new(SMART);
+    hear(&mut segmenter, &times(Heard(tone(FAINT), 0.02), 80), true);
+    assert!(hear(&mut segmenter, &times(speech(FAINT), 40), true).is_empty());
+    assert_eq!(segmenter.overlap.speech(), 0);
+
+    let (mut segmenter, at) = interrupted_softly(SMART, 6);
+    // The soft word and the loud windows up to the one that opened the turn: every window heard since the word began.
+    assert_eq!(segmenter.start_run(), (at + 1) * WINDOW);
+    let Some(Segment::Ended(ended)) = segmenter.poll(AUDIO_IDLE_MS) else {
+        panic!("turn")
+    };
+    assert_eq!(ended.pcm.len(), (6 + 60) * WINDOW);
+    assert_eq!(ended.pcm[..WINDOW], tone(FAINT)[..], "the first word");
+}
+
+#[test]
+fn playback_the_detector_never_held_for_speech_stays_out_of_the_turn() {
+    // A second of reply audio (not held) before the soft word: the turn opens from the word, not from the reply.
+    let mut segmenter = Segmenter::new(SMART);
+    hear(&mut segmenter, &times(Heard(tone(FAINT), 0.02), 80), true);
+    assert!(hear(&mut segmenter, &times(Heard(tone(FAINT), 0.1), 30), true).is_empty());
+    let mut windows = times(speech(FAINT), 6);
+    windows.extend(times(speech(LOUD), 60));
+    let started = hear(&mut segmenter, &windows, true);
+    assert!(
+        matches!(started[..], [(_, Segment::Started)]),
+        "{started:?}"
     );
+    let Some(Segment::Ended(ended)) = segmenter.poll(AUDIO_IDLE_MS) else {
+        panic!("turn")
+    };
+    assert_eq!(ended.pcm.len(), (6 + 60) * WINDOW, "the reply leaked");
+}
+
+#[test]
+fn the_opening_before_the_first_qualified_window_is_bounded_by_the_pre_roll() {
+    // 20 windows (640 ms) of soft speech, and the loud ones up to the bar: a 200 ms pre-roll keeps only the last of it
+    // before the 19 windows that cleared the bar.
+    let numbers = Segmentation {
+        pre_roll_ms: 200,
+        ..SMART
+    };
+    let (segmenter, at) = interrupted_softly(numbers, 20);
+    assert!(
+        at + 1 - 19 > 3_200 / WINDOW,
+        "more is held than the pre-roll"
+    );
+    assert_eq!(segmenter.start_run(), 19 * WINDOW + 3_200);
 }
 
 #[test]
@@ -342,7 +406,8 @@ fn speech_under_the_raised_bar_adds_nothing() {
     // Confidence is high: the volume alone falls below the raised bar.
     assert!(hear(&mut segmenter, &times(speech(MURMUR), 100), true).is_empty());
     assert_eq!(segmenter.overlap.speech(), 0);
-    assert!(segmenter.recent.is_empty());
+    // Held for speech, so kept as a possible opening word, but no more than the sliding window of it: 1.5 s.
+    assert_eq!(segmenter.recent.len(), 24_000 / WINDOW * WINDOW);
 }
 
 #[test]

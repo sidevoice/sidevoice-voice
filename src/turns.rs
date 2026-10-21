@@ -7,7 +7,9 @@
 //!   sounding audio it starts only once the configured minimum of such windows has been heard within a sliding window two and
 //!   a half times as long (`overlap`), wherever they fall in it, so bursts with pauses add up. It stops after the
 //!   segmentation's `stop_ms` without one (`activity`).
-//! - A turn opens where speech starts, with the second of audio before it (the pre-roll).
+//! - A turn opens where speech starts, with the second of audio before it (the pre-roll). Over sounding audio the
+//!   pre-roll is the audio the detector held for speech before the first window that cleared the bar, however soft:
+//!   the first word of an interruption is kept, the playback before it is not.
 //! - Where speech stops inside a turn, a pause begins. With `smart-turn` the turn's audio so far is offered to an
 //!   end-of-turn model, at each stop; the turn ends when it says the turn is over, or once the pause has lasted
 //!   `end_ms` whatever it says. With `silence`, the pause ends the turn once it has lasted `end_ms`. Speech that starts
@@ -119,7 +121,7 @@ pub(crate) struct Segmenter {
     volume: Volume,
     activity: Activity,
     /// The speech that made speech start last, in samples: it began this long before the end of the window it started
-    /// in.
+    /// in (over playback, the audio the opened turn kept).
     start_run: usize,
     /// Whether the preceding window was gated by audible playback.
     was_playing: bool,
@@ -198,12 +200,14 @@ impl Segmenter {
         } else {
             self.numbers.quiet_bar
         };
-        let speech = confidence >= self.numbers.confidence && volume >= bar;
+        let held = confidence >= self.numbers.confidence;
+        let speech = held && volume >= bar;
         let gated = playing && self.open.is_none();
         let min_speech = self.numbers.barge_in_min_ms as usize * PER_MS as usize;
         let change = if gated {
             self.overlap.take(
                 pcm.len(),
+                held,
                 speech,
                 overlap::window(min_speech, self.numbers.barge_in_window),
             );
@@ -225,14 +229,16 @@ impl Segmenter {
         };
         if change == Some(Change::Started) {
             self.start_run = if gated {
-                self.overlap.total()
+                self.overlap
+                    .kept(self.numbers.pre_roll_ms as usize * PER_MS as usize)
             } else {
                 activity::windows(self.numbers.start_ms, pcm.len()).max(1) as usize * pcm.len()
             };
         }
-        // Only the audio from the first qualified window of the sliding window is eligible for pre-roll while playback
-        // sounds. Overlap that never qualifies has no path to recognition or take marks; the microphone level still
-        // reports normally.
+        // Only the audio from the first window the detector held for speech is eligible for pre-roll while playback
+        // sounds, soft or not: an opening word under the playing bar belongs to the interruption, the playback before
+        // it does not. Overlap that never opens a turn has no path to recognition or take marks; the microphone level
+        // still reports normally.
         if gated {
             self.recent.extend(pcm);
             let excess = self.recent.len().saturating_sub(self.overlap.total());
@@ -247,10 +253,13 @@ impl Segmenter {
                 return None;
             }
             let pre_roll = self.numbers.pre_roll_ms as usize * PER_MS as usize;
-            let from = self
-                .recent
-                .len()
-                .saturating_sub(pre_roll.max(self.start_run) + pcm.len());
+            // Over playback the turn keeps what the overlap kept; `recent` holds no more than that and then some.
+            let keep = if gated {
+                self.start_run
+            } else {
+                pre_roll.max(self.start_run) + pcm.len()
+            };
+            let from = self.recent.len().saturating_sub(keep);
             self.open = Some(Open {
                 pcm: self.recent.range(from..).copied().collect(),
                 heard: 0,
