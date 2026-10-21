@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.3](https://github.com/sidevoice/sidevoice-voice/compare/v0.7.2...v0.7.3) (2026-10-21)
+
+
+### Bug Fixes
+
+* **turns:** keep counting an interruption across playback starting or stopping ([#70](https://github.com/sidevoice/sidevoice-voice/issues/70)) ([9c3b3ae](https://github.com/sidevoice/sidevoice-voice/commit/9c3b3ae90528abcd1ae1d19a3ed5f833050e97cd))
+
 ## [0.7.2](https://github.com/sidevoice/sidevoice-voice/compare/v0.7.1...v0.7.2) (2026-10-21)
 
 
