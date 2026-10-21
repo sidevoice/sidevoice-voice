@@ -7,6 +7,9 @@
 //!   sounding audio it starts only once the configured minimum of such windows has been heard within a sliding window two and
 //!   a half times as long (`overlap`), wherever they fall in it, so bursts with pauses add up. It stops after the
 //!   segmentation's `stop_ms` without one (`activity`).
+//! - Playback starting or stopping with no turn open does not restart the count: what was heard on one side is
+//!   credited to the other (`carry`), so an interruption that straddles a gap between a reply's sentences opens no
+//!   later than one that does not.
 //! - A turn opens where speech starts, with the second of audio before it (the pre-roll). Over sounding audio the
 //!   pre-roll is the audio the detector held for speech before the first window that cleared the bar, however soft:
 //!   the first word of an interruption is kept, the playback before it is not.
@@ -186,11 +189,8 @@ impl Segmenter {
         confidence: f32,
         playing: bool,
     ) -> Option<Segment> {
-        // A candidate heard over playback cannot become ordinary silence speech when that playback ends.
         if self.was_playing != playing && self.open.is_none() {
-            self.activity.reset();
-            self.recent.clear();
-            self.overlap.clear();
+            self.carry(playing, pcm.len());
         }
         self.was_playing = playing;
         self.level.take(pcm);
@@ -204,6 +204,7 @@ impl Segmenter {
         let speech = held && volume >= bar;
         let gated = playing && self.open.is_none();
         let min_speech = self.numbers.barge_in_min_ms as usize * PER_MS as usize;
+        let mut starting = 0;
         let change = if gated {
             self.overlap.take(
                 pcm.len(),
@@ -220,6 +221,7 @@ impl Segmenter {
             }
         } else {
             self.overlap.clear();
+            starting = self.activity.starting();
             self.activity.take(
                 speech,
                 pcm.len(),
@@ -232,7 +234,7 @@ impl Segmenter {
                 self.overlap
                     .kept(self.numbers.pre_roll_ms as usize * PER_MS as usize)
             } else {
-                activity::windows(self.numbers.start_ms, pcm.len()).max(1) as usize * pcm.len()
+                (starting + 1) * pcm.len()
             };
         }
         // Only the audio from the first window the detector held for speech is eligible for pre-roll while playback
@@ -306,6 +308,33 @@ impl Segmenter {
             }
         }
         None
+    }
+
+    /// Playback started or stopped with no turn open, in a window of `window` samples: the speech heard so far keeps
+    /// counting on the other side, so an interruption that straddles the switch is no slower than one that does not.
+    /// From silence to playback, the windows of speech counted towards starting are credited to the overlap, as speech
+    /// that qualified; from playback to silence, the speech in the overlap is credited towards starting, if it goes on
+    /// up to the switch. The audio they were heard in stays in `recent`, so the turn keeps it.
+    fn carry(&mut self, playing: bool, window: usize) {
+        let window = window.max(1);
+        if playing {
+            let heard = self.activity.starting().min(self.recent.len() / window);
+            let min_speech = self.numbers.barge_in_min_ms as usize * PER_MS as usize;
+            let limit = overlap::window(min_speech, self.numbers.barge_in_window);
+            self.overlap.clear();
+            for _ in 0..heard {
+                self.overlap.take(window, true, true, limit);
+            }
+            self.activity.reset();
+        } else {
+            let heard = if self.overlap.speaking() {
+                self.overlap.speech() / window
+            } else {
+                0
+            };
+            self.overlap.clear();
+            self.activity.credit(heard);
+        }
     }
 
     /// When the open turn ends for lack of audio, in the call's milliseconds.
