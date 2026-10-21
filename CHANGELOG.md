@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.2](https://github.com/sidevoice/sidevoice-voice/compare/v0.7.1...v0.7.2) (2026-10-21)
+
+
+### Bug Fixes
+
+* **turns:** keep an interruption's soft first word ([#67](https://github.com/sidevoice/sidevoice-voice/issues/67)) ([c3b2074](https://github.com/sidevoice/sidevoice-voice/commit/c3b20742ffaada530fd94f7cb8a484817d5d6d36))
+
 ## [0.7.1](https://github.com/sidevoice/sidevoice-voice/compare/v0.7.0...v0.7.1) (2026-10-20)
 
 
