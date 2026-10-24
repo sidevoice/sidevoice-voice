@@ -1,0 +1,20 @@
+[package]
+name = "audio-comparison"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "audio-comparison"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+sonora = "=0.2.0"
+webrtc-audio-processing = { version = "=2.1.0", features = ["bundled"] }
+hound = "3.5.1"
+cpu-time = "1.0.0"
+
+[build-dependencies]
+cfg_aliases = "0.2.2"

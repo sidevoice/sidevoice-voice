@@ -22,7 +22,7 @@ fn room(reply: &[f32]) -> Vec<f32> {
 }
 
 /// What the canceller leaves of `mic` while `reply` plays.
-fn cancel(canceller: &EchoCanceller, reply: &[f32], mic: &[f32]) -> Vec<f32> {
+fn cancel(canceller: &mut EchoCanceller, reply: &[f32], mic: &[f32]) -> Vec<f32> {
     let mut out = Vec::with_capacity(mic.len());
     for (render, capture) in reply
         .as_chunks::<FRAME>()
@@ -56,7 +56,7 @@ fn reply() -> Vec<f32> {
 fn the_echo_of_the_reply_is_removed() {
     let reply = reply();
     let echo = room(&reply);
-    let left = cancel(&EchoCanceller::with(false).unwrap(), &reply, &echo);
+    let left = cancel(&mut EchoCanceller::with(false), &reply, &echo);
     let tail = left.len() - 4 * 16_000;
     let erle = db(energy(&echo[tail..left.len()]) / energy(&left[tail..]).max(1e-12));
     assert!(erle > 15.0, "{erle:.1} dB of echo removed");
@@ -72,8 +72,8 @@ fn the_person_is_kept_while_the_reply_plays() {
     for (slot, sample) in mic[start..].iter_mut().zip(&person) {
         *slot += sample;
     }
-    let both = cancel(&EchoCanceller::with(false).unwrap(), &reply, &mic);
-    let alone = cancel(&EchoCanceller::with(false).unwrap(), &reply, &echo);
+    let both = cancel(&mut EchoCanceller::with(false), &reply, &mic);
+    let alone = cancel(&mut EchoCanceller::with(false), &reply, &echo);
     let over = db(energy(&both[start..]) / energy(&alone[start..]).max(1e-12));
     assert!(over > 10.0, "the person {over:.1} dB above the echo left");
 }
@@ -81,7 +81,21 @@ fn the_person_is_kept_while_the_reply_plays() {
 #[test]
 fn the_call_s_processing_leaves_finite_audio() {
     let reply = reply();
-    let left = cancel(&EchoCanceller::new().unwrap(), &reply, &room(&reply));
+    let left = cancel(&mut EchoCanceller::new().unwrap(), &reply, &room(&reply));
     assert_eq!(left.len(), reply.len() / FRAME * FRAME);
     assert!(left.iter().all(|s| s.is_finite()));
+}
+
+#[test]
+fn changing_devices_discards_the_old_echo_and_gain_state() {
+    let reply = reply();
+    let echo = room(&reply);
+    for cleanup in [false, true] {
+        let mut canceller = EchoCanceller::with(cleanup);
+        cancel(&mut canceller, &reply, &echo);
+        canceller.reinitialize();
+        let reset = cancel(&mut canceller, &reply, &echo);
+        let fresh = cancel(&mut EchoCanceller::with(cleanup), &reply, &echo);
+        assert_eq!(reset, fresh, "reset preserves cleanup={cleanup}");
+    }
 }
