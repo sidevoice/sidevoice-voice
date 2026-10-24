@@ -1,229 +1,261 @@
 //! Reproducible comparison against the former bundled C++ pipeline. See ../README.md.
-use cpu_time::ThreadTime;
-use std::{hint::black_box, path::Path, time::Instant};
-
-// Compile the actual product adapter, so the benchmark cannot silently drift from it.
+mod engine;
+mod input;
 mod audio {
     pub const FRAME: usize = 160;
 }
 mod turns {
     pub const RATE: u32 = 16_000;
 }
-#[rustfmt::skip] // Formatted with the product; its unit tests belong to the product crate.
+#[rustfmt::skip] // Formatted/tested with the product crate.
 #[path = "../../../src/echo/native.rs"]
 mod native;
-use audio::FRAME;
-use native::EchoCanceller;
-use webrtc_audio_processing::{config as cpp, Config, Processor};
 
-trait Engine {
-    fn frame(&mut self, render: &[f32; FRAME], capture: &mut [f32; FRAME]);
-}
-impl Engine for EchoCanceller {
-    fn frame(&mut self, render: &[f32; FRAME], capture: &mut [f32; FRAME]) {
-        self.render(render);
-        self.capture(capture);
-    }
-}
-impl Engine for Processor {
-    fn frame(&mut self, render: &[f32; FRAME], capture: &mut [f32; FRAME]) {
-        self.analyze_render_frame([&render[..]]).unwrap();
-        self.process_capture_frame([&mut capture[..]]).unwrap();
-    }
-}
-fn cpp() -> Processor {
-    let processor = Processor::new(16_000).unwrap();
-    // Verbatim settings from src/echo/native.rs at the pre-migration main commit.
-    processor.set_config(Config {
-        echo_canceller: Some(cpp::EchoCanceller::Full {
-            stream_delay_ms: None,
-        }),
-        high_pass_filter: Some(cpp::HighPassFilter::default()),
-        noise_suppression: Some(cpp::NoiseSuppression::default()),
-        gain_controller: Some(cpp::GainController::GainController2(cpp::GainController2 {
-            adaptive_digital: Some(Default::default()),
-            ..Default::default()
-        })),
-        ..Default::default()
-    });
-    processor
-}
-fn speech(name: &str, peak: f32) -> Vec<f32> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures")
-        .join(name);
-    let mut reader = hound::WavReader::open(path).unwrap();
-    assert_eq!(reader.spec().sample_rate, 16_000);
-    assert_eq!(reader.spec().channels, 1);
-    let samples: Vec<f32> = reader
-        .samples::<i16>()
-        .map(|v| f32::from(v.unwrap()) / 32768.0)
-        .collect();
-    let max = samples.iter().fold(0.0_f32, |a, v| a.max(v.abs()));
-    samples.into_iter().map(|v| v * peak / max).collect()
-}
-fn energy(values: &[f32]) -> f64 {
-    values.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>()
-}
-fn db(ratio: f64) -> f64 {
-    10.0 * ratio.max(1e-30).log10()
-}
-fn rms_db(values: &[f32]) -> f64 {
-    db(energy(values) / values.len() as f64)
-}
-fn process(mut engine: impl Engine, render: &[f32], mic: &[f32]) -> Vec<f32> {
+use audio::FRAME;
+use audio_comparison::{
+    db, energy, group_delay, lag, quality, quantile, white_noise, Quality, RATE,
+};
+use cpu_time::ThreadTime;
+use engine::{Engine, Kind};
+use input::Inputs;
+use std::{hint::black_box, time::Instant};
+
+fn process(mut engine: Box<dyn Engine>, render: &[f32], mic: &[f32]) -> Vec<f32> {
+    assert_eq!(render.len(), mic.len());
     let mut out = Vec::with_capacity(mic.len());
-    for (render, mic) in render
+    for (render, capture) in render
         .as_chunks::<FRAME>()
         .0
         .iter()
         .zip(mic.as_chunks::<FRAME>().0)
     {
-        let mut frame = *mic;
+        let mut frame = *capture;
         engine.frame(render, &mut frame);
         assert!(frame.iter().all(|v| v.is_finite()));
         out.extend(frame);
     }
     out
 }
-struct Inputs {
-    render: Vec<f32>,
-    echo: Vec<f32>,
-    near: Vec<f32>,
-    noise: Vec<f32>,
-    mixed: Vec<f32>,
-}
-impl Inputs {
-    fn new() -> Self {
-        let far = speech("librispeech_mr_quilter.wav", 0.7);
-        let person = speech("fleur_es_sample.wav", 0.5);
-        let count = 60 * 16_000;
-        let render: Vec<f32> = far.iter().copied().cycle().take(count).collect();
-        let near: Vec<f32> = person.iter().copied().cycle().take(count).collect();
-        let mut echo = vec![0.0; count];
-        for (delay_ms, gain_db) in [(60, -6.0), (75, -14.0), (95, -20.0)] {
-            let delay = delay_ms * 16;
-            let gain = 10f32.powf(gain_db / 20.0);
-            for i in delay..count {
-                echo[i] += render[i - delay] * gain;
-            }
-        }
-        let mut rng = 0x12345678_u32;
-        let noise: Vec<f32> = (0..count)
-            .map(|_| {
-                rng ^= rng << 13;
-                rng ^= rng >> 17;
-                rng ^= rng << 5;
-                (rng as f64 / u32::MAX as f64 * 2.0 - 1.0) as f32 * 0.01
-            })
-            .collect();
-        // 0–20s: echo alone; 20–40s: double-talk + noise; 40–60s: echo + noise.
-        let mixed = (0..count)
-            .map(|i| {
-                echo[i]
-                    + if i >= 20 * 16_000 { noise[i] } else { 0.0 }
-                    + if (20 * 16_000..40 * 16_000).contains(&i) {
-                        near[i]
-                    } else {
-                        0.0
-                    }
-            })
-            .collect();
-        Self {
-            render,
-            echo,
-            near,
-            noise,
-            mixed,
-        }
-    }
-}
-fn delay(input: &[f32], output: &[f32]) -> f64 {
-    // Peak normalized cross-correlation of a near-only speech probe, after 10 s warmup.
-    let start = 10 * 16_000;
-    let end = 20 * 16_000;
-    let lag = (0..=320)
-        .max_by(|&a, &b| {
-            let score = |lag| {
-                let x = &input[start..end];
-                let y = &output[start + lag..end + lag];
-                let dot: f64 = x
-                    .iter()
-                    .zip(y)
-                    .map(|(x, y)| f64::from(*x) * f64::from(*y))
-                    .sum();
-                dot / (energy(x) * energy(y)).sqrt().max(1e-30)
-            };
-            score(a).total_cmp(&score(b))
-        })
-        .unwrap();
-    lag as f64 / 16.0
-}
-struct Metrics {
+struct Acoustics {
     erle: f64,
-    latency: f64,
-    cpu: f64,
+    buffering: usize,
+    hpf_delay: [f64; 4],
+    near: Quality,
+    double: Quality,
+    near_clean: Quality,
+    double_clean: Quality,
+    noise_attenuation: f64,
 }
-fn measure<E: Engine>(name: &str, new: impl Fn() -> E, input: &Inputs) -> Metrics {
-    let output = process(new(), &input.render, &input.mixed);
+fn acoustic(kind: Kind, input: &Inputs) -> Acoustics {
+    // Match the full pipeline against its own isolated HPF on a broadband probe.
+    // HPF phase is present in both paths and is not mistaken for buffering.
+    let probe = white_noise(16 * RATE, 0.1);
+    let zero = vec![0.0; probe.len()];
+    let reference = process(kind.hpf(), &zero, &probe);
+    let output = process(kind.full(), &zero, &probe);
+    let lags: Vec<_> = [10, 12, 14]
+        .into_iter()
+        .map(|sec| lag(&reference, &output, sec * RATE, RATE))
+        .collect();
+    println!(
+        "{} phase-matched broadband lag/correlation (10/12/14 s): {:?}",
+        kind.name(),
+        lags
+    );
+    let buffering = lags[0].0;
+    assert!(
+        lags.iter()
+            .all(|&(lag, corr)| lag == buffering && corr > 0.8),
+        "unstable/uncorrelated buffering probe"
+    );
+    assert!(buffering < 320, "buffering search hit its boundary");
+
+    let mut impulse = vec![0.0; RATE];
+    impulse[0] = 0.125;
+    let hpf_ir = process(kind.hpf(), &vec![0.0; RATE], &impulse);
+    let hpf_delay = [100.0, 300.0, 1000.0, 3000.0].map(|hz| group_delay(&hpf_ir, hz));
+    let output = process(kind.full(), &input.render, &input.mixed);
     let erle =
-        db(energy(&input.echo[10 * 16_000..20 * 16_000])
-            / energy(&output[10 * 16_000..20 * 16_000]));
-    let zero = vec![0.0; input.render.len()];
-    let near = process(new(), &zero, &input.near);
-    let noise = process(new(), &zero, &input.noise);
-    let latency = delay(&input.near, &near);
-    let gain = db(energy(&near[10 * 16_000..]) / energy(&input.near[10 * 16_000..]));
-    let ns = db(energy(&input.noise[10 * 16_000..]) / energy(&noise[10 * 16_000..]));
-    let mut cpu = vec![];
-    let mut wall = vec![];
-    // Each repetition starts fresh and sees the same samples. Creation and I/O are excluded.
-    for _ in 0..9 {
-        let mut engine = new();
-        let start_cpu = ThreadTime::now();
-        let start_wall = Instant::now();
-        for (r, c) in input
-            .render
-            .as_chunks::<FRAME>()
-            .0
-            .iter()
-            .zip(input.mixed.as_chunks::<FRAME>().0)
-        {
-            let mut frame = *c;
-            engine.frame(black_box(r), black_box(&mut frame));
-            black_box(frame);
-        }
-        let count = (input.mixed.len() / FRAME) as f64;
-        wall.push(start_wall.elapsed().as_secs_f64() * 1e6 / count);
-        cpu.push(start_cpu.elapsed().as_secs_f64() * 1e6 / count);
-    }
-    cpu.sort_by(f64::total_cmp);
-    wall.sort_by(f64::total_cmp);
-    println!("| {name} | {erle:.3} | {latency:.3} | {:.3} | {:.3} | {:.3} | {ns:.3} | {gain:.3} | {:.3} |", cpu[4], cpu[0], cpu[8], rms_db(&output[20*16_000..40*16_000]));
-    eprintln!("{name}: wall mean us/frame median={:.3}; range {:.3}..{:.3}; echo-only residual {:.3} dBFS", wall[4], wall[0], wall[8], rms_db(&output[10*16_000..20*16_000]));
-    Metrics {
+        db(energy(&input.echo[10 * RATE..20 * RATE]) / energy(&output[10 * RATE..20 * RATE]));
+    let zero = vec![0.0; input.near.len()];
+    let near = process(kind.full(), &zero, &input.near);
+    let filtered_near = process(kind.hpf(), &zero, &input.near);
+    // Preserve the actual near-end onset at 20 s in the double-talk reference.
+    let gated: Vec<f32> = input
+        .near
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| {
+            if (20 * RATE..40 * RATE).contains(&i) {
+                v
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let filtered_double = process(kind.hpf(), &zero, &gated);
+    let score = |reference: &[f32], output: &[f32], start: usize, end: usize| {
+        quality(
+            &reference[start * RATE..end * RATE],
+            &output[start * RATE + buffering..end * RATE + buffering],
+        )
+    };
+    let noise = process(kind.full(), &zero, &input.noise);
+    Acoustics {
         erle,
-        latency,
-        cpu: cpu[4],
+        buffering,
+        hpf_delay,
+        near: score(&filtered_near, &near, 10, 20),
+        double: score(&filtered_double, &output, 20, 40),
+        near_clean: score(&input.near, &near, 10, 20),
+        double_clean: score(&gated, &output, 20, 40),
+        noise_attenuation: db(energy(&input.noise[10 * RATE..]) / energy(&noise[10 * RATE..])),
     }
+}
+
+fn timed(kind: Kind, input: &Inputs) -> (f64, f64) {
+    let mut engine = kind.full();
+    let render = input.render.as_chunks::<FRAME>().0;
+    let mic = input.mixed.as_chunks::<FRAME>().0;
+    // Process seconds 0–10 with this same instance before either timer starts.
+    let warmup = 10 * RATE / FRAME;
+    for (r, c) in render[..warmup].iter().zip(&mic[..warmup]) {
+        let mut frame = *c;
+        engine.frame(r, &mut frame);
+        black_box(frame);
+    }
+    let cpu = ThreadTime::now();
+    let wall = Instant::now();
+    for (r, c) in render[warmup..].iter().zip(&mic[warmup..]) {
+        let mut frame = *c;
+        engine.frame(black_box(r), black_box(&mut frame));
+        black_box(frame);
+    }
+    let elapsed_wall = wall.elapsed().as_secs_f64();
+    let elapsed_cpu = cpu.elapsed().as_secs_f64();
+    let frames = (mic.len() - warmup) as f64;
+    (elapsed_cpu * 1e6 / frames, elapsed_wall * 1e6 / frames)
+}
+fn row(label: &str, a: f64, b: f64) {
+    println!("| {label} | {a:.3} | {b:.3} |");
 }
 fn main() {
     let input = Inputs::new();
-    // Also exercise the actual adapter's reset path before measurements.
-    EchoCanceller::new().unwrap().reinitialize();
-    println!("| Engine | ERLE dB | Added signal delay ms | CPU us/10ms | CPU min | CPU max | Noise attenuation dB | Near-only gain dB | Double-talk output dBFS |");
-    println!("|---|---:|---:|---:|---:|---:|---:|---:|---:|");
-    let cpp = measure("C++ 2.1.0", cpp, &input);
-    let sonora = measure("Sonora 0.2.0", || EchoCanceller::new().unwrap(), &input);
-    let matches = (sonora.erle - cpp.erle).abs() <= 1.0
-        && sonora.latency <= cpp.latency * 1.1
-        && sonora.cpu <= cpp.cpu * 1.1;
-    println!(
-        "\n{}: ERLE delta {:+.3} dB; delay {:.3} -> {:.3} ms; CPU {:+.1}%.",
-        if matches { "MATCH" } else { "DIFFERS" },
-        sonora.erle - cpp.erle,
-        cpp.latency,
-        sonora.latency,
-        100.0 * (sonora.cpu / cpp.cpu - 1.0)
+    native::EchoCanceller::new().unwrap().reinitialize();
+    let cpp = acoustic(Kind::Cpp, &input);
+    let sonora = acoustic(Kind::Sonora, &input);
+    let mut cpu: [Vec<f64>; 2] = std::array::from_fn(|_| Vec::new());
+    let mut wall: [Vec<f64>; 2] = std::array::from_fn(|_| Vec::new());
+    println!("\n| Iteration | First engine | C++ CPU us/frame | Sonora CPU us/frame |\n|---|---|---:|---:|");
+    for iteration in 0..12 {
+        let order = if iteration % 2 == 0 {
+            [Kind::Cpp, Kind::Sonora]
+        } else {
+            [Kind::Sonora, Kind::Cpp]
+        };
+        for kind in order {
+            let index = match kind {
+                Kind::Cpp => 0,
+                Kind::Sonora => 1,
+            };
+            let (c, w) = timed(kind, &input);
+            cpu[index].push(c);
+            wall[index].push(w);
+        }
+        println!(
+            "| {} | {} | {:.3} | {:.3} |",
+            iteration + 1,
+            order[0].name(),
+            cpu[0][iteration],
+            cpu[1][iteration]
+        );
+    }
+    for values in cpu.iter_mut().chain(wall.iter_mut()) {
+        values.sort_by(f64::total_cmp);
+    }
+    let cpu_median = cpu.each_ref().map(|v| quantile(v, 0.5));
+    println!("\n| Metric | C++ 2.1.0 | Sonora 0.2.0 |\n|---|---:|---:|");
+    row("Full-pipeline ERLE dB", cpp.erle, sonora.erle);
+    row(
+        "Buffering delay ms (HPF phase matched)",
+        cpp.buffering as f64 / 16.0,
+        sonora.buffering as f64 / 16.0,
     );
+    for (i, hz) in [100, 300, 1000, 3000].iter().enumerate() {
+        row(
+            &format!("HPF group delay ms at {hz} Hz"),
+            cpp.hpf_delay[i],
+            sonora.hpf_delay[i],
+        );
+    }
+    row(
+        "Near-only SI-SDR dB (HPF reference)",
+        cpp.near.si_sdr,
+        sonora.near.si_sdr,
+    );
+    row(
+        "Double-talk SI-SDR dB (HPF reference)",
+        cpp.double.si_sdr,
+        sonora.double.si_sdr,
+    );
+    row(
+        "Near-only SNR dB (HPF reference, no gain fit)",
+        cpp.near.snr,
+        sonora.near.snr,
+    );
+    row(
+        "Double-talk SNR dB (HPF reference, no gain fit)",
+        cpp.double.snr,
+        sonora.double.snr,
+    );
+    row(
+        "Near-only projected gain dB",
+        cpp.near.gain,
+        sonora.near.gain,
+    );
+    row(
+        "Double-talk projected gain dB",
+        cpp.double.gain,
+        sonora.double.gain,
+    );
+    row(
+        "Near-only SI-SDR dB (unfiltered reference)",
+        cpp.near_clean.si_sdr,
+        sonora.near_clean.si_sdr,
+    );
+    row(
+        "Double-talk SI-SDR dB (unfiltered reference)",
+        cpp.double_clean.si_sdr,
+        sonora.double_clean.si_sdr,
+    );
+    row(
+        "Noise-only attenuation dB",
+        cpp.noise_attenuation,
+        sonora.noise_attenuation,
+    );
+    for (label, p) in [
+        ("CPU min us/10ms", 0.0),
+        ("CPU Q1 us/10ms", 0.25),
+        ("CPU median us/10ms", 0.5),
+        ("CPU Q3 us/10ms", 0.75),
+        ("CPU max us/10ms", 1.0),
+    ] {
+        row(label, quantile(&cpu[0], p), quantile(&cpu[1], p));
+    }
+    row(
+        "Wall median us/10ms",
+        quantile(&wall[0], 0.5),
+        quantile(&wall[1], 0.5),
+    );
+    let overlap = cpu[0][0].max(cpu[1][0]) <= cpu[0][11].min(cpu[1][11]);
+    println!(
+        "\nCPU min/max ranges overlap: **{}**.",
+        if overlap { "yes" } else { "no" }
+    );
+    let matches = (sonora.erle - cpp.erle).abs() <= 1.0
+        && sonora.buffering as f64 <= cpp.buffering as f64 * 1.1
+        && cpu_median[1] <= cpu_median[0] * 1.1;
+    println!("\n**{}**: ERLE delta {:+.3} dB; buffering {:+.1}%; CPU {:+.1}%. HPF group delay is frequency dependent and reported separately.",
+        if matches {"MATCH"} else {"DIFFERS"},sonora.erle-cpp.erle,
+        100.0*(sonora.buffering as f64/cpp.buffering as f64-1.0),100.0*(cpu_median[1]/cpu_median[0]-1.0));
 }

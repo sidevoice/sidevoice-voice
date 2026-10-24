@@ -72,10 +72,15 @@ fn the_person_is_kept_while_the_reply_plays() {
     for (slot, sample) in mic[start..].iter_mut().zip(&person) {
         *slot += sample;
     }
-    let both = cancel(&mut EchoCanceller::with(false), &reply, &mic);
-    let alone = cancel(&mut EchoCanceller::with(false), &reply, &echo);
-    let over = db(energy(&both[start..]) / energy(&alone[start..]).max(1e-12));
-    assert!(over > 10.0, "the person {over:.1} dB above the echo left");
+    for cleanup in [false, true] {
+        let both = cancel(&mut EchoCanceller::with(cleanup), &reply, &mic);
+        let alone = cancel(&mut EchoCanceller::with(cleanup), &reply, &echo);
+        let over = db(energy(&both[start..]) / energy(&alone[start..]).max(1e-12));
+        assert!(
+            over > 10.0,
+            "the person {over:.1} dB above the echo left, cleanup={cleanup}"
+        );
+    }
 }
 
 #[test]
