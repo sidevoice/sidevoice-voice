@@ -31,6 +31,12 @@ runs:
     - if: runner.os == 'macOS'
       shell: bash
       run: brew install meson ninja pkg-config
+    # Windows: meson and ninja from PyPI, and the LLVM the runner ships for bindgen's libclang. MSVC is on the runner.
+    - if: runner.os == 'Windows'
+      shell: bash
+      run: |
+        pip install meson ninja
+        echo "LIBCLANG_PATH=C:\\Program Files\\LLVM\\bin" >> "$GITHUB_ENV"
     - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       with:
         key: ${{ inputs.wasm == 'true' && 'wasm' || '' }}
