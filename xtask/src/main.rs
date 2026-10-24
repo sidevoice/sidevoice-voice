@@ -2,6 +2,7 @@
 //! `cargo`, `wasm-bindgen`, `npm`, `node` and `gh` from the `PATH`. The wasm32 tests need no xtask: `cargo test
 //! --target wasm32-unknown-unknown --lib` (its runner is set in `.cargo/config.toml`).
 //!
+//! - `audio-comparison`: validate and run the optional C++/Sonora comparison on this host.
 //! - `npm`: the npm package `@sidevoice/voice` packed into `target/npm/` (xtask/src/npm.rs).
 //! - `npm-smoke`: that tarball installed as a consumer installs it, and a call run in Node on fake models and a
 //!   fake microphone and speaker.
@@ -10,6 +11,7 @@
 //! - `publish DIR TAG`: DIR attached to the GitHub Release TAG, read back, verified, and the Release published.
 //! - `npm-publish TAG`: the tarball of the Release TAG (a `vX.Y.Z`), verified, staged on npm for the operator to approve.
 
+mod comparison;
 mod npm;
 mod release;
 
@@ -22,12 +24,13 @@ use sha2::{Digest, Sha256};
 type Result<T> = std::result::Result<T, String>;
 
 const USAGE: &str =
-    "usage: cargo xtask npm | npm-smoke | manifest DIR [--tag vX.Y.Z] | publish DIR TAG | npm-publish TAG";
+    "usage: cargo xtask audio-comparison | npm | npm-smoke | manifest DIR [--tag vX.Y.Z] | publish DIR TAG | npm-publish TAG";
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let result = match args.as_slice() {
+        ["audio-comparison"] => comparison::run(),
         ["npm"] => npm::package(),
         ["npm-smoke"] => npm::smoke(),
         ["manifest", dir] => release::manifest(Path::new(dir), None),
