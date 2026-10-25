@@ -34,10 +34,14 @@ fn scans_multiline_cfgs_and_apis_but_ignores_literals_and_wasm() {
 }
 
 #[test]
-fn debt_allows_existing_or_lower_counts_but_rejects_growth_and_new_files() {
-    let debt = BTreeMap::from([("old.rs".into(), 2), ("removed.rs".into(), 1)]);
+fn debt_requires_exact_counts_and_rejects_growth_new_files_or_unused_allowance() {
+    let debt = BTreeMap::from([("old.rs".into(), 2)]);
     assert!(compare(&BTreeMap::from([("old.rs".into(), 2)]), &debt).is_empty());
-    assert!(compare(&BTreeMap::from([("old.rs".into(), 1)]), &debt).is_empty());
+    assert_eq!(
+        compare(&BTreeMap::from([("old.rs".into(), 1)]), &debt).len(),
+        1
+    );
+    assert_eq!(compare(&BTreeMap::new(), &debt).len(), 1);
     let errors = compare(
         &BTreeMap::from([("old.rs".into(), 3), ("new.rs".into(), 1)]),
         &debt,

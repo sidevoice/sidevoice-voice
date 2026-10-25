@@ -136,7 +136,7 @@ fn compare(actual: &BTreeMap<String, usize>, debt: &BTreeMap<String, usize>) -> 
     for (path, cap) in debt {
         let count = actual.get(path).copied().unwrap_or(0);
         if count < *cap {
-            println!("hint: lower platform-debt.txt entry for {path} from {cap} to {count} (remove it at zero)");
+            errors.push(format!("lower platform-debt.txt entry for {path} from {cap} to {count} (remove it at zero); freed allowance cannot be reused"));
         }
     }
     errors
