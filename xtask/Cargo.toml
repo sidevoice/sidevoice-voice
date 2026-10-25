@@ -11,3 +11,6 @@ serde_json = "1"
 sha2 = "0.10"
 # npm names a tarball by its SHA-1 (`shasum`), which `npm-publish` compares with a staged version's.
 sha1 = "0.10"
+# Token scanning excludes comments and literal contents from the platform boundary check.
+proc-macro2 = "1"
+syn = { version = "2", default-features = false, features = ["full", "parsing"] }

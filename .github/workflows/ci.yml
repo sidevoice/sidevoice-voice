@@ -32,6 +32,7 @@ jobs:
       - uses: ./.github/actions/setup
         with:
           wasm: true
+      - run: cargo xtask platform-guard
       - run: cargo fmt --check
       - run: cargo fmt --manifest-path xtask/Cargo.toml --check
       - run: cargo clippy --locked --all-targets -- -D warnings
