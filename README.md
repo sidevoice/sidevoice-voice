@@ -262,13 +262,13 @@ The browser adapter flattens the serialized Rust stop reason in both `done` and 
 
 The call cancels the echo of its own playback, never relying on the operating system's (sidevoice-core#89).
 
-- **Natively** (`NativeIo`, `src/io/native.rs`), WebRTC's AEC3 (`webrtc-audio-processing`, its C++ built with the
-  crate). The microphone's samples go to mono, to 16 kHz and into 10 ms frames, and each frame passes AEC3 before
+- **Natively** (`NativeIo`, `src/io/native.rs`), WebRTC's AEC3 through [Sonora](https://github.com/dignifiedquire/sonora),
+  a pure-Rust pipeline on macOS, Linux and Windows. The microphone's samples go to mono, to 16 kHz and into 10 ms frames, and each frame passes AEC3 before
   the detector. The reference is the playback itself, taken at the moment the speaker's callback takes it (the same
   moment that moves the heard position), at the speaker's rate, to 16 kHz. Capture and reference go in step; AEC3
   estimates the delay left between them (the output buffer, the room, the input buffer). The same processing applies
   the high-pass filter, moderate noise suppression and the adaptive digital gain, as the browser does with its
-  constraints. The devices' callbacks only move samples through lock-free rings; the C++ runs on the module's audio
+  constraints. The devices' callbacks only move samples through lock-free rings; the processing runs on the module's audio
   thread, never in a callback. A device that changes under a stream starts the canceller over; a chosen one that goes
   away gives way to the default one (said once, as `lost`, with the next list); the default one going away stops the
   call with `audio-device-unavailable`.
@@ -276,7 +276,8 @@ The call cancels the echo of its own playback, never relying on the operating sy
   `echoCancellation`; a track explicitly reporting it disabled is rejected before capture starts. The browser uses
   its rendered speaker output as the AEC reference. The playback worklet reports rendered level only; it never
   decides speech. No canceller is linked into the wasm32 build, so audio is never processed twice.
-- **Windows** is out of the beta: the canceller's C++ does not build there yet.
+The reproducible [comparison harness](tools/audio-comparison/README.md) keeps the former C++ engine outside
+the product build for measuring echo attenuation, latency and CPU against Sonora.
 
 ## What the call does
 
@@ -328,7 +329,7 @@ The call knows nothing of the room; the app translates both ways.
 ## Status
 
 The state machine and its task, on the app's models through the module's interfaces, natively and in the browser.
-The device's microphone and speaker natively, with AEC3 (macOS and Linux). The browser's microphone and speaker
+The device's microphone and speaker natively, with AEC3 (macOS, Linux and Windows). The browser's microphone and speaker
 (`getUserMedia` and Web Audio) and the npm package `@sidevoice/voice`, built and smoke-tested on every pull request
 and released with release-please (RELEASING.md); whether a chosen output device stays in the browser's echo canceller
 is still to be checked per browser (sidevoice-core#89).
@@ -381,8 +382,8 @@ xtask/          the build tooling, `cargo xtask`: the npm package, its smoke tes
 ## Build and test
 
 You need Rust 1.98.1 (the version `.github/actions/setup` installs). The module links no model runtime. Natively,
-WebRTC's audio processing needs meson, ninja and pkg-config, and cpal needs ALSA's development files on Linux
-(`libasound2-dev`); the wasm32 build links no canceller.
+Sonora's audio processing is pure Rust; cpal needs pkg-config and ALSA's development files on Linux
+(`libasound2-dev`). No C++ audio-processing toolchain is needed. The wasm32 build links no canceller.
 
 The tests drive the state machine with the recorded clips of `tests/fixtures` and a detector on energy, and the task
 with fake models (a fake end-of-turn classifier among them) and a fake microphone and speaker; nothing is downloaded.

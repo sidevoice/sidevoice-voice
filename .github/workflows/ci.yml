@@ -1,6 +1,6 @@
 name: ci
 
-# Every pull request: format and Clippy (native and wasm32, and the build tooling), the tests on macOS and Linux and
+# Every pull request: format and Clippy (native and wasm32, and the build tooling), the tests on macOS, Linux, Windows and
 # on wasm32 in Node (the call on recorded speech, with fake models; real models run in the apps' CI, which wire them
 # in), and the npm package `@sidevoice/voice` built and installed as a consumer installs it (`cargo xtask npm`,
 # `npm-smoke`), publishing nothing: what passes here is what merging publishes (release.yml).
@@ -9,16 +9,22 @@ on:
   pull_request:
   # release-please.yml dispatches it on the release PR, whose pushes start no workflow.
   workflow_dispatch:
+    inputs:
+      comparison:
+        description: Run the optional C++/Sonora comparison on Linux and macOS instead of product CI
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
+  group: ci-${{ github.event.pull_request.number || github.ref }}-${{ inputs.comparison || false }}
   cancel-in-progress: true
 
 jobs:
   lint:
+    if: ${{ !inputs.comparison }}
     name: Lint
     runs-on: ubuntu-24.04
     steps:
@@ -33,6 +39,7 @@ jobs:
       - run: cargo clippy --locked --manifest-path xtask/Cargo.toml --all-targets -- -D warnings
 
   test-native:
+    if: ${{ !inputs.comparison }}
     name: Test native (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -41,12 +48,14 @@ jobs:
         include:
           - { target: macos-aarch64, runner: macos-15 }
           - { target: linux-x86_64, runner: ubuntu-24.04 }
+          - { target: windows-x86_64, runner: windows-2025 }
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: ./.github/actions/setup
       - run: cargo test --locked
 
   test-wasm:
+    if: ${{ !inputs.comparison }}
     name: Test wasm (Node, npm package)
     runs-on: ubuntu-24.04
     steps:
@@ -73,3 +82,31 @@ jobs:
           retention-days: 7
           if-no-files-found: error
           overwrite: true
+
+  audio-comparison:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.comparison }}
+    name: Audio comparison (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, macos-15]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: ./.github/actions/setup
+      # Only this opt-in comparison links C++; product setup remains Rust-only for processing.
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq build-essential meson ninja-build pkg-config libclang-dev
+      - if: runner.os == 'macOS'
+        run: brew install meson ninja pkg-config llvm
+      - if: runner.os == 'macOS'
+        run: echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
+      - run: rustup component add llvm-tools
+      - name: Validate and compare
+        shell: bash
+        run: cargo xtask audio-comparison | tee comparison.md
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: audio-comparison-${{ matrix.runner }}-${{ github.sha }}
+          path: comparison.md
+          if-no-files-found: error
