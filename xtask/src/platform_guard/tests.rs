@@ -38,3 +38,25 @@ fn grouped_and_renamed_imports_keep_the_original_os_names() {
     let source = "use std::{os::unix::fs::MetadataExt}; use std::os as host_os; use libc as c; use {rustix as r, windows_sys as w, windows as win, objc2 as o, core_foundation as cf, coreaudio as ca}; use std::{fs, path::Path};";
     assert_eq!(occurrences(source.parse().unwrap(), &BTreeSet::new()), 9);
 }
+
+#[test]
+fn os_alias_definitions_fail_while_wasm_and_native_aliases_pass() {
+    let source = r#"
+        cfg_aliases! {
+            review_os: { target_os = "windows" },
+            posix: { unix },
+            win: { windows },
+            family: { target_family = "unix" },
+            web: { target_arch = "wasm32" },
+            native: { not(target_arch = "wasm32") },
+            wasm_family: { target_family = "wasm" },
+        }
+    "#;
+    assert_eq!(occurrences(source.parse().unwrap(), &BTreeSet::new()), 4);
+    let host = r#"cfg_aliases! {
+        web: { target_arch = "wasm32" },
+        native: { not(target_arch = "wasm32") },
+        wasm_family: { target_family = "wasm" },
+    }"#;
+    assert_eq!(occurrences(host.parse().unwrap(), &BTreeSet::new()), 0);
+}

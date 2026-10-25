@@ -72,7 +72,7 @@ fn colon(token: Option<&TokenTree>) -> bool {
     matches!(token, Some(TokenTree::Punct(value)) if value.as_char() == ':')
 }
 
-/// One occurrence per OS-sensitive cfg/cfg_attr/cfg! invocation or OS API path/identifier.
+/// One occurrence per OS-sensitive cfg invocation, cfg_aliases definition or OS API path/identifier.
 /// Tokenization ignores comments and literal contents, and handles multiline attributes.
 fn occurrences(stream: TokenStream, aliases: &BTreeSet<String>) -> usize {
     let tokens: Vec<_> = stream.into_iter().collect();
@@ -97,6 +97,18 @@ fn occurrences(stream: TokenStream, aliases: &BTreeSet<String>) -> usize {
         }
         if let TokenTree::Group(group) = token {
             count += occurrences(group.stream(), aliases);
+        }
+        if ident(Some(token), "cfg_aliases")
+            && matches!(tokens.get(i + 1), Some(TokenTree::Punct(p)) if p.as_char() == '!')
+        {
+            if let Some(TokenTree::Group(group)) = tokens.get(i + 2) {
+                let definitions: Vec<_> = group.stream().into_iter().collect();
+                count += definitions.windows(3).filter(|parts| {
+                    matches!(&parts[0], TokenTree::Ident(_))
+                        && colon(parts.get(1))
+                        && matches!(&parts[2], TokenTree::Group(body) if os_condition(body.stream(), aliases))
+                }).count();
+            }
         }
         if ident(Some(token), "cfg") || ident(Some(token), "cfg_attr") {
             let next = if matches!(tokens.get(i + 1), Some(TokenTree::Punct(p)) if p.as_char() == '!')
