@@ -42,7 +42,7 @@ tooling `cargo xtask` (`xtask/`). The design is sidevoice-core#89.
 - **Names say what a thing is**, by role, never by state.
 - **Unit tests live in `x/tests.rs`** beside their module (`#[cfg(test)] mod tests;`), never inline. Test doubles
   shared between modules are in `src/test_support.rs`, compiled in test builds only.
-- **Platform conditions use the crate's aliases** (`web`, `native`, from `build.rs`), never `target_arch` directly.
+- **Web/native conditions use the crate's aliases** (`web`, `native`, from `build.rs`), never `target_arch` directly.
   A crate-level module's condition goes on its declaration (`#[cfg(web)] mod web;`); a file that only compiles on
   one platform starts with its own `#![cfg(alias)]`, with a comment saying why, and its dependency sits under the
   same platform in `Cargo.toml`. There are no crate features and no central list of platform files.
@@ -58,3 +58,28 @@ tooling `cargo xtask` (`xtask/`). The design is sidevoice-core#89.
 - Logic lives in `cargo xtask`, not in workflow YAML: a workflow sets up the machine and calls one command, which runs
   the same on a laptop.
 - Third-party actions are pinned by commit SHA, with the version in a comment.
+
+## Platform code
+
+Operator rule (2026-10-25). Applies to product code, tests, xtask and build scripts.
+
+- **Only `platform` touches the operating system.** Each crate has one `platform` module. It is the only place with
+  `cfg(target_os | unix | windows | target_family)`, `cfg!` on those, `std::os::*`, `libc`, `rustix`, `windows-sys`,
+  `objc2`/AppKit, OS commands, local sockets/pipes or OS-specific paths. Everything else is host-agnostic.
+- **One file per concern:** `platform/<concern>.rs`. When the behaviour differs per OS, that file declares a
+  documented trait, and its `cfg` picks `platform/<concern>/<os>.rs`, each implementing the trait with the minimum
+  code. The concern file holds only the trait, the shared types and that selection, never an OS body.
+- **An OS that cannot do something still implements the method**, returning a documented fallback (`None`,
+  "unknown", a coarser value) that callers handle. Callers never ask which OS they run on.
+- **Only a value differs** (a folder name, a shortcut label): a plain module with that value is enough, no trait.
+- **Callers import the trait and its type**; no forwarding wrappers or free functions repeating the trait.
+- **Tests are written against the interface** and run on every OS; no per-OS test modules unless it cannot be
+  phrased generically (say why in the PR).
+- **Maintained crates first**; own `unsafe` only where nothing maintained exists, justified in the PR.
+- **Enforced in CI** by its own `platform-boundary` check (next to Clippy's `disallowed-*`): any OS-specific code
+  outside `platform` fails it. It stays red until the existing debt is fixed; there is no allowlist.
+
+Reference: sidevoice-connector `connector/src/platform/user.rs` and `user/{unix,windows}.rs`.
+
+Web (wasm) versus native selection through `web`/`native` and `build.rs` stays outside this OS rule for now;
+its relationship to the platform boundary is an open design question for the operator.
