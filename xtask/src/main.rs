@@ -3,6 +3,7 @@
 //! --target wasm32-unknown-unknown --lib` (its runner is set in `.cargo/config.toml`).
 //!
 //! - `audio-comparison`: validate and run the optional C++/Sonora comparison on this host.
+//! - `platform-guard`: reject new OS-specific code outside platform modules.
 //! - `npm`: the npm package `@sidevoice/voice` packed into `target/npm/` (xtask/src/npm.rs).
 //! - `npm-smoke`: that tarball installed as a consumer installs it, and a call run in Node on fake models and a
 //!   fake microphone and speaker.
@@ -13,6 +14,7 @@
 
 mod comparison;
 mod npm;
+mod platform_guard;
 mod release;
 
 use std::path::{Path, PathBuf};
@@ -24,13 +26,14 @@ use sha2::{Digest, Sha256};
 type Result<T> = std::result::Result<T, String>;
 
 const USAGE: &str =
-    "usage: cargo xtask audio-comparison | npm | npm-smoke | manifest DIR [--tag vX.Y.Z] | publish DIR TAG | npm-publish TAG";
+    "usage: cargo xtask audio-comparison | platform-guard | npm | npm-smoke | manifest DIR [--tag vX.Y.Z] | publish DIR TAG | npm-publish TAG";
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let result = match args.as_slice() {
         ["audio-comparison"] => comparison::run(),
+        ["platform-guard"] => platform_guard::check(),
         ["npm"] => npm::package(),
         ["npm-smoke"] => npm::smoke(),
         ["manifest", dir] => release::manifest(Path::new(dir), None),
