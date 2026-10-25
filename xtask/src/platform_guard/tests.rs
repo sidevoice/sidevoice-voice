@@ -34,37 +34,6 @@ fn scans_multiline_cfgs_and_apis_but_ignores_literals_and_wasm() {
 }
 
 #[test]
-fn debt_requires_exact_counts_and_rejects_growth_new_files_or_unused_allowance() {
-    let debt = BTreeMap::from([("old.rs".into(), 2)]);
-    assert!(compare(&BTreeMap::from([("old.rs".into(), 2)]), &debt).is_empty());
-    assert_eq!(
-        compare(&BTreeMap::from([("old.rs".into(), 1)]), &debt).len(),
-        1
-    );
-    assert_eq!(compare(&BTreeMap::new(), &debt).len(), 1);
-    let errors = compare(
-        &BTreeMap::from([("old.rs".into(), 3), ("new.rs".into(), 1)]),
-        &debt,
-    );
-    assert_eq!(errors.len(), 2);
-}
-
-#[test]
-fn debt_cannot_add_files_or_raise_base_allowances() {
-    let base = BTreeMap::from([("old.rs".into(), 2)]);
-    assert!(shrink_errors(&BTreeMap::from([("old.rs".into(), 1)]), &base).is_empty());
-    assert!(shrink_errors(&base, &base).is_empty());
-    assert_eq!(
-        shrink_errors(
-            &BTreeMap::from([("old.rs".into(), 3), ("new.rs".into(), 0)]),
-            &base
-        )
-        .len(),
-        2
-    );
-}
-
-#[test]
 fn grouped_and_renamed_imports_keep_the_original_os_names() {
     let source = "use std::{os::unix::fs::MetadataExt}; use std::os as host_os; use libc as c; use {rustix as r, windows_sys as w, windows as win, objc2 as o, core_foundation as cf, coreaudio as ca}; use std::{fs, path::Path};";
     assert_eq!(occurrences(source.parse().unwrap(), &BTreeSet::new()), 9);

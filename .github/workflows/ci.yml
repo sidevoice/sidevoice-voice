@@ -23,6 +23,14 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  platform-boundary:
+    name: Platform boundary
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: ./.github/actions/setup
+      - run: cargo xtask platform-guard
+
   lint:
     if: ${{ !inputs.comparison }}
     name: Lint
@@ -32,7 +40,6 @@ jobs:
       - uses: ./.github/actions/setup
         with:
           wasm: true
-      - run: cargo xtask platform-guard
       - run: cargo fmt --check
       - run: cargo fmt --manifest-path xtask/Cargo.toml --check
       - run: cargo clippy --locked --all-targets -- -D warnings

@@ -1,5 +1,5 @@
 //! A token check, not a Rust type checker: every cfg branch is inspected, on every host.
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use proc_macro2::{Delimiter, TokenStream, TokenTree};
@@ -8,36 +8,6 @@ use crate::{read, repo, run_in, Result};
 
 pub fn check() -> Result<()> {
     let root = repo();
-    let text = String::from_utf8(read(&root.join("platform-debt.txt"))?)
-        .map_err(|error| error.to_string())?;
-    let debt = parse_debt(&text)?;
-    if std::env::var_os("CI").is_some() {
-        let base = std::env::var("GITHUB_BASE_REF")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "main".into());
-        run_in(&root, "git fetch --no-tags origin", &[&base])?;
-        let reference = format!("origin/{base}");
-        let tree = run_in(
-            &root,
-            "git ls-tree --name-only",
-            &[&reference, "--", "platform-debt.txt"],
-        )?;
-        let baseline = if tree.trim().is_empty() {
-            // Bootstrap: before this check lands, base has no allowances.
-            BTreeMap::new()
-        } else {
-            parse_debt(&run_in(
-                &root,
-                "git show",
-                &[&format!("{reference}:platform-debt.txt")],
-            )?)?
-        };
-        let errors = shrink_errors(&debt, &baseline);
-        if !errors.is_empty() {
-            return Err(errors.join("\n"));
-        }
-    }
     // Include untracked sources locally too; ignored build output is never scanned.
     let files = run_in(
         &root,
@@ -67,7 +37,7 @@ pub fn check() -> Result<()> {
             break;
         }
     }
-    let mut actual = BTreeMap::new();
+    let mut errors = Vec::new();
     for path in files.split('\0').filter(|path| !path.is_empty()) {
         if exempt(Path::new(path)) || !path.ends_with(".rs") {
             continue;
@@ -77,69 +47,21 @@ pub fn check() -> Result<()> {
         let tokens: TokenStream = source.parse().map_err(|error| format!("{path}: {error}"))?;
         let count = occurrences(tokens, &aliases);
         if count > 0 {
-            actual.insert(path.to_owned(), count);
+            errors.push(format!(
+                "{path}: {count} OS-specific occurrences; move OS code into platform"
+            ));
         }
     }
-    let errors = compare(&actual, &debt);
     if !errors.is_empty() {
         return Err(errors.join("\n"));
     }
-    println!(
-        "platform boundary: {} occurrences in {} debt files",
-        actual.values().sum::<usize>(),
-        actual.len()
-    );
+    println!("platform boundary: no OS-specific code outside platform");
     Ok(())
-}
-
-fn parse_debt(text: &str) -> Result<BTreeMap<String, usize>> {
-    let mut debt = BTreeMap::new();
-    for line in text
-        .lines()
-        .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
-    {
-        let (path, count) = line
-            .split_once(' ')
-            .ok_or("invalid platform-debt.txt entry")?;
-        let count: usize = count.parse().map_err(|_| "invalid platform debt count")?;
-        if debt.insert(path.to_owned(), count).is_some() {
-            return Err(format!("duplicate platform debt: {path}"));
-        }
-    }
-    Ok(debt)
-}
-
-fn shrink_errors(debt: &BTreeMap<String, usize>, base: &BTreeMap<String, usize>) -> Vec<String> {
-    debt.iter()
-        .filter(|(path, count)| base.get(*path).is_none_or(|cap| *count > cap))
-        .map(|(path, count)| {
-            format!("platform-debt.txt: {path} allowance {count} is new or higher than base")
-        })
-        .collect()
 }
 
 fn exempt(path: &Path) -> bool {
     path.file_name().is_some_and(|name| name == "platform.rs")
         || path.components().any(|part| part.as_os_str() == "platform")
-}
-
-fn compare(actual: &BTreeMap<String, usize>, debt: &BTreeMap<String, usize>) -> Vec<String> {
-    let mut errors = Vec::new();
-    for (path, count) in actual {
-        let cap = debt.get(path).copied().unwrap_or(0);
-        if *count > cap {
-            errors.push(format!(
-                "{path}: {count} occurrences (debt limit {cap}); move OS code into platform"
-            ));
-        }
-    }
-    for (path, cap) in debt {
-        let count = actual.get(path).copied().unwrap_or(0);
-        if count < *cap {
-            errors.push(format!("lower platform-debt.txt entry for {path} from {cap} to {count} (remove it at zero); freed allowance cannot be reused"));
-        }
-    }
-    errors
 }
 
 fn ident(token: Option<&TokenTree>, name: &str) -> bool {
