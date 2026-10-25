@@ -76,8 +76,8 @@ Operator rule (2026-10-25). Applies to product code, tests, xtask and build scri
 - **Tests are written against the interface** and run on every OS; no per-OS test modules unless it cannot be
   phrased generically (say why in the PR).
 - **Maintained crates first**; own `unsafe` only where nothing maintained exists, justified in the PR.
-- **Enforced in CI**: new OS-specific code outside `platform` fails the build. Existing debt is listed in the
-  repository's `platform-debt.txt` file, which may only shrink.
+- **Enforced in CI** by its own `platform-boundary` check (next to Clippy's `disallowed-*`): any OS-specific code
+  outside `platform` fails it. It stays red until the existing debt is fixed; there is no allowlist.
 
 Reference: sidevoice-connector `connector/src/platform/user.rs` and `user/{unix,windows}.rs`.
 
