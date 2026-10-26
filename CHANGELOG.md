@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.7.4](https://github.com/sidevoice/sidevoice-voice/compare/v0.7.3...v0.7.4) (2026-10-26)
+
+
+### Bug Fixes
+
+* replace native C++ audio processing with Sonora ([#78](https://github.com/sidevoice/sidevoice-voice/issues/78)) ([5eb998f](https://github.com/sidevoice/sidevoice-voice/commit/5eb998f4f5437887cb47b108b328de0bf62991de))
+* **xtask:** describe the comparison host through the platform module ([#83](https://github.com/sidevoice/sidevoice-voice/issues/83)) ([0eb2ac7](https://github.com/sidevoice/sidevoice-voice/commit/0eb2ac7f95730a45ec4ffac669c1662bcd1bed38))
+
 ## [0.7.3](https://github.com/sidevoice/sidevoice-voice/compare/v0.7.2...v0.7.3) (2026-10-21)
 
 
