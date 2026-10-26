@@ -8,7 +8,8 @@
 //!   `cfg!`, or a `cfg_aliases!` definition of one, and every use of such an alias;
 //! - any name bound to an OS path by `use`/`extern crate` (`use libc as sys;` makes `sys::…` OS code);
 //! - a `Command::new("<program>")` of a program that exists on one OS only (shells, `uname`, `launchctl`…), or a
-//!   call of a function wrapping `Command` with such a command line (`sh("uname -a")`);
+//!   call of a function whose parameter becomes that program (`sh("uname -a")`), followed through locals, wrappers
+//!   and import aliases, and only through the parameter that reaches the program;
 //! - the Cargo OS variables (`CARGO_CFG_TARGET_OS`…) read by a build script.
 //!
 //! Inside `platform` the OS is allowed, but the root (`platform.rs`, or `platform/mod.rs`) carries no OS
@@ -311,8 +312,9 @@ struct Shared {
     cfg_aliases: HashSet<String>,
     /// Types that wrap a process `Command` (`struct Cmd { command: Command }`, `type Run = Command`).
     command_types: HashSet<String>,
-    /// Functions that run a command line given as text (`fn sh(words: &str)` around `Command::new`).
-    command_fns: HashSet<String>,
+    /// Functions that run a command whose program is one of their parameters (`fn sh(words: &str)` around
+    /// `Command::new`), by name and the indexes of those parameters.
+    command_fns: HashMap<String, BTreeSet<usize>>,
 }
 
 fn is_command_type(name: &str, shared: &Shared) -> bool {
@@ -380,12 +382,80 @@ fn first_string(stream: TokenStream) -> Option<String> {
     }
 }
 
-/// The first string literal among the arguments of a call: the command line of `sh("uname -a")`.
-fn command_line(args: &TokenStream) -> Option<String> {
-    args.clone().into_iter().find_map(|tree| match tree {
-        TokenTree::Literal(lit) => string_value(&lit),
-        _ => None,
+/// The arguments of a call, split at its top-level commas.
+fn call_args(args: &TokenStream) -> Vec<Vec<TokenTree>> {
+    flat(args.clone())
+        .split(|tree| punct(Some(tree), ','))
+        .map(<[TokenTree]>::to_vec)
+        .collect()
+}
+
+/// Whether any identifier, at any depth, is one of `names`.
+fn mentions(trees: &[TokenTree], names: &HashSet<String>) -> bool {
+    trees.iter().any(|tree| match tree {
+        TokenTree::Ident(_) => ident(tree).is_some_and(|name| names.contains(&name)),
+        TokenTree::Group(g) => mentions(&flat(g.stream()), names),
+        _ => false,
     })
+}
+
+/// Grows `tainted` with every local bound or assigned from an expression that mentions a tainted name
+/// (`let program = match words.next() { .. };`, `program = words;`).
+fn propagate(trees: &[TokenTree], tainted: &mut HashSet<String>) {
+    for (i, tree) in trees.iter().enumerate() {
+        if let TokenTree::Group(g) = tree {
+            propagate(&flat(g.stream()), tainted);
+        }
+        let is_let = ident(tree).as_deref() == Some("let");
+        let assigned = !is_let
+            && ident(tree).is_some()
+            && punct(trees.get(i + 1), '=')
+            && !matches!(trees.get(i + 2), Some(TokenTree::Punct(p)) if matches!(p.as_char(), '=' | '>'))
+            && !(i > 0 && punct(trees.get(i - 1), '.'));
+        if !is_let && !assigned {
+            continue;
+        }
+        let end = trees[i..]
+            .iter()
+            .position(|t| punct(Some(t), ';'))
+            .map_or(trees.len(), |p| i + p);
+        let Some(eq) = trees[i..end]
+            .iter()
+            .position(|t| punct(Some(t), '='))
+            .map(|p| i + p)
+        else {
+            continue;
+        };
+        if mentions(&trees[eq + 1..end], tainted) {
+            let colon = trees[i..eq]
+                .iter()
+                .position(|t| punct(Some(t), ':'))
+                .map_or(eq, |p| i + p);
+            tainted.extend(
+                trees[i..colon]
+                    .iter()
+                    .filter_map(ident)
+                    .filter(|name| name != "let" && name != "mut"),
+            );
+        }
+    }
+}
+
+/// Whether a command line starts with a program that exists on one OS only.
+fn os_program(command: &str) -> bool {
+    let file = command
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+        .to_lowercase();
+    let stem = file
+        .strip_suffix(".exe")
+        .or_else(|| file.strip_suffix(".cmd"))
+        .unwrap_or(&file);
+    OS_PROGRAMS.contains(&stem)
 }
 
 fn cargo_os_variable(value: &str) -> bool {
@@ -485,6 +555,18 @@ impl Scan {
                         i = at;
                     }
                 }
+                TokenTree::Ident(id)
+                    if id == "cfg"
+                        && punct(trees.get(i + 1), '!')
+                        && !(i > 0 && punct(trees.get(i - 1), '.')) =>
+                {
+                    if let Some(inner) = any_group(trees.get(i + 2)) {
+                        if names_os(&inner, &self.shared.cfg_aliases) {
+                            self.found(&trees[i]);
+                        }
+                        i += 2;
+                    }
+                }
                 _ => {}
             }
             i += 1;
@@ -509,7 +591,14 @@ impl Scan {
                             self.found(&trees[i]);
                         }
                         // Other attributes can carry paths and strings (`doc`): scan them like any tokens.
-                        if !cfg {
+                        if name.as_deref() == Some("cfg_attr") {
+                            // The attributes it applies are scanned too (`windows::core::implement`), its predicate is not.
+                            let args =
+                                group(body.get(1), Delimiter::Parenthesis).unwrap_or_default();
+                            for applied in flat(args).split(|tree| punct(Some(tree), ',')).skip(1) {
+                                self.walk(applied);
+                            }
+                        } else if !cfg {
                             self.walk(&body);
                         }
                         i = at;
@@ -598,6 +687,37 @@ impl Scan {
         i + 1
     }
 
+    /// Whether `name` is a process command type here, under its own name or an import alias.
+    fn is_command(&self, name: &str) -> bool {
+        is_command_type(name, &self.shared)
+            || self.imports.get(name).is_some_and(|paths| {
+                paths.iter().any(|path| {
+                    path.last()
+                        .is_some_and(|last| is_command_type(last, &self.shared))
+                })
+            })
+    }
+
+    /// The argument indexes that supply the program of a call of any of `options`: `Command::new` however it is
+    /// imported, or a learned command function.
+    fn program_indexes(&self, options: &[Vec<String>]) -> BTreeSet<usize> {
+        let mut indexes = BTreeSet::new();
+        for path in options {
+            if let Some(known) = path
+                .last()
+                .and_then(|last| self.shared.command_fns.get(last))
+            {
+                indexes.extend(known);
+            }
+            if let [.., prev, last] = path.as_slice() {
+                if matches!(last.as_str(), "new" | "with_new") && self.is_command(prev) {
+                    indexes.insert(0);
+                }
+            }
+        }
+        indexes
+    }
+
     /// `struct Cmd { command: Command, … }` and `type Run = Command;` make `Cmd`/`Run` a command type.
     fn learn_command_type(&mut self, trees: &[TokenTree], at: usize) {
         let Some(name) = trees.get(at + 1).and_then(ident) else {
@@ -608,12 +728,12 @@ impl Scan {
             match tree {
                 TokenTree::Punct(p) if p.as_char() == ';' => break,
                 TokenTree::Group(g) => {
-                    wraps |= mentions_command(g.stream());
+                    wraps |= self.mentions_command(g.stream());
                     if g.delimiter() == Delimiter::Brace {
                         break;
                     }
                 }
-                TokenTree::Ident(id) => wraps |= is_command_type(&id.to_string(), &self.shared),
+                TokenTree::Ident(id) => wraps |= self.is_command(&id.to_string()),
                 _ => {}
             }
         }
@@ -622,28 +742,82 @@ impl Scan {
         }
     }
 
-    /// `fn sh(words: &str) { … Command::new(…) … }` (or a call of one) makes `sh` a function taking a command line.
+    fn mentions_command(&self, stream: TokenStream) -> bool {
+        stream.into_iter().any(|tree| match tree {
+            TokenTree::Ident(id) => self.is_command(&id.to_string()),
+            TokenTree::Group(g) => self.mentions_command(g.stream()),
+            _ => false,
+        })
+    }
+
+    /// `fn sh(words: &str) { … Command::new(words) … }` (or a call of one) makes `sh` a function whose parameter 0
+    /// is a command line. Only a parameter that reaches the program counts: a function that runs `git` and merely
+    /// prints its argument is not a command launcher, and one with a label before the command line takes index 1.
     fn learn_command_fn(&mut self, trees: &[TokenTree], at: usize) {
         let Some(name) = trees.get(at + 1).and_then(ident) else {
             return;
         };
-        let body = trees[at + 2..]
+        let Some(open) = trees[at + 2..]
             .iter()
             .take_while(|tree| !punct(Some(tree), ';'))
-            .find_map(|tree| group(Some(tree), Delimiter::Brace));
-        if body.is_some_and(|body| self.runs_command(&flat(body))) {
-            self.shared.command_fns.insert(name);
+            .position(|tree| group(Some(tree), Delimiter::Brace).is_some())
+            .map(|p| at + 2 + p)
+        else {
+            return;
+        };
+        let signature: TokenStream = trees[at..open].iter().cloned().collect();
+        let Ok(signature) = syn::parse::Parser::parse2(
+            |input: syn::parse::ParseStream| {
+                let signature = input.parse::<syn::Signature>()?;
+                input.parse::<TokenStream>()?;
+                Ok(signature)
+            },
+            signature,
+        ) else {
+            return;
+        };
+        let body = flat(group(trees.get(open), Delimiter::Brace).unwrap_or_default());
+        for (index, input) in signature.inputs.iter().enumerate() {
+            let syn::FnArg::Typed(typed) = input else {
+                continue;
+            };
+            let syn::Pat::Ident(param) = &*typed.pat else {
+                continue;
+            };
+            let mut tainted = HashSet::from([param.ident.to_string()]);
+            loop {
+                let before = tainted.len();
+                propagate(&body, &mut tainted);
+                if tainted.len() == before {
+                    break;
+                }
+            }
+            if self.passes_to_program(&body, &tainted) {
+                self.shared
+                    .command_fns
+                    .entry(name.clone())
+                    .or_default()
+                    .insert(index);
+            }
         }
     }
 
-    fn runs_command(&self, trees: &[TokenTree]) -> bool {
+    /// Whether a command construction or a call of a command function in `trees` takes, as its program, an
+    /// expression that mentions a tainted name.
+    fn passes_to_program(&self, trees: &[TokenTree], tainted: &HashSet<String>) -> bool {
         trees.iter().enumerate().any(|(i, tree)| match tree {
-            TokenTree::Group(g) => self.runs_command(&flat(g.stream())),
-            TokenTree::Ident(id) => {
-                let name = id.to_string();
-                is_command_type(&name, &self.shared)
-                    || (self.shared.command_fns.contains(&name)
-                        && group(trees.get(i + 1), Delimiter::Parenthesis).is_some())
+            TokenTree::Group(g) => self.passes_to_program(&flat(g.stream()), tainted),
+            TokenTree::Ident(_)
+                if !mid_path(trees, i) && !(i > 0 && punct(trees.get(i - 1), '.')) =>
+            {
+                let (segments, end) = parse_path(trees, i);
+                let Some(args) = group(trees.get(end), Delimiter::Parenthesis) else {
+                    return false;
+                };
+                let args = call_args(&args);
+                self.program_indexes(&self.expand(&segments, 3))
+                    .into_iter()
+                    .any(|k| args.get(k).is_some_and(|arg| mentions(arg, tainted)))
             }
             _ => false,
         })
@@ -659,20 +833,17 @@ impl Scan {
         let Some(args) = group(trees.get(end), Delimiter::Parenthesis) else {
             return;
         };
-        let (mut program, mut cargo_var, mut fs_path) = (None, false, false);
+        let (mut cargo_var, mut fs_path) = (false, false);
+        let call = call_args(&args);
+        let runs_os = self.program_indexes(&options).into_iter().any(|k| {
+            call.get(k)
+                .and_then(|arg| first_string(arg.iter().cloned().collect()))
+                .is_some_and(|command| os_program(&command))
+        });
         for path in &options {
-            if path
-                .last()
-                .is_some_and(|last| self.shared.command_fns.contains(last))
-            {
-                program = program.or_else(|| command_line(&args));
-            }
             let [.., prev, last] = path.as_slice() else {
                 continue;
             };
-            if matches!(last.as_str(), "new" | "with_new") && is_command_type(prev, &self.shared) {
-                program = program.or_else(|| first_string(args.clone()));
-            }
             if matches!(last.as_str(), "var" | "var_os")
                 && path.len() == 3
                 && path[..2] == ["std", "env"]
@@ -685,22 +856,8 @@ impl Scan {
                 || (matches!(prev.as_str(), "Path" | "PathBuf" | "OsStr" | "OsString")
                     && matches!(last.as_str(), "new" | "from"));
         }
-        if let Some(program) = program {
-            let file = program
-                .split_whitespace()
-                .next()
-                .unwrap_or_default()
-                .rsplit(['/', '\\'])
-                .next()
-                .unwrap_or_default()
-                .to_lowercase();
-            let stem = file
-                .strip_suffix(".exe")
-                .or_else(|| file.strip_suffix(".cmd"))
-                .unwrap_or(&file);
-            if OS_PROGRAMS.contains(&stem) {
-                self.found(&trees[at]);
-            }
+        if runs_os {
+            self.found(&trees[at]);
         }
         if cargo_var {
             self.found(&trees[at]);
@@ -741,17 +898,6 @@ fn allows_unused(attribute: &[TokenTree]) -> bool {
     })
 }
 
-fn mentions_command(stream: TokenStream) -> bool {
-    stream.into_iter().any(|tree| match tree {
-        TokenTree::Ident(id) => {
-            let name = id.to_string();
-            name.ends_with("Command") || name.ends_with("CommandWrap")
-        }
-        TokenTree::Group(g) => mentions_command(g.stream()),
-        _ => false,
-    })
-}
-
 /// What one file holds: OS operations (count and lines), plus the names it defines for the others.
 struct Report {
     count: usize,
@@ -767,7 +913,14 @@ fn scan(source: &str, shared: &Shared) -> Result<Report> {
         collecting: true,
         ..Scan::default()
     };
-    scan.walk(&trees);
+    // Names are learned in any order (an import or a helper may follow its use) until nothing new appears.
+    loop {
+        let before = (scan.shared.clone(), scan.imports.clone());
+        scan.walk(&trees);
+        if (scan.shared.clone(), scan.imports.clone()) == before {
+            break;
+        }
+    }
     scan.collecting = false;
     scan.walk(&trees);
     Ok(Report {
@@ -841,7 +994,9 @@ fn inspect(root: &Path) -> Result<()> {
                 .shared;
             shared.cfg_aliases.extend(found.cfg_aliases);
             shared.command_types.extend(found.command_types);
-            shared.command_fns.extend(found.command_fns);
+            for (name, indexes) in found.command_fns {
+                shared.command_fns.entry(name).or_default().extend(indexes);
+            }
         }
         if shared == before {
             break;

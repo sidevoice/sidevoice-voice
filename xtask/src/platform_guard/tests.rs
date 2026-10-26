@@ -1,3 +1,5 @@
+use std::collections::{BTreeSet, HashMap};
+
 use super::*;
 
 fn n(source: &str) -> usize {
@@ -374,7 +376,10 @@ fn command_line_functions_are_followed_across_files() {
     let mut shared = scan(helpers, &shared).unwrap().shared;
     assert_eq!(
         shared.command_fns,
-        HashSet::from(["run_in".to_string(), "sh".to_string()])
+        HashMap::from([
+            ("run_in".to_string(), BTreeSet::from([1])),
+            ("sh".to_string(), BTreeSet::from([0]))
+        ])
     );
     let count = |source: &str| scan(source, &shared).unwrap().count;
     assert_eq!(count("fn f() { sh(\"uname -a\"); }"), 1);
@@ -388,4 +393,73 @@ fn command_line_functions_are_followed_across_files() {
         scan("fn f() { sh(\"uname -a\"); }", &shared).unwrap().count,
         0
     );
+}
+
+#[test]
+fn command_helpers_are_found_through_aliases_in_any_order() {
+    let aliased = "use std::process::Command as Cmd; fn shell(words: &str) { Cmd::new(words).output(); } fn f() { shell(\"uname\"); }";
+    assert_eq!(n(aliased), 1);
+    // The import may follow the helper that uses it.
+    let late = "fn shell(words: &str) { Cmd::new(words).output(); } use std::process::Command as Cmd; fn f() { shell(\"uname\"); }";
+    assert_eq!(n(late), 1);
+    let wrapper = "use std::process::Command as Cmd; struct Run { inner: Cmd } fn go(words: &str) { Run::new(words); } fn f() { go(\"sh\"); }";
+    assert_eq!(n(wrapper), 1);
+}
+
+#[test]
+fn only_the_parameter_that_reaches_the_program_is_a_command() {
+    let label_first = "fn run(label: &str, program: &str) { Command::new(program).output(); } fn f() { run(\"host\", \"uname\"); run(\"uname\", \"git\"); }";
+    assert_eq!(n(label_first), 1);
+    let prints = "fn label(text: &str) { Command::new(\"git\").arg(\"status\").output(); println!(\"{}\", text); } fn f() { label(\"uname\"); }";
+    assert_eq!(n(prints), 0);
+    let args_only = "fn run(program: &str, extra: &str) { Command::new(program).arg(extra); } fn f() { run(\"git\", \"uname\"); }";
+    assert_eq!(n(args_only), 0);
+    let through_wrapper = "fn run(label: &str, program: &str) { Command::new(program); } fn go(a: &str, b: &str, c: &str) { run(a, c); } fn f() { go(\"uname\", \"git\", \"git\"); go(\"git\", \"git\", \"sh\"); }";
+    assert_eq!(n(through_wrapper), 1);
+    let through_locals = "fn run(words: &str) { let mut parts = words.split(' '); let program = parts.next().unwrap(); Command::new(&program).output(); } fn f() { run(\"uname -a\"); }";
+    assert_eq!(n(through_locals), 1);
+}
+
+#[test]
+fn applied_attributes_of_cfg_attr_are_scanned() {
+    assert_eq!(
+        n("#[cfg_attr(feature = \"x\", windows::core::implement(IFoo))] struct Foo;"),
+        1
+    );
+    assert_eq!(
+        n("#[cfg_attr(feature = \"x\", derive(Debug), objc2::declare_class!())] struct Foo;"),
+        1
+    );
+    assert_eq!(
+        n("#[cfg_attr(feature = \"x\", cfg_attr(test, windows::x))] struct Foo;"),
+        1
+    );
+    assert_eq!(n("#[cfg_attr(feature = \"windows\", derive(Debug), doc = \"windows::core\")] struct Foo;"), 0);
+}
+
+#[test]
+fn platform_root_rejects_os_cfg_macros() {
+    assert_eq!(root("pub const IS_WINDOWS: bool = cfg!(windows);"), 1);
+    assert_eq!(
+        root("fn f() { if cfg! { target_os = \"linux\" } {} let _ = cfg![unix]; }"),
+        2
+    );
+    assert_eq!(
+        root(
+            "fn f() { let _ = (cfg!(test), cfg!(feature = \"windows\"), cfg!(debug_assertions)); }"
+        ),
+        0
+    );
+    let aliases = scan(
+        "cfg_aliases! { mac: { target_os = \"macos\" } }",
+        &Shared::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        scan_platform("const M: bool = cfg!(mac);", true, &aliases.shared)
+            .unwrap()
+            .count,
+        1
+    );
+    assert_eq!(other("const M: bool = cfg!(windows);"), 0);
 }
