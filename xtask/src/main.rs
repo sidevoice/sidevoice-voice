@@ -14,6 +14,7 @@
 
 mod comparison;
 mod npm;
+mod platform;
 mod platform_guard;
 mod release;
 
