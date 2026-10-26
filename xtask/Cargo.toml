@@ -7,6 +7,8 @@ publish = false
 description = "Build tooling for sidevoice-voice: the npm package, the release assets and publishing."
 
 [dependencies]
+# Describes the host in the comparison report.
+sysinfo = { version = "0.37", default-features = false, features = ["system"] }
 serde_json = "1"
 sha2 = "0.10"
 # npm names a tarball by its SHA-1 (`shasum`), which `npm-publish` compares with a staged version's.

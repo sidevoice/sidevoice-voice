@@ -1,9 +1,12 @@
 //! The optional native C++/Sonora comparison and its metric checks, on the current host.
-use crate::{sh, Result};
+use crate::{
+    platform::host::{Host, LocalHost},
+    sh, Result,
+};
 
 pub(super) fn run() -> Result<()> {
     println!("Commit: `{}`\n", sh("git rev-parse HEAD")?.trim());
-    println!("Host: `{}`\n", sh("uname -a")?.trim());
+    println!("Host: `{}`\n", LocalHost.description());
     println!("Rust: `{}`\n", sh("rustc --version")?.trim());
     println!(
         "C++: `{}`\n",
