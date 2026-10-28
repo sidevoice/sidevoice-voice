@@ -5,10 +5,11 @@ use std::sync::atomic::Ordering;
 
 use rtrb::RingBuffer;
 
-use super::drain;
 use super::output::{Counters, Output, Queue, ReferenceSample, Schedule};
 use super::pipeline::Pipeline;
 use super::playout::{playback_complete, send_capture_after_playback};
+use super::tally::{Tally, FIRST_SECONDS};
+use super::{drain, goes_on};
 use crate::call::{Call, Effect, Input};
 use crate::event::{TurnEvent, VoiceEvent};
 use crate::io::IoEvent;
@@ -558,4 +559,28 @@ fn an_abandoned_queue_ends_every_chunk_in_order() {
         ]
     );
     assert!(queue.is_idle());
+}
+
+#[test]
+fn a_glitch_is_no_failure_and_a_lost_device_is() {
+    assert!(goes_on(cpal::ErrorKind::Xrun));
+    assert!(goes_on(cpal::ErrorKind::RealtimeDenied));
+    assert!(!goes_on(cpal::ErrorKind::DeviceNotAvailable));
+    assert!(!goes_on(cpal::ErrorKind::StreamInvalidated));
+    assert!(!goes_on(cpal::ErrorKind::BackendError));
+}
+
+#[test]
+fn the_first_seconds_are_said_once_and_only_once_they_are_over() {
+    let opened = std::time::Instant::now();
+    let tally = Tally::new(opened);
+    tally.heard(480);
+    tally.heard(480);
+    tally.glitched();
+    assert_eq!(tally.due(opened), None);
+    assert_eq!(
+        tally.due(opened + FIRST_SECONDS).as_deref(),
+        Some("microphone stream, first 2 s: 2 callbacks, 960 samples, 1 glitches")
+    );
+    assert_eq!(tally.due(opened + FIRST_SECONDS * 2), None);
 }

@@ -825,6 +825,7 @@ dependencies = [
  "futures-util",
  "icu_locale",
  "js-sys",
+ "log",
  "rtrb",
  "serde",
  "serde_json",

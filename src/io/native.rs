@@ -16,6 +16,7 @@ mod output;
 mod pipeline;
 mod playout;
 mod shared;
+mod tally;
 
 #[cfg(test)]
 mod tests;
@@ -23,7 +24,7 @@ mod tests;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{ErrorKind, FromSample, SampleFormat, SizedSample, Stream, StreamConfig};
@@ -35,6 +36,7 @@ use self::output::{Counters, Output, ReferenceSample};
 use self::pipeline::Pipeline;
 use self::playout::{Command, Playout};
 pub use self::shared::{InputPort, SharedNativeAudio};
+use self::tally::Tally;
 use crate::io::{AudioIo, IoEvent, IoSink};
 
 /// How long a stop fades out, in milliseconds.
@@ -290,7 +292,12 @@ fn run(sink: &IoSink, devices: &NativeDevices, input: bool, control: &Control) {
         }
         playout.exchange(&mut speaker.playback, &mut speaker.reference);
         match &mut microphone {
-            Some(microphone) => drain(&mut microphone.capture, &mut heard, microphone.channels),
+            Some(microphone) => {
+                drain(&mut microphone.capture, &mut heard, microphone.channels);
+                if let Some(line) = microphone.tally.due(Instant::now()) {
+                    log::info!("{line}");
+                }
+            }
             None => heard.clear(),
         }
         if changed.swap(false, Ordering::AcqRel) {
@@ -361,6 +368,8 @@ struct Microphone {
     /// Whether it failed under the call (told as [`IoEvent::InputLost`]), or the chosen one went away (the default
     /// one is switched to).
     failed: Arc<AtomicBool>,
+    /// What its stream delivered, said once its first seconds are over.
+    tally: Arc<Tally>,
 }
 
 impl Microphone {
@@ -376,18 +385,23 @@ impl Microphone {
         let (rate, channels) = (config.sample_rate(), usize::from(config.channels()));
         let (capture_in, capture) = RingBuffer::new((rate * BACKLOG_SECONDS) as usize * channels);
         let failed_flag = Arc::new(AtomicBool::new(false));
+        let tally = Arc::new(Tally::new(Instant::now()));
         let failed = failure(
             sink,
             changed,
             id.map(|_| (Kind::Input, devices)),
             &failed_flag,
-            true,
+            Some(&tally),
+        );
+        log::info!(
+            "microphone stream: {rate} Hz, {channels} ch, {}",
+            config.sample_format()
         );
         let stream = match config.sample_format() {
-            SampleFormat::F32 => listen::<f32>(&input, config.config(), capture_in, failed),
-            SampleFormat::I16 => listen::<i16>(&input, config.config(), capture_in, failed),
-            SampleFormat::U16 => listen::<u16>(&input, config.config(), capture_in, failed),
-            SampleFormat::I32 => listen::<i32>(&input, config.config(), capture_in, failed),
+            SampleFormat::F32 => listen::<f32>(&input, config.config(), capture_in, &tally, failed),
+            SampleFormat::I16 => listen::<i16>(&input, config.config(), capture_in, &tally, failed),
+            SampleFormat::U16 => listen::<u16>(&input, config.config(), capture_in, &tally, failed),
+            SampleFormat::I32 => listen::<i32>(&input, config.config(), capture_in, &tally, failed),
             _ => Err("audio-format-unsupported".into()),
         }?;
         stream.play().map_err(|error| code(&error))?;
@@ -397,6 +411,7 @@ impl Microphone {
             rate,
             channels,
             failed: failed_flag,
+            tally,
         })
     }
 }
@@ -435,7 +450,7 @@ impl Speaker {
             changed,
             id.map(|_| (Kind::Output, devices)),
             &gone,
-            false,
+            None,
         );
         let stream_config = config.config();
         let stream = match config.sample_format() {
@@ -457,21 +472,24 @@ impl Speaker {
     }
 }
 
-/// The microphone's stream: every sample into the capture ring.
+/// The microphone's stream: every sample into the capture ring, each callback counted in `tally`.
 fn listen<T>(
     device: &cpal::Device,
     config: StreamConfig,
     mut ring: Producer<f32>,
+    tally: &Arc<Tally>,
     failed: impl FnMut(cpal::Error) + Send + 'static,
 ) -> Result<Stream, String>
 where
     T: SizedSample,
     f32: FromSample<T>,
 {
+    let tally = Arc::clone(tally);
     device
         .build_input_stream::<T, _, _>(
             config,
             move |data: &[T], _| {
+                tally.heard(data.len());
                 for &sample in data {
                     let _ = ring.push(sample.to_sample::<f32>());
                 }
@@ -511,20 +529,29 @@ where
         .map_err(|error| code(&error))
 }
 
-/// What a stream does with its errors: a device that changed under it starts the canceller over; a chosen device
-/// (`chosen`: its kind, and the choice) that went away is lost and marked `gone`, and the default one takes over; any
-/// other failure is told once, and the call stops.
+/// What a stream does with its errors: a glitch it goes on from (`goes_on`) is counted in a microphone's `tally` and
+/// is no failure; a device that changed under it starts the canceller over; a chosen device (`chosen`: its kind, and
+/// the choice) that went away is lost and marked `gone`, and the default one takes over; any other failure is told
+/// once, and the call stops. `tally` is the microphone's, for its stream; the speaker's has none.
 fn failure(
     sink: &IoSink,
     changed: &Arc<AtomicBool>,
     chosen: Option<(Kind, &NativeDevices)>,
     gone: &Arc<AtomicBool>,
-    input: bool,
+    tally: Option<&Arc<Tally>>,
 ) -> impl FnMut(cpal::Error) + Send + 'static {
     let (sink, changed, gone) = (sink.clone(), Arc::clone(changed), Arc::clone(gone));
     let chosen = chosen.map(|(kind, devices)| (kind, devices.clone()));
+    let tally = tally.map(Arc::clone);
+    let input = tally.is_some();
     let mut told = false;
     move |error| {
+        if goes_on(error.kind()) {
+            if let Some(tally) = &tally {
+                tally.glitched();
+            }
+            return;
+        }
         if error.kind() == ErrorKind::DeviceChanged {
             changed.store(true, Ordering::Release);
             return;
@@ -533,6 +560,8 @@ fn failure(
             return;
         }
         told = true;
+        let stream = if input { "microphone" } else { "speaker" };
+        log::warn!("{stream} stream error: {:?}", error.kind());
         let lost = error.kind() == ErrorKind::DeviceNotAvailable
             && chosen
                 .as_ref()
@@ -551,6 +580,12 @@ fn failure(
             sink.send(IoEvent::Failed(code(&error)));
         }
     }
+}
+
+/// Whether a stream error of `kind` leaves the stream running: a buffer overrun or underrun (a glitch, which a
+/// network-carried device such as a Remote Desktop microphone reports often), or real-time priority refused.
+fn goes_on(kind: ErrorKind) -> bool {
+    matches!(kind, ErrorKind::Xrun | ErrorKind::RealtimeDenied)
 }
 
 /// Moves what `ring` holds in whole frames of `channels` interleaved samples into `out`, after clearing it. A frame
