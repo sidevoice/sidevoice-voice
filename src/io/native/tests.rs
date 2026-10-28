@@ -594,14 +594,16 @@ fn the_first_seconds_are_handed_out_once_and_only_once_they_are_over() {
 }
 
 /// A microphone's callback and error callback as its stream drives them, and what they tell the call.
-fn microphone_stream() -> (
-    impl FnMut(&[f32]),
-    impl FnMut(cpal::Error),
-    rtrb::Consumer<f32>,
-    Arc<Tally>,
-    Arc<AtomicBool>,
-    UnboundedReceiver<Message>,
-) {
+struct MicrophoneStream {
+    callback: Box<dyn FnMut(&[f32])>,
+    failed: Box<dyn FnMut(cpal::Error)>,
+    captured: rtrb::Consumer<f32>,
+    tally: Arc<Tally>,
+    gone: Arc<AtomicBool>,
+    told: UnboundedReceiver<Message>,
+}
+
+fn microphone_stream() -> MicrophoneStream {
     let (messages, told) = unbounded();
     let sink = IoSink {
         messages,
@@ -616,19 +618,26 @@ fn microphone_stream() -> (
         Arc::new(AtomicBool::new(false)),
     );
     let failed = failure(&sink, &changed, None, &gone, Some(&tally));
-    (
-        capture::<f32>(ring, Arc::clone(&tally)),
-        failed,
+    MicrophoneStream {
+        callback: Box::new(capture::<f32>(ring, Arc::clone(&tally))),
+        failed: Box::new(failed),
         captured,
         tally,
         gone,
         told,
-    )
+    }
 }
 
 #[test]
 fn an_xrun_leaves_the_microphone_open_and_its_samples_flowing() {
-    let (mut callback, mut failed, mut captured, tally, gone, mut told) = microphone_stream();
+    let MicrophoneStream {
+        mut callback,
+        mut failed,
+        mut captured,
+        tally,
+        gone,
+        mut told,
+    } = microphone_stream();
     callback(&[0.1; 4]);
     failed(cpal::Error::new(cpal::ErrorKind::Xrun));
     callback(&[0.2; 4]);
@@ -638,7 +647,7 @@ fn an_xrun_leaves_the_microphone_open_and_its_samples_flowing() {
         !gone.load(Ordering::Acquire),
         "a glitch closed the microphone"
     );
-    assert!(told.try_next().is_err(), "a glitch was told to the call");
+    assert!(told.try_recv().is_err(), "a glitch was told to the call");
     let mut heard = Vec::new();
     drain(&mut captured, &mut heard, 1);
     assert_eq!(heard, [[0.1; 4], [0.2; 4], [0.3; 4]].concat());
@@ -654,13 +663,19 @@ fn an_xrun_leaves_the_microphone_open_and_its_samples_flowing() {
 
 #[test]
 fn a_device_gone_after_an_xrun_still_loses_the_microphone() {
-    let (mut callback, mut failed, _captured, _tally, gone, mut told) = microphone_stream();
+    let MicrophoneStream {
+        mut callback,
+        mut failed,
+        gone,
+        mut told,
+        ..
+    } = microphone_stream();
     callback(&[0.1; 4]);
     failed(cpal::Error::new(cpal::ErrorKind::Xrun));
     failed(cpal::Error::new(cpal::ErrorKind::DeviceNotAvailable));
     assert!(gone.load(Ordering::Acquire));
-    match told.try_next() {
-        Ok(Some(Message::Io(_, IoEvent::InputLost(code)))) => {
+    match told.try_recv() {
+        Ok(Message::Io(_, IoEvent::InputLost(code))) => {
             assert_eq!(code, "audio-device-unavailable")
         }
         _ => panic!("the lost microphone was not told"),
