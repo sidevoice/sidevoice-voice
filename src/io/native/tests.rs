@@ -594,8 +594,11 @@ fn the_first_seconds_are_handed_out_once_and_only_once_they_are_over() {
 }
 
 /// A microphone's callback and error callback as its stream drives them, and what they tell the call.
+/// A microphone stream's callback, as `capture` makes it.
+type Callback = Box<dyn FnMut(&[f32])>;
+
 struct MicrophoneStream {
-    callback: Box<dyn FnMut(&[f32])>,
+    callback: Callback,
     failed: Box<dyn FnMut(cpal::Error)>,
     captured: rtrb::Consumer<f32>,
     tally: Arc<Tally>,
