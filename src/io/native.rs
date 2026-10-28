@@ -294,8 +294,14 @@ fn run(sink: &IoSink, devices: &NativeDevices, input: bool, control: &Control) {
         match &mut microphone {
             Some(microphone) => {
                 drain(&mut microphone.capture, &mut heard, microphone.channels);
-                if let Some(line) = microphone.tally.due(Instant::now()) {
-                    log::info!("{line}");
+                if let Some(counts) = microphone.tally.due(Instant::now()) {
+                    tracing::info!(
+                        seconds = tally::FIRST_SECONDS.as_secs(),
+                        callbacks = counts.callbacks,
+                        samples = counts.samples,
+                        glitches = counts.glitches,
+                        "microphone stream first seconds"
+                    );
                 }
             }
             None => heard.clear(),
@@ -393,9 +399,11 @@ impl Microphone {
             &failed_flag,
             Some(&tally),
         );
-        log::info!(
-            "microphone stream: {rate} Hz, {channels} ch, {}",
-            config.sample_format()
+        tracing::info!(
+            rate,
+            channels,
+            format = %config.sample_format(),
+            "microphone stream opened"
         );
         let stream = match config.sample_format() {
             SampleFormat::F32 => listen::<f32>(&input, config.config(), capture_in, &tally, failed),
@@ -472,32 +480,37 @@ impl Speaker {
     }
 }
 
-/// The microphone's stream: every sample into the capture ring, each callback counted in `tally`.
+/// The microphone's stream, its callback `capture`.
 fn listen<T>(
     device: &cpal::Device,
     config: StreamConfig,
-    mut ring: Producer<f32>,
+    ring: Producer<f32>,
     tally: &Arc<Tally>,
     failed: impl FnMut(cpal::Error) + Send + 'static,
 ) -> Result<Stream, String>
 where
-    T: SizedSample,
+    T: SizedSample + 'static,
     f32: FromSample<T>,
 {
-    let tally = Arc::clone(tally);
+    let mut capture = capture::<T>(ring, Arc::clone(tally));
     device
-        .build_input_stream::<T, _, _>(
-            config,
-            move |data: &[T], _| {
-                tally.heard(data.len());
-                for &sample in data {
-                    let _ = ring.push(sample.to_sample::<f32>());
-                }
-            },
-            failed,
-            None,
-        )
+        .build_input_stream::<T, _, _>(config, move |data: &[T], _| capture(data), failed, None)
         .map_err(|error| code(&error))
+}
+
+/// What the microphone's callback does with what it is handed: every sample into the capture ring, each callback
+/// counted in `tally`.
+fn capture<T>(mut ring: Producer<f32>, tally: Arc<Tally>) -> impl FnMut(&[T]) + Send + 'static
+where
+    T: SizedSample + 'static,
+    f32: FromSample<T>,
+{
+    move |data: &[T]| {
+        tally.heard(data.len());
+        for &sample in data {
+            let _ = ring.push(sample.to_sample::<f32>());
+        }
+    }
 }
 
 /// The speaker's stream: every frame from the player, the same sample on every channel.
@@ -561,7 +574,7 @@ fn failure(
         }
         told = true;
         let stream = if input { "microphone" } else { "speaker" };
-        log::warn!("{stream} stream error: {:?}", error.kind());
+        tracing::warn!(stream, kind = ?error.kind(), "audio stream error");
         let lost = error.kind() == ErrorKind::DeviceNotAvailable
             && chosen
                 .as_ref()

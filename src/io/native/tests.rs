@@ -1,20 +1,24 @@
 //! The native microphone and speaker without devices: what the output callback plays and reports, and the capture's
 //! way through the echo canceller, at a speaker's and a microphone's own rates.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+use futures_channel::mpsc::{unbounded, UnboundedReceiver};
 
 use rtrb::RingBuffer;
 
 use super::output::{Counters, Output, Queue, ReferenceSample, Schedule};
 use super::pipeline::Pipeline;
 use super::playout::{playback_complete, send_capture_after_playback};
-use super::tally::{Tally, FIRST_SECONDS};
-use super::{drain, goes_on};
+use super::tally::{Counts, Tally, FIRST_SECONDS};
+use super::{capture, drain, failure, goes_on};
 use crate::call::{Call, Effect, Input};
 use crate::event::{TurnEvent, VoiceEvent};
-use crate::io::IoEvent;
+use crate::io::{IoEvent, IoSink, RenderedMailbox};
 use crate::say::SayEvent;
 use crate::test_support::{clip, config, EnergyVad, FLEURS_ES, QUILTER, WINDOW};
+use crate::voice_call::Message;
 
 fn output(
     fade: usize,
@@ -571,7 +575,7 @@ fn a_glitch_is_no_failure_and_a_lost_device_is() {
 }
 
 #[test]
-fn the_first_seconds_are_said_once_and_only_once_they_are_over() {
+fn the_first_seconds_are_handed_out_once_and_only_once_they_are_over() {
     let opened = std::time::Instant::now();
     let tally = Tally::new(opened);
     tally.heard(480);
@@ -579,8 +583,86 @@ fn the_first_seconds_are_said_once_and_only_once_they_are_over() {
     tally.glitched();
     assert_eq!(tally.due(opened), None);
     assert_eq!(
-        tally.due(opened + FIRST_SECONDS).as_deref(),
-        Some("microphone stream, first 2 s: 2 callbacks, 960 samples, 1 glitches")
+        tally.due(opened + FIRST_SECONDS),
+        Some(Counts {
+            callbacks: 2,
+            samples: 960,
+            glitches: 1
+        })
     );
     assert_eq!(tally.due(opened + FIRST_SECONDS * 2), None);
+}
+
+/// A microphone's callback and error callback as its stream drives them, and what they tell the call.
+fn microphone_stream() -> (
+    impl FnMut(&[f32]),
+    impl FnMut(cpal::Error),
+    rtrb::Consumer<f32>,
+    Arc<Tally>,
+    Arc<AtomicBool>,
+    UnboundedReceiver<Message>,
+) {
+    let (messages, told) = unbounded();
+    let sink = IoSink {
+        messages,
+        generation: 1,
+        rendered: Arc::new(Mutex::new(RenderedMailbox::default())),
+        direct_rendered: true,
+    };
+    let (ring, captured) = RingBuffer::new(64);
+    let tally = Arc::new(Tally::new(std::time::Instant::now()));
+    let (changed, gone) = (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let failed = failure(&sink, &changed, None, &gone, Some(&tally));
+    (
+        capture::<f32>(ring, Arc::clone(&tally)),
+        failed,
+        captured,
+        tally,
+        gone,
+        told,
+    )
+}
+
+#[test]
+fn an_xrun_leaves_the_microphone_open_and_its_samples_flowing() {
+    let (mut callback, mut failed, mut captured, tally, gone, mut told) = microphone_stream();
+    callback(&[0.1; 4]);
+    failed(cpal::Error::new(cpal::ErrorKind::Xrun));
+    callback(&[0.2; 4]);
+    failed(cpal::Error::new(cpal::ErrorKind::RealtimeDenied));
+    callback(&[0.3; 4]);
+    assert!(
+        !gone.load(Ordering::Acquire),
+        "a glitch closed the microphone"
+    );
+    assert!(told.try_next().is_err(), "a glitch was told to the call");
+    let mut heard = Vec::new();
+    drain(&mut captured, &mut heard, 1);
+    assert_eq!(heard, [[0.1; 4], [0.2; 4], [0.3; 4]].concat());
+    assert_eq!(
+        tally.counts(),
+        Counts {
+            callbacks: 3,
+            samples: 12,
+            glitches: 2
+        }
+    );
+}
+
+#[test]
+fn a_device_gone_after_an_xrun_still_loses_the_microphone() {
+    let (mut callback, mut failed, _captured, _tally, gone, mut told) = microphone_stream();
+    callback(&[0.1; 4]);
+    failed(cpal::Error::new(cpal::ErrorKind::Xrun));
+    failed(cpal::Error::new(cpal::ErrorKind::DeviceNotAvailable));
+    assert!(gone.load(Ordering::Acquire));
+    match told.try_next() {
+        Ok(Some(Message::Io(_, IoEvent::InputLost(code)))) => {
+            assert_eq!(code, "audio-device-unavailable")
+        }
+        _ => panic!("the lost microphone was not told"),
+    }
 }
