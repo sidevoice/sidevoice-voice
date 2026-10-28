@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.5](https://github.com/sidevoice/sidevoice-voice/compare/v0.7.4...v0.7.5) (2026-10-28)
+
+
+### Bug Fixes
+
+* **io:** keep the microphone through stream glitches ([#84](https://github.com/sidevoice/sidevoice-voice/issues/84)) ([10938a6](https://github.com/sidevoice/sidevoice-voice/commit/10938a699db1a68365d557a9098c3945b0fe6535))
+
 ## [0.7.4](https://github.com/sidevoice/sidevoice-voice/compare/v0.7.3...v0.7.4) (2026-10-26)
 
 
