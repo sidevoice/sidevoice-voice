@@ -7,6 +7,7 @@ fn job(turn: usize) -> Job {
     Job {
         turn,
         pcm: Vec::new(),
+        language: None,
     }
 }
 
@@ -27,11 +28,11 @@ fn one_job_runs_at_a_time_in_order_and_the_queue_is_bounded() {
 #[test]
 fn a_held_transcript_is_due_only_when_nothing_can_join_it() {
     let mut recognition = Recognition::default();
-    assert_eq!(recognition.hold(0, "one".into(), 100), Outcome::Held);
+    assert_eq!(recognition.hold(0, "one".into(), None, 100), Outcome::Held);
     assert_eq!(recognition.deadline(true), None, "a turn is open");
     assert_eq!(recognition.due(100, true), None);
     assert_eq!(
-        recognition.hold(1, "two".into(), 200),
+        recognition.hold(1, "two".into(), None, 200),
         Outcome::Joined(vec![0])
     );
     assert_eq!(recognition.due(199, false), None);
@@ -95,4 +96,21 @@ fn the_script_a_language_is_written_in_comes_from_cldr() {
         accepted("Здраво", Some("not a tag")).as_deref(),
         Some("Здраво")
     );
+}
+
+#[test]
+fn transcripts_in_different_languages_are_never_joined() {
+    let mut recognition = Recognition::default();
+    let english = Some("en".to_string());
+    let spanish = Some("es".to_string());
+    assert_eq!(
+        recognition.hold(0, "hello".into(), english, 100),
+        Outcome::Held
+    );
+    let Outcome::Split(earlier) = recognition.hold(1, "hola".into(), spanish, 200) else {
+        panic!("another language is not joined");
+    };
+    assert_eq!((earlier.turns, earlier.text.as_str()), (vec![0], "hello"));
+    let due = recognition.due(200, false).expect("due");
+    assert_eq!((due.turns, due.text.as_str()), (vec![1], "hola"));
 }
