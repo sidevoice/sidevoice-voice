@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.6](https://github.com/sidevoice/sidevoice-voice/compare/v0.7.5...v0.7.6) (2026-10-29)
+
+
+### Bug Fixes
+
+* **call:** keep each turn's input language through recognition ([#87](https://github.com/sidevoice/sidevoice-voice/issues/87)) ([3a77c16](https://github.com/sidevoice/sidevoice-voice/commit/3a77c16808c0ce31f11644aaea42e3d03898f791))
+
 ## [0.7.5](https://github.com/sidevoice/sidevoice-voice/compare/v0.7.4...v0.7.5) (2026-10-28)
 
 
