@@ -575,11 +575,20 @@ impl Call {
                 let merge = u64::from(self.patience().merge_window_ms());
                 if merge == 0 {
                     self.close_turn(now, turn, Some(text), false, out);
-                } else if let Outcome::Joined(joined) =
-                    self.recognition.hold(turn, text, now + merge)
-                {
-                    for earlier in joined {
-                        self.close_turn(now, earlier, None, true, out);
+                } else {
+                    let language = self
+                        .turns
+                        .get(&turn)
+                        .and_then(|record| record.language.clone());
+                    match self.recognition.hold(turn, text, language, now + merge) {
+                        Outcome::Held => {}
+                        Outcome::Joined(joined) => {
+                            for earlier in joined {
+                                self.close_turn(now, earlier, None, true, out);
+                            }
+                        }
+                        // Another language: the earlier transcript is reported now, on its own.
+                        Outcome::Split(earlier) => self.finish_pending(now, earlier, out),
                     }
                 }
             }

@@ -1742,3 +1742,38 @@ fn a_queued_turn_is_transcribed_in_its_own_language_not_the_one_current_when_it_
         .collect();
     assert_eq!(started, [Some("es".to_string())]);
 }
+
+#[test]
+fn a_transcript_is_never_merged_with_one_in_another_language() {
+    let mut run = Run::new(config_with(|input| input.language = Some("en".into())));
+    run.hear(&speech());
+    run.hear(&silence(3_000));
+    let (first, _) = Run::transcribe(&run.take()).expect("transcribed");
+    run.transcribed(first, "Hello there");
+    assert!(
+        Run::turns(&run.take()).is_empty(),
+        "held for the merge window"
+    );
+    // The language changes and Spanish follows before the merge deadline.
+    run.input(Input::Config(Box::new(config_with(|input| {
+        input.language = Some("es".into())
+    }))));
+    run.hear(&speech());
+    run.hear(&silence(3_000));
+    let (second, _) = Run::transcribe(&run.take()).expect("transcribed");
+    run.transcribed(second, "Hola amigo");
+    let mut finished = Run::turns(&run.take());
+    run.wait(500);
+    finished.extend(Run::turns(&run.take()));
+    let finished: Vec<_> = finished
+        .iter()
+        .filter(|turn| turn.phase == TurnPhase::Finished)
+        .collect();
+    assert_eq!(finished.len(), 2, "{finished:?}");
+    assert_eq!(finished[0].text.as_deref(), Some("Hello there"));
+    assert_eq!(finished[0].language.as_deref(), Some("en"));
+    assert!(!finished[0].merged);
+    assert_eq!(finished[1].text.as_deref(), Some("Hola amigo"));
+    assert_eq!(finished[1].language.as_deref(), Some("es"));
+    assert!(!finished[1].merged);
+}

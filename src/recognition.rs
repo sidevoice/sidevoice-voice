@@ -29,6 +29,8 @@ pub(crate) struct Pending {
     /// The turns it holds, oldest first; the last one carries the transcript.
     pub(crate) turns: Vec<usize>,
     pub(crate) text: String,
+    /// The language it was recorded in: only transcripts of one language are joined.
+    language: Option<String>,
     deadline: u64,
 }
 
@@ -47,6 +49,9 @@ pub(crate) enum Outcome {
     Held,
     /// It joined the one held before it, which is no longer reported on its own: these turns are cancelled as merged.
     Joined(Vec<usize>),
+    /// It is in another language than the one held before it, which is never joined to it: the held one is returned
+    /// to be reported on its own, and this one is held in its place.
+    Split(Pending),
 }
 
 impl Recognition {
@@ -77,15 +82,27 @@ impl Recognition {
     }
 
     /// Holds a transcript for the merge window, joined to the one already held.
-    pub(crate) fn hold(&mut self, turn: usize, text: String, deadline: u64) -> Outcome {
+    pub(crate) fn hold(
+        &mut self,
+        turn: usize,
+        text: String,
+        language: Option<String>,
+        deadline: u64,
+    ) -> Outcome {
+        let fresh = |text, language| Pending {
+            turns: vec![turn],
+            text,
+            language,
+            deadline,
+        };
         match self.pending.take() {
             None => {
-                self.pending = Some(Pending {
-                    turns: vec![turn],
-                    text,
-                    deadline,
-                });
+                self.pending = Some(fresh(text, language));
                 Outcome::Held
+            }
+            Some(held) if held.language != language => {
+                self.pending = Some(fresh(text, language));
+                Outcome::Split(held)
             }
             Some(mut held) => {
                 let joined = held.turns.clone();
