@@ -143,6 +143,9 @@ struct Turn {
     audio_ms: u64,
     silence_ms: u64,
     recognised_ms: Option<u64>,
+    /// The input language it was recorded in: what its transcript is checked and labelled with, whatever the
+    /// configuration says by then.
+    language: Option<String>,
     /// Its marks in the take being kept, if one is: their index in it.
     mark: Option<usize>,
 }
@@ -453,6 +456,7 @@ impl Call {
                         audio_ms: 0,
                         silence_ms: 0,
                         recognised_ms: None,
+                        language: self.config.input_language(),
                         mark,
                     },
                 );
@@ -485,9 +489,14 @@ impl Call {
                 if let Some(mark) = self.mark(number) {
                     mark.end_ms = Some(heard);
                 }
+                let language = self
+                    .turns
+                    .get(&number)
+                    .and_then(|turn| turn.language.clone());
                 match self.recognition.push(Job {
                     turn: number,
                     pcm: ended.pcm,
+                    language,
                 }) {
                     Ok(job) => self.transcribe(job, out),
                     Err(_) => {
@@ -533,7 +542,7 @@ impl Call {
             out.push(Effect::Transcribe {
                 turn: job.turn,
                 pcm: job.pcm,
-                language: self.config.input_language(),
+                language: job.language,
             });
         }
     }
@@ -549,7 +558,7 @@ impl Call {
             return;
         }
         let next = self.recognition.done();
-        let language = self.config.input_language();
+        let language = self.turns.get(&turn).and_then(|turn| turn.language.clone());
         let text = match result {
             Ok(text) => accepted(&text, language.as_deref()),
             Err(code) => {
@@ -729,7 +738,7 @@ impl Call {
                 let ended = turn.ended_ms.unwrap_or(now);
                 TurnEvent::Finished {
                     turn_id: turn.id,
-                    language: self.config.input_language(),
+                    language: turn.language,
                     text,
                     started_at: self.epoch_unix_ms + turn.started_ms,
                     ended_at: self.epoch_unix_ms + ended,

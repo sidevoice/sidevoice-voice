@@ -1689,3 +1689,56 @@ fn an_input_change_waits_for_no_turn_to_be_open() {
     run.hear(&silence(3_000));
     assert!(run.call.input_idle());
 }
+
+#[test]
+fn a_turn_keeps_the_language_it_was_recorded_in_when_the_configuration_changes_before_its_transcript(
+) {
+    let mut run = Run::new(config_with(|input| input.language = Some("ru".into())));
+    run.hear(&speech());
+    run.hear(&silence(3_000));
+    let effects = run.take();
+    let (turn, _) = Run::transcribe(&effects).expect("transcribed");
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::Transcribe { language, .. } if language.as_deref() == Some("ru")
+    )));
+    // The language changes while the turn is being transcribed.
+    run.input(Input::Config(Box::new(config_with(|input| {
+        input.language = Some("en".into())
+    }))));
+    run.transcribed(turn, "Привет, как дела");
+    run.wait(500);
+    let finished = Run::turns(&run.take());
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0].phase, TurnPhase::Finished);
+    assert_eq!(finished[0].text.as_deref(), Some("Привет, как дела"));
+    assert_eq!(finished[0].language.as_deref(), Some("ru"));
+}
+
+#[test]
+fn a_queued_turn_is_transcribed_in_its_own_language_not_the_one_current_when_it_starts() {
+    let mut run = Run::new(config_with(|input| input.language = Some("en".into())));
+    run.hear(&speech());
+    run.hear(&silence(3_000));
+    let (first, _) = Run::transcribe(&run.take()).expect("transcribed");
+    // A second turn is recorded in Spanish while the first is still being transcribed.
+    run.input(Input::Config(Box::new(config_with(|input| {
+        input.language = Some("es".into())
+    }))));
+    run.hear(&speech());
+    run.hear(&silence(3_000));
+    assert!(Run::transcribe(&run.take()).is_none(), "one at a time");
+    run.input(Input::Config(Box::new(config_with(|input| {
+        input.language = Some("fr".into())
+    }))));
+    run.transcribed(first, "Hello there");
+    let started: Vec<_> = run
+        .take()
+        .into_iter()
+        .filter_map(|effect| match effect {
+            Effect::Transcribe { language, .. } => Some(language),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(started, [Some("es".to_string())]);
+}

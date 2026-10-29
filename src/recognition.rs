@@ -19,6 +19,8 @@ pub(crate) const MAX_QUEUE: usize = 8;
 pub(crate) struct Job {
     pub(crate) turn: usize,
     pub(crate) pcm: Vec<f32>,
+    /// The language it was recorded in, which the configuration may have left by the time its transcript arrives.
+    pub(crate) language: Option<String>,
 }
 
 /// A transcript held for the merge window.

@@ -7,6 +7,7 @@ fn job(turn: usize) -> Job {
     Job {
         turn,
         pcm: Vec::new(),
+        language: None,
     }
 }
 
