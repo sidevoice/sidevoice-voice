@@ -1760,9 +1760,12 @@ fn a_transcript_is_never_merged_with_one_in_another_language() {
     }))));
     run.hear(&speech());
     run.hear(&silence(3_000));
-    let (second, _) = Run::transcribe(&run.take()).expect("transcribed");
+    let effects = run.take();
+    let (second, _) = Run::transcribe(&effects).expect("transcribed");
+    // The earlier transcript may already be reported while the second turn is heard.
+    let mut finished = Run::turns(&effects);
     run.transcribed(second, "Hola amigo");
-    let mut finished = Run::turns(&run.take());
+    finished.extend(Run::turns(&run.take()));
     run.wait(500);
     finished.extend(Run::turns(&run.take()));
     let finished: Vec<_> = finished
