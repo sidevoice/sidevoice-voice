@@ -1,7 +1,7 @@
 name: ci
 
-# Every pull request: format and Clippy (native and wasm32, and the build tooling), the tests on macOS, Linux, Windows and
-# on wasm32 in Node (the call on recorded speech, with fake models; real models run in the apps' CI, which wire them
+# Every pull request: format and Clippy (native and wasm32, and the build tooling), the crate built and linked for iOS
+# and Android (`cargo xtask mobile-build`), the tests on macOS, Linux, Windows and on wasm32 in Node (the call on recorded speech, with fake models; real models run in the apps' CI, which wire them
 # in), and the npm package `@sidevoice/voice` built and installed as a consumer installs it (`cargo xtask npm`,
 # `npm-smoke`), publishing nothing: what passes here is what merging publishes (release.yml).
 on:
@@ -61,6 +61,26 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: ./.github/actions/setup
       - run: cargo test --locked
+
+  # The crate for the phones' targets, as an app compiles it in: iOS on a Mac (the iOS SDK links), Android with cargo-ndk.
+  # Built and linked, not run.
+  build-mobile:
+    if: ${{ !inputs.comparison }}
+    name: Build (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: ios, runner: macos-15 }
+          - { platform: android, runner: ubuntu-24.04 }
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: ./.github/actions/setup
+        with:
+          ios: ${{ matrix.platform == 'ios' }}
+          android: ${{ matrix.platform == 'android' }}
+      - run: cargo xtask mobile-build ${{ matrix.platform }}
 
   test-wasm:
     if: ${{ !inputs.comparison }}
