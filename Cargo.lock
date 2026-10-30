@@ -825,6 +825,8 @@ dependencies = [
  "futures-util",
  "icu_locale",
  "js-sys",
+ "objc2-avf-audio",
+ "objc2-foundation",
  "rtrb",
  "serde",
  "serde_json",
