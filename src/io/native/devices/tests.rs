@@ -97,6 +97,7 @@ fn the_list_serialises_with_lost_only_when_something_was() {
             "outputs": [],
             "input": "alsa:mic",
             "output": null,
+            "outputSelectable": Session::OUTPUT_SELECTABLE,
         })
     );
 }
