@@ -1,6 +1,7 @@
 //! Which devices are chosen, without the system's: what a vanished choice becomes, and when the audio thread switches.
 
 use super::{lock, settle, AudioDevice, Choice, Kind, NativeDevices};
+use crate::platform::audio_session::{AudioSession, Session};
 
 fn device(id: &str) -> AudioDevice {
     AudioDevice {
@@ -98,4 +99,13 @@ fn the_list_serialises_with_lost_only_when_something_was() {
             "output": null,
         })
     );
+}
+
+#[test]
+fn the_list_says_whether_the_speaker_can_be_chosen_as_the_system_does_under_its_seam_name() {
+    let devices = NativeDevices::new().report(vec![device("mic")], vec![device("speaker")]);
+    assert_eq!(devices.output_selectable, Session::OUTPUT_SELECTABLE);
+    let json = serde_json::to_value(&devices).expect("a list serializes");
+    assert_eq!(json["outputSelectable"], Session::OUTPUT_SELECTABLE);
+    assert!(json.get("output_selectable").is_none());
 }

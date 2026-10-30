@@ -119,6 +119,21 @@ the chosen ones (`None`: the system's default); `devices.choose(input, output)` 
 once what it is playing has ended. A chosen device that goes away gives way to the default one, said once as `lost`
 on the next list; the list is polled, cpal telling no changes.
 
+`AudioDevices` also says whether the speaker can be chosen at all (`output_selectable`, `outputSelectable` as JSON):
+true where the program picks among the outputs, false on iOS, where the system picks the route (the receiver, the
+loudspeaker, a headset) and the list has the one default output.
+
+**The audio session** (iOS; every other OS does nothing and succeeds). iOS keeps one session for the process, and it
+decides how the audio hardware is shared and routed. `Session::configure(&SessionConfig {mode, speaker, bluetooth})`
+declares how the call uses it (play-and-record, the mode, the loudspeaker rather than the receiver, Bluetooth hands-free
+devices) and does not start anything; `Session::activate()` is when the system applies it and the process gets the
+hardware, and `Session::deactivate()` gives it back and tells the audio it interrupted to go on. They are separate
+steps so that whoever starts the audio can activate it when the system hands it over, and the module does none of them
+by itself: `NativeIo` opens its streams on whatever session there is. There is no default `SessionConfig`; the mode and
+the options are the caller's decision. Recording must start while the app is in the foreground (the system refuses
+`561015905` otherwise: `audio-session-activate-failed`, the system's own code in the log). Import `AudioSession` for the
+methods.
+
 A page does the same with the npm package `@sidevoice/voice`, the WebAssembly build with the browser's microphone and
 speaker. Its models are JavaScript objects with the interfaces' methods, typed in `js/voice-models.d.ts` and called
 through wasm-bindgen's structural imports (`src/models/web.rs`); the page wires its models into them (those of
