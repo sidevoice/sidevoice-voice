@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/sidevoice/sidevoice-voice/compare/v0.7.6...v0.8.0) (2026-11-01)
+
+
+### Features
+
+* **platform:** the iOS audio session for the call ([#91](https://github.com/sidevoice/sidevoice-voice/issues/91)) ([d2dbdc5](https://github.com/sidevoice/sidevoice-voice/commit/d2dbdc55a720619cf2ab9b5db14eb4246f358434))
+
 ## [0.7.6](https://github.com/sidevoice/sidevoice-voice/compare/v0.7.5...v0.7.6) (2026-10-29)
 
 
