@@ -1,7 +1,7 @@
 //! Which microphone and speaker the native call uses ([`NativeDevices`]): the system's, listed by cpal, each known by
-//! its cpal device id as text, and chosen by the app at any time. The handle is shared with the audio thread, which
-//! opens what is chosen and switches when it changes; a chosen device that goes away is the default one from then,
-//! said once with the next list.
+//! its cpal device id as text, and chosen at any time through the handle. The handle is shared with the audio thread,
+//! which opens what is chosen and switches when it changes; a chosen device that goes away is the default one from
+//! then, said once with the next list.
 
 #[cfg(test)]
 mod tests;
@@ -11,6 +11,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use cpal::traits::{DeviceTrait, HostTrait};
 use serde::Serialize;
+
+use crate::platform::audio_session::{AudioSession, Session};
 
 /// A microphone or speaker as the system lists it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -42,6 +44,10 @@ pub struct AudioDevices {
     pub outputs: Vec<AudioDevice>,
     pub input: Option<String>,
     pub output: Option<String>,
+    /// Whether the speaker can be chosen at all: false where the system picks the output route (iOS), whatever
+    /// `outputs` lists.
+    #[serde(rename = "outputSelectable")]
+    pub output_selectable: bool,
     /// Once, on the list after a chosen device went away.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lost: Option<LostDevices>,
@@ -78,8 +84,8 @@ struct Shared {
     output_switch: AtomicBool,
 }
 
-/// The app's handle on which devices the native call uses: give a clone to
-/// [`NativeIo::with_devices`](super::NativeIo::with_devices), keep one to list and choose.
+/// A handle on which devices the native call uses: a clone goes to
+/// [`NativeIo::with_devices`](super::NativeIo::with_devices), and the other clones list and choose.
 #[derive(Clone, Default)]
 pub struct NativeDevices {
     shared: Arc<Shared>,
@@ -184,6 +190,7 @@ impl NativeDevices {
             outputs,
             input: choice.input,
             output: choice.output,
+            output_selectable: Session::OUTPUT_SELECTABLE,
             lost: (!lost.is_empty()).then_some(lost),
         }
     }

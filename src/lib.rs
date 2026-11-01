@@ -9,7 +9,7 @@
 //! `turns` (segmentation: detector windows into turns), `recognition` (the queue, the acceptance filter and the merge
 //! window), `speech` (a text in sentence chunks), `playback` (the queue, barge-in and the heard position), `take` (what
 //! the microphone gave over one stretch of listening, and where the turns fell in it) and `call`
-//! (the state machine that runs the three regions).
+//! (the state machine that runs the three regions), and `platform` (what the operating system decides: the audio session).
 
 #[cfg(native)]
 mod audio;
@@ -21,6 +21,8 @@ mod io;
 mod level;
 mod maybe_send;
 mod models;
+#[cfg(native)]
+mod platform;
 mod playback;
 mod recognition;
 mod residency;
@@ -57,6 +59,8 @@ pub use models::{
     EndOfTurnModel, InputModels, OutputModels, SharedModelLoader, SharedModels, Speaker,
     Transcriber, Vad, VadFactory, VadFrame,
 };
+#[cfg(native)]
+pub use platform::audio_session::{AudioSession, Session, SessionConfig, SessionMode};
 pub use say::{SayCancel, SayEvent, SayOptions, SayOutcome, Saying, StopReason};
 pub use setup::{VoiceInput, VoiceOutput, VoiceSetup};
 pub use take::{Take, TakePause, TakeTurn};

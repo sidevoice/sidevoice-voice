@@ -54,6 +54,12 @@ rtrb = "=0.4.0"
 sonora = "=0.2.0"
 tokio = { version = "1.53.2", default-features = false, features = ["rt", "sync", "time"] }
 
+# iOS only: the process's audio session (src/platform/audio_session/ios.rs). cpal already links these on iOS, with the same
+# features.
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2-avf-audio = { version = "0.3", default-features = false, features = ["std", "AVAudioSession", "AVAudioSessionTypes"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSError", "NSString"] }
+
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tokio = { version = "1.53.2", default-features = false, features = ["rt-multi-thread", "time"] }
 
