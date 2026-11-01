@@ -4,6 +4,7 @@
 //!
 //! - `audio-comparison`: validate and run the optional C++/Sonora comparison on this host.
 //! - `platform-guard`: reject new OS-specific code outside platform modules.
+//! - `mobile-build ios|android`: the crate built for the phones' targets, linked but not run (xtask/src/mobile.rs).
 //! - `npm`: the npm package `@sidevoice/voice` packed into `target/npm/` (xtask/src/npm.rs).
 //! - `npm-smoke`: that tarball installed as a consumer installs it, and a call run in Node on fake models and a
 //!   fake microphone and speaker.
@@ -13,6 +14,7 @@
 //! - `npm-publish TAG`: the tarball of the Release TAG (a `vX.Y.Z`), verified, staged on npm for the operator to approve.
 
 mod comparison;
+mod mobile;
 mod npm;
 mod platform;
 mod platform_guard;
@@ -27,7 +29,7 @@ use sha2::{Digest, Sha256};
 type Result<T> = std::result::Result<T, String>;
 
 const USAGE: &str =
-    "usage: cargo xtask audio-comparison | platform-guard | npm | npm-smoke | manifest DIR [--tag vX.Y.Z] | publish DIR TAG | npm-publish TAG";
+    "usage: cargo xtask audio-comparison | platform-guard | mobile-build ios|android | npm | npm-smoke | manifest DIR [--tag vX.Y.Z] | publish DIR TAG | npm-publish TAG";
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -35,6 +37,7 @@ fn main() -> ExitCode {
     let result = match args.as_slice() {
         ["audio-comparison"] => comparison::run(),
         ["platform-guard"] => platform_guard::check(),
+        ["mobile-build", platform] => mobile::build(platform),
         ["npm"] => npm::package(),
         ["npm-smoke"] => npm::smoke(),
         ["manifest", dir] => release::manifest(Path::new(dir), None),
