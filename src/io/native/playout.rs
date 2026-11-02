@@ -38,6 +38,8 @@ pub(super) struct Playout {
     /// Where a stop's flush ends, until it has played.
     ending: Option<u64>,
     had_chunks: bool,
+    /// The samples taken when the playback under way began.
+    began: u64,
     drained_reference: u64,
     played: Vec<ReferenceSample>,
 }
@@ -51,6 +53,7 @@ impl Playout {
             queue: Queue::default(),
             ending: None,
             had_chunks: false,
+            began: 0,
             drained_reference: 0,
             played: Vec::new(),
         }
@@ -80,6 +83,9 @@ impl Playout {
                         + 2,
                 );
                 resampler.process(&samples, &mut resampled);
+                if !self.had_chunks {
+                    self.began = counters.consumed.load(Ordering::Acquire);
+                }
                 self.had_chunks = true;
                 self.ending = None;
                 self.queue.play(utterance, chunk, resampled);
@@ -142,6 +148,12 @@ impl Playout {
             counters.referenced.load(Ordering::Acquire),
             self.drained_reference,
         ) {
+            // A reply whose chunks come slower than they play ends several times, once at each gap.
+            let played = consumed.saturating_sub(self.began);
+            tracing::info!(
+                ms = played * 1000 / u64::from(self.rate.max(1)),
+                "speaker playback ended"
+            );
             sink.send(IoEvent::PlaybackEnded);
             pipeline.reset_playback_meter();
             self.ending = None;

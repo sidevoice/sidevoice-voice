@@ -1,5 +1,5 @@
-//! What a microphone stream delivered in its first seconds — its callbacks, its samples and the glitches it reported —
-//! handed out once. Counts only: nothing of what was heard.
+//! What a stream (a microphone or a speaker) delivered — its callbacks, its samples and the glitches it reported (an
+//! overrun or an underrun) —, its first seconds handed out once. Counts only: nothing of what was heard or played.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};

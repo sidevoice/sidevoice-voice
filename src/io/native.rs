@@ -51,6 +51,8 @@ const PLAYBACK_SECONDS: u32 = 120;
 const BACKLOG_SECONDS: u32 = 2;
 /// How often the audio thread wakes.
 const TICK: Duration = Duration::from_millis(5);
+/// How often, at most, the speaker's underruns are said.
+const UNDERRUNS_SAID_EVERY: Duration = Duration::from_secs(1);
 
 /// The system's microphone and speaker, the default ones or those chosen, with echo cancellation.
 #[derive(Default)]
@@ -318,6 +320,7 @@ fn run(sink: &IoSink, devices: &NativeDevices, input: bool, control: &Control) {
             }
             None => heard.clear(),
         }
+        speaker.say_health(Instant::now());
         if changed.swap(false, Ordering::AcqRel) {
             pipeline.reinitialize();
         }
@@ -452,6 +455,11 @@ struct Speaker {
     gone: Arc<AtomicBool>,
     /// Whether the system took the default device away under it: it is opened again on the default one.
     rerouted: Arc<AtomicBool>,
+    /// What its stream played and the underruns it reported.
+    tally: Arc<Tally>,
+    /// The underruns said so far, and when they last were.
+    underruns_said: u64,
+    underruns_said_at: Option<Instant>,
 }
 
 impl Speaker {
@@ -481,12 +489,37 @@ impl Speaker {
             &rerouted,
             None,
         );
+        // An underrun is no failure, and is counted.
+        let tally = Arc::new(Tally::new(Instant::now()));
+        let failed = {
+            let (tally, mut failed) = (Arc::clone(&tally), failed);
+            move |error: cpal::Error| {
+                if goes_on(error.kind()) {
+                    tally.glitched();
+                }
+                failed(error);
+            }
+        };
+        tracing::info!(
+            rate,
+            channels = config.channels(),
+            format = %config.sample_format(),
+            "speaker stream opened"
+        );
         let stream_config = config.config();
         let stream = match config.sample_format() {
-            SampleFormat::F32 => speak::<f32>(&output, stream_config, player, &counters, failed),
-            SampleFormat::I16 => speak::<i16>(&output, stream_config, player, &counters, failed),
-            SampleFormat::U16 => speak::<u16>(&output, stream_config, player, &counters, failed),
-            SampleFormat::I32 => speak::<i32>(&output, stream_config, player, &counters, failed),
+            SampleFormat::F32 => {
+                speak::<f32>(&output, stream_config, player, &counters, &tally, failed)
+            }
+            SampleFormat::I16 => {
+                speak::<i16>(&output, stream_config, player, &counters, &tally, failed)
+            }
+            SampleFormat::U16 => {
+                speak::<u16>(&output, stream_config, player, &counters, &tally, failed)
+            }
+            SampleFormat::I32 => {
+                speak::<i32>(&output, stream_config, player, &counters, &tally, failed)
+            }
             _ => Err("audio-format-unsupported".into()),
         }?;
         stream.play().map_err(|error| code(&error))?;
@@ -498,7 +531,37 @@ impl Speaker {
             rate,
             gone,
             rerouted,
+            tally,
+            underruns_said: 0,
+            underruns_said_at: None,
         })
+    }
+
+    /// Says what its stream delivered once its first seconds are over, and the underruns it reported since they were
+    /// last said, at most every [`UNDERRUNS_SAID_EVERY`].
+    fn say_health(&mut self, now: Instant) {
+        if let Some(counts) = self.tally.due(now) {
+            tracing::info!(
+                seconds = tally::FIRST_SECONDS.as_secs(),
+                callbacks = counts.callbacks,
+                samples = counts.samples,
+                underruns = counts.glitches,
+                "speaker stream first seconds"
+            );
+        }
+        let underruns = self.tally.counts().glitches;
+        let due = self
+            .underruns_said_at
+            .is_none_or(|said| now.duration_since(said) >= UNDERRUNS_SAID_EVERY);
+        if underruns > self.underruns_said && due {
+            tracing::warn!(
+                underruns = underruns - self.underruns_said,
+                total = underruns,
+                "speaker stream underran"
+            );
+            self.underruns_said = underruns;
+            self.underruns_said_at = Some(now);
+        }
     }
 }
 
@@ -535,23 +598,26 @@ where
     }
 }
 
-/// The speaker's stream: every frame from the player, the same sample on every channel.
+/// The speaker's stream: every frame from the player, the same sample on every channel, each callback counted in
+/// `tally`.
 fn speak<T>(
     device: &cpal::Device,
     config: StreamConfig,
     mut player: Output,
     counters: &Arc<Counters>,
+    tally: &Arc<Tally>,
     failed: impl FnMut(cpal::Error) + Send + 'static,
 ) -> Result<Stream, String>
 where
     T: SizedSample + FromSample<f32>,
 {
     let channels = usize::from(config.channels).max(1);
-    let counters = Arc::clone(counters);
+    let (counters, tally) = (Arc::clone(counters), Arc::clone(tally));
     device
         .build_output_stream::<T, _, _>(
             config,
             move |data: &mut [T], _| {
+                tally.heard(data.len());
                 for frame in data.chunks_exact_mut(channels) {
                     let sample = T::from_sample(player.next(&counters));
                     frame.fill(sample);
