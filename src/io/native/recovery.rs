@@ -64,9 +64,24 @@ impl Reopening {
         }
     }
 
-    /// Whether a try is due at `now`.
-    pub(super) fn due(&self, now: Instant) -> bool {
-        now >= self.next
+    /// Whether a try is due at `now`. While the system holds the audio (`held`) only a device chosen anew is tried.
+    pub(super) fn due(&self, now: Instant, held: bool) -> bool {
+        now >= self.next && (!held || self.cause == Cause::Switched)
+    }
+
+    /// The system holds the audio at `now`: whether this is still to be opened again. A stalled stream is not (it is
+    /// waited for, and watched again once the audio is let go); the recovery of one taken away starts over, so that it
+    /// has its whole time once the audio is let go.
+    pub(super) fn held(&mut self, now: Instant) -> bool {
+        match self.cause {
+            Cause::Stalled => false,
+            Cause::Rerouted => {
+                self.since = now;
+                self.next = now;
+                true
+            }
+            Cause::Switched => true,
+        }
     }
 
     /// A try failed at `now`: whether another one is made (when it is due), or the stream is given up.

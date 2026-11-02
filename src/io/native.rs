@@ -258,14 +258,12 @@ fn run(sink: &IoSink, devices: &NativeDevices, input: bool, control: &Control) {
                 Err(code) => return sink.send(IoEvent::Failed(code)),
             }
         }
-        // While the system holds the audio, a stream that stopped is waited for, not opened again.
+        // While the system holds the audio, nothing it stopped or took away is opened again: it is waited for.
         let held = devices.held();
         if held {
+            let now = Instant::now();
             for reopening in [&mut microphone_reopening, &mut speaker_reopening] {
-                if reopening
-                    .as_ref()
-                    .is_some_and(|due| due.cause == Cause::Stalled)
-                {
+                if reopening.as_mut().is_some_and(|due| !due.held(now)) {
                     *reopening = None;
                 }
             }
@@ -285,7 +283,10 @@ fn run(sink: &IoSink, devices: &NativeDevices, input: bool, control: &Control) {
                     now,
                 );
             }
-            if let Some(reopening) = microphone_reopening.as_mut().filter(|due| due.due(now)) {
+            if let Some(reopening) = microphone_reopening
+                .as_mut()
+                .filter(|due| due.due(now, held))
+            {
                 match switched(
                     Microphone::open(
                         &host,
@@ -331,7 +332,7 @@ fn run(sink: &IoSink, devices: &NativeDevices, input: bool, control: &Control) {
                 now,
             );
         }
-        if let Some(reopening) = speaker_reopening.as_mut().filter(|due| due.due(now)) {
+        if let Some(reopening) = speaker_reopening.as_mut().filter(|due| due.due(now, held)) {
             let opened = Speaker::open(
                 &host,
                 devices.chosen().output.as_deref(),
