@@ -603,6 +603,7 @@ struct MicrophoneStream {
     captured: rtrb::Consumer<f32>,
     tally: Arc<Tally>,
     gone: Arc<AtomicBool>,
+    rerouted: Arc<AtomicBool>,
     told: UnboundedReceiver<Message>,
 }
 
@@ -616,17 +617,19 @@ fn microphone_stream() -> MicrophoneStream {
     };
     let (ring, captured) = RingBuffer::new(64);
     let tally = Arc::new(Tally::new(std::time::Instant::now()));
-    let (changed, gone) = (
+    let (changed, gone, rerouted) = (
+        Arc::new(AtomicBool::new(false)),
         Arc::new(AtomicBool::new(false)),
         Arc::new(AtomicBool::new(false)),
     );
-    let failed = failure(&sink, &changed, None, &gone, Some(&tally));
+    let failed = failure(&sink, &changed, None, &gone, &rerouted, Some(&tally));
     MicrophoneStream {
         callback: Box::new(capture::<f32>(ring, Arc::clone(&tally))),
         failed: Box::new(failed),
         captured,
         tally,
         gone,
+        rerouted,
         told,
     }
 }
@@ -640,6 +643,7 @@ fn an_xrun_leaves_the_microphone_open_and_its_samples_flowing() {
         tally,
         gone,
         mut told,
+        ..
     } = microphone_stream();
     callback(&[0.1; 4]);
     failed(cpal::Error::new(cpal::ErrorKind::Xrun));
@@ -665,22 +669,46 @@ fn an_xrun_leaves_the_microphone_open_and_its_samples_flowing() {
 }
 
 #[test]
-fn a_device_gone_after_an_xrun_still_loses_the_microphone() {
+fn a_stream_that_fails_after_an_xrun_still_loses_the_microphone() {
     let MicrophoneStream {
         mut callback,
         mut failed,
         gone,
+        rerouted,
         mut told,
         ..
     } = microphone_stream();
     callback(&[0.1; 4]);
     failed(cpal::Error::new(cpal::ErrorKind::Xrun));
-    failed(cpal::Error::new(cpal::ErrorKind::DeviceNotAvailable));
+    failed(cpal::Error::new(cpal::ErrorKind::StreamInvalidated));
     assert!(gone.load(Ordering::Acquire));
+    assert!(!rerouted.load(Ordering::Acquire));
     match told.try_recv() {
         Ok(Message::Io(_, IoEvent::InputLost(code))) => {
-            assert_eq!(code, "audio-device-unavailable")
+            assert_eq!(code, "audio-device-failed")
         }
         _ => panic!("the lost microphone was not told"),
     }
+}
+
+#[test]
+fn the_default_microphone_taken_away_is_opened_again_untold() {
+    let MicrophoneStream {
+        mut failed,
+        gone,
+        rerouted,
+        mut told,
+        ..
+    } = microphone_stream();
+    failed(cpal::Error::new(cpal::ErrorKind::DeviceNotAvailable));
+    failed(cpal::Error::new(cpal::ErrorKind::DeviceNotAvailable));
+    assert!(rerouted.load(Ordering::Acquire));
+    assert!(
+        !gone.load(Ordering::Acquire),
+        "a route change closed the microphone"
+    );
+    assert!(
+        told.try_recv().is_err(),
+        "a route change was told to the call as a lost device"
+    );
 }

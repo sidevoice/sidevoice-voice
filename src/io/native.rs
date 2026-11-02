@@ -9,6 +9,10 @@
 //! clean 16 kHz frames to the call, resamples the chunks it is handed to the speaker's rate and feeds them into the
 //! playback ring as room frees up (`playout`), and tells the call when each chunk starts and ends at the speaker. No
 //! C++ runs in a device callback.
+//!
+//! A stream on the system's default device that the system takes away (Android's AAudio does so whenever the route or
+//! the audio mode changes: the loudspeaker chosen, a headset plugged in, a call mode entered) is opened again on the
+//! default as it is now, without telling the call: only a default that cannot be opened again is a lost device.
 #![cfg(native)]
 
 mod devices;
@@ -244,7 +248,12 @@ fn run(sink: &IoSink, devices: &NativeDevices, input: bool, control: &Control) {
                 Err(code) => return sink.send(IoEvent::Failed(code)),
             }
         }
-        if devices.take_switch(Kind::Input) && microphone.is_some() {
+        // A chosen microphone switched, or the default one the system took away, opened again.
+        let input_switch = devices.take_switch(Kind::Input);
+        let input_rerouted = microphone
+            .as_ref()
+            .is_some_and(|open| open.rerouted.load(Ordering::Acquire));
+        if (input_switch || input_rerouted) && microphone.is_some() {
             match switched(
                 Microphone::open(
                     &host,
@@ -266,8 +275,11 @@ fn run(sink: &IoSink, devices: &NativeDevices, input: bool, control: &Control) {
             }
         }
         speaker_switch |= devices.take_switch(Kind::Output);
-        // A speaker that went away plays nothing more: what it was left to play is over.
-        let gone = speaker.gone.load(Ordering::Acquire);
+        // A speaker that went away plays nothing more: what it was left to play is over. The default one the system took
+        // away is opened again at once, on the default as it is now.
+        let rerouted = speaker.rerouted.load(Ordering::Acquire);
+        speaker_switch |= rerouted;
+        let gone = rerouted || speaker.gone.load(Ordering::Acquire);
         if speaker_switch && (playout.queue.is_idle() || gone) {
             speaker_switch = false;
             for event in playout.queue.abandon() {
@@ -376,6 +388,8 @@ struct Microphone {
     failed: Arc<AtomicBool>,
     /// What its stream delivered, said once its first seconds are over.
     tally: Arc<Tally>,
+    /// Whether the system took the default device away under it: it is opened again on the default one.
+    rerouted: Arc<AtomicBool>,
 }
 
 impl Microphone {
@@ -391,12 +405,14 @@ impl Microphone {
         let (rate, channels) = (config.sample_rate(), usize::from(config.channels()));
         let (capture_in, capture) = RingBuffer::new((rate * BACKLOG_SECONDS) as usize * channels);
         let failed_flag = Arc::new(AtomicBool::new(false));
+        let rerouted = Arc::new(AtomicBool::new(false));
         let tally = Arc::new(Tally::new(Instant::now()));
         let failed = failure(
             sink,
             changed,
             id.map(|_| (Kind::Input, devices)),
             &failed_flag,
+            &rerouted,
             Some(&tally),
         );
         tracing::info!(
@@ -420,6 +436,7 @@ impl Microphone {
             channels,
             failed: failed_flag,
             tally,
+            rerouted,
         })
     }
 }
@@ -433,6 +450,8 @@ struct Speaker {
     rate: u32,
     /// Whether the chosen device went away under it.
     gone: Arc<AtomicBool>,
+    /// Whether the system took the default device away under it: it is opened again on the default one.
+    rerouted: Arc<AtomicBool>,
 }
 
 impl Speaker {
@@ -453,11 +472,13 @@ impl Speaker {
         let player = Output::new(playback_out, reference_in, (rate * FADE_MS / 1000) as usize);
         let counters = Arc::new(Counters::default());
         let gone = Arc::new(AtomicBool::new(false));
+        let rerouted = Arc::new(AtomicBool::new(false));
         let failed = failure(
             sink,
             changed,
             id.map(|_| (Kind::Output, devices)),
             &gone,
+            &rerouted,
             None,
         );
         let stream_config = config.config();
@@ -476,6 +497,7 @@ impl Speaker {
             counters,
             rate,
             gone,
+            rerouted,
         })
     }
 }
@@ -543,17 +565,25 @@ where
 }
 
 /// What a stream does with its errors: a glitch it goes on from (`goes_on`) is counted in a microphone's `tally` and
-/// is no failure; a device that changed under it starts the canceller over; a chosen device (`chosen`: its kind, and
-/// the choice) that went away is lost and marked `gone`, and the default one takes over; any other failure is told
-/// once, and the call stops. `tally` is the microphone's, for its stream; the speaker's has none.
+/// is no failure; a device that changed under it starts the canceller over; the default device taken away (no
+/// `chosen`) is marked `rerouted`, to be opened again on the default as it is now, and is no failure either; a chosen
+/// device (`chosen`: its kind, and the choice) that went away is lost and marked `gone`, and the default one takes
+/// over; any other failure is told once, and the call stops. `tally` is the microphone's, for its stream; the
+/// speaker's has none.
 fn failure(
     sink: &IoSink,
     changed: &Arc<AtomicBool>,
     chosen: Option<(Kind, &NativeDevices)>,
     gone: &Arc<AtomicBool>,
+    rerouted: &Arc<AtomicBool>,
     tally: Option<&Arc<Tally>>,
 ) -> impl FnMut(cpal::Error) + Send + 'static {
-    let (sink, changed, gone) = (sink.clone(), Arc::clone(changed), Arc::clone(gone));
+    let (sink, changed, gone, rerouted) = (
+        sink.clone(),
+        Arc::clone(changed),
+        Arc::clone(gone),
+        Arc::clone(rerouted),
+    );
     let chosen = chosen.map(|(kind, devices)| (kind, devices.clone()));
     let tally = tally.map(Arc::clone);
     let input = tally.is_some();
@@ -569,11 +599,21 @@ fn failure(
             changed.store(true, Ordering::Release);
             return;
         }
+        let stream = if input { "microphone" } else { "speaker" };
+        if error.kind() == ErrorKind::DeviceNotAvailable && chosen.is_none() {
+            if !rerouted.swap(true, Ordering::AcqRel) {
+                tracing::info!(
+                    stream,
+                    error = %error,
+                    "default audio device taken away; opening it again"
+                );
+            }
+            return;
+        }
         if told {
             return;
         }
         told = true;
-        let stream = if input { "microphone" } else { "speaker" };
         tracing::warn!(stream, kind = ?error.kind(), "audio stream error");
         let lost = error.kind() == ErrorKind::DeviceNotAvailable
             && chosen
