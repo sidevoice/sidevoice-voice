@@ -12,7 +12,7 @@ use super::output::{Counters, Output, Queue, ReferenceSample, Schedule};
 use super::pipeline::Pipeline;
 use super::playout::{playback_complete, send_capture_after_playback};
 use super::tally::{Counts, Tally, FIRST_SECONDS};
-use super::{capture, drain, failure, goes_on};
+use super::{capture, drain, failure, goes_on, reopens};
 use crate::call::{Call, Effect, Input};
 use crate::event::{TurnEvent, VoiceEvent};
 use crate::io::{IoEvent, IoSink, RenderedMailbox};
@@ -680,7 +680,7 @@ fn a_stream_that_fails_after_an_xrun_still_loses_the_microphone() {
     } = microphone_stream();
     callback(&[0.1; 4]);
     failed(cpal::Error::new(cpal::ErrorKind::Xrun));
-    failed(cpal::Error::new(cpal::ErrorKind::StreamInvalidated));
+    failed(cpal::Error::new(cpal::ErrorKind::BackendError));
     assert!(gone.load(Ordering::Acquire));
     assert!(!rerouted.load(Ordering::Acquire));
     match told.try_recv() {
@@ -711,4 +711,39 @@ fn the_default_microphone_taken_away_is_opened_again_untold() {
         told.try_recv().is_err(),
         "a route change was told to the call as a lost device"
     );
+}
+
+#[test]
+fn a_stream_the_system_invalidated_is_opened_again_untold() {
+    let MicrophoneStream {
+        mut failed,
+        gone,
+        rerouted,
+        mut told,
+        ..
+    } = microphone_stream();
+    // iOS: a route change (a car kit or a headset taking over, an override, the category) or the media services reset.
+    failed(cpal::Error::new(cpal::ErrorKind::StreamInvalidated));
+    failed(cpal::Error::new(cpal::ErrorKind::StreamInvalidated));
+    assert!(rerouted.load(Ordering::Acquire));
+    assert!(
+        !gone.load(Ordering::Acquire),
+        "a route change closed the microphone"
+    );
+    assert!(
+        told.try_recv().is_err(),
+        "a route change was told to the call as a failure"
+    );
+}
+
+#[test]
+fn what_the_system_takes_away_is_opened_again_and_a_chosen_device_gone_is_lost() {
+    use cpal::ErrorKind;
+    for chosen in [false, true] {
+        assert!(reopens(ErrorKind::StreamInvalidated, chosen), "{chosen}");
+        assert!(!reopens(ErrorKind::BackendError, chosen), "{chosen}");
+        assert!(!reopens(ErrorKind::PermissionDenied, chosen), "{chosen}");
+    }
+    assert!(reopens(ErrorKind::DeviceNotAvailable, false));
+    assert!(!reopens(ErrorKind::DeviceNotAvailable, true));
 }

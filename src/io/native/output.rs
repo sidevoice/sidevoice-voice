@@ -22,6 +22,8 @@ pub(crate) struct Counters {
     pub(crate) referenced: AtomicU64,
     /// Every sample queued before this count is dropped (after the fade).
     pub(crate) flush_to: AtomicU64,
+    /// Callbacks the stream has made: whether it still runs.
+    pub(crate) callbacks: AtomicU64,
 }
 
 /// What the output callback runs: one sample at a time, no lock and no allocation.
@@ -110,12 +112,13 @@ impl Output {
         }
     }
 
-    /// Publishes how many samples were taken.
+    /// Publishes how many samples were taken, once per callback, and counts the callback.
     pub(crate) fn publish(&self, counters: &Counters) {
         counters
             .referenced
             .store(self.referenced, Ordering::Release);
         counters.consumed.store(self.consumed, Ordering::Release);
+        counters.callbacks.fetch_add(1, Ordering::Relaxed);
     }
 }
 
