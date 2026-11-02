@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.2](https://github.com/sidevoice/sidevoice-voice/compare/v0.8.1...v0.8.2) (2026-11-02)
+
+
+### Bug Fixes
+
+* **io:** reopen streams iOS invalidates or stops on a route change ([#99](https://github.com/sidevoice/sidevoice-voice/issues/99)) ([9b2029c](https://github.com/sidevoice/sidevoice-voice/commit/9b2029c0e40b2629192e488b8e7645faf36690ff))
+
 ## [0.8.1](https://github.com/sidevoice/sidevoice-voice/compare/v0.8.0...v0.8.1) (2026-11-02)
 
 
