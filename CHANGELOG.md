@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.1](https://github.com/sidevoice/sidevoice-voice/compare/v0.8.0...v0.8.1) (2026-11-02)
+
+
+### Bug Fixes
+
+* **io:** reopen a default stream the system takes away instead of losing it ([#95](https://github.com/sidevoice/sidevoice-voice/issues/95)) ([c3ff848](https://github.com/sidevoice/sidevoice-voice/commit/c3ff8483da0e0cbebdac99156d0e4fb75ef23767))
+
 ## [0.8.0](https://github.com/sidevoice/sidevoice-voice/compare/v0.7.6...v0.8.0) (2026-11-01)
 
 
