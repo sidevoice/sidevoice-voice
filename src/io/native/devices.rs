@@ -82,6 +82,7 @@ struct Shared {
     lost: Mutex<LostDevices>,
     input_switch: AtomicBool,
     output_switch: AtomicBool,
+    held: AtomicBool,
 }
 
 /// A handle on which devices the native call uses: a clone goes to
@@ -139,6 +140,18 @@ impl NativeDevices {
             }
         }
         Ok(self.report(inputs, outputs))
+    }
+
+    /// Whether the system holds the audio (`true`: an interruption, another call, the session taken away), each time
+    /// that changes. While it does, a stream of the call that stops calling back is waited for: opening it again would
+    /// take the audio back from whoever the system gave it to. Once it is let go, a stream that stopped is opened again.
+    pub fn hold(&self, held: bool) {
+        self.shared.held.store(held, Ordering::Release);
+    }
+
+    /// Whether the system holds the audio.
+    pub(crate) fn held(&self) -> bool {
+        self.shared.held.load(Ordering::Acquire)
     }
 
     /// What is chosen now.

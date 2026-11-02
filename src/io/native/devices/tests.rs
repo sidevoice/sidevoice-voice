@@ -110,3 +110,14 @@ fn the_list_says_whether_the_speaker_can_be_chosen_as_the_system_does_under_its_
     assert_eq!(json["outputSelectable"], Session::OUTPUT_SELECTABLE);
     assert!(json.get("output_selectable").is_none());
 }
+
+#[test]
+fn the_audio_held_by_the_system_is_seen_by_every_clone_until_let_go() {
+    let devices = NativeDevices::new();
+    let audio_thread = devices.clone();
+    assert!(!audio_thread.held());
+    devices.hold(true);
+    assert!(audio_thread.held());
+    devices.hold(false);
+    assert!(!audio_thread.held());
+}

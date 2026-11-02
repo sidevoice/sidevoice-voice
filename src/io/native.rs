@@ -10,15 +10,20 @@
 //! playback ring as room frees up (`playout`), and tells the call when each chunk starts and ends at the speaker. No
 //! C++ runs in a device callback.
 //!
-//! A stream on the system's default device that the system takes away (Android's AAudio does so whenever the route or
-//! the audio mode changes: the loudspeaker chosen, a headset plugged in, a call mode entered) is opened again on the
-//! default as it is now, without telling the call: only a default that cannot be opened again is a lost device.
+//! A stream the system takes away is opened again as the route is now, without telling the call (`recovery`):
+//! Android's AAudio disconnects the default device's whenever the route or the audio mode changes (the loudspeaker
+//! chosen, a headset plugged in, a call mode entered), and iOS invalidates them when the route changes (another
+//! output, a car kit, a headset) or its media services reset. It is tried again while the route settles; only one
+//! that cannot be opened again by then is a lost device. A stream that stops calling back without a word (iOS stops
+//! its audio unit while the session is interrupted, and may not start it again) is opened again too, once the system
+//! no longer holds the audio ([`NativeDevices::hold`]).
 #![cfg(native)]
 
 mod devices;
 mod output;
 mod pipeline;
 mod playout;
+mod recovery;
 mod shared;
 mod tally;
 
@@ -39,6 +44,7 @@ pub use self::devices::{AudioDevice, AudioDevices, LostDevices, NativeDevices};
 use self::output::{Counters, Output, ReferenceSample};
 use self::pipeline::Pipeline;
 use self::playout::{Command, Playout};
+use self::recovery::{Cause, Reopening, Watch};
 pub use self::shared::{InputPort, SharedNativeAudio};
 use self::tally::Tally;
 use crate::io::{AudioIo, IoEvent, IoSink};
@@ -214,6 +220,9 @@ fn run(sink: &IoSink, devices: &NativeDevices, input: bool, control: &Control) {
     let mut playout = Playout::new(speaker.rate);
     let mut heard = Vec::new();
     let mut speaker_switch = false;
+    // The microphone and the speaker being opened again, and why.
+    let mut microphone_reopening: Option<Reopening> = None;
+    let mut speaker_reopening: Option<Reopening> = None;
     while !stop.load(Ordering::Acquire) {
         for command in commands.try_iter() {
             playout.command(command, &speaker.counters);
@@ -226,6 +235,7 @@ fn run(sink: &IoSink, devices: &NativeDevices, input: bool, control: &Control) {
         let close = lost || (want == Some(false) && microphone.is_some());
         let open = want == Some(true) && (microphone.is_none() || lost);
         if close || open {
+            microphone_reopening = None;
             let next = if open {
                 match Microphone::open(
                     &host,
@@ -248,44 +258,81 @@ fn run(sink: &IoSink, devices: &NativeDevices, input: bool, control: &Control) {
                 Err(code) => return sink.send(IoEvent::Failed(code)),
             }
         }
-        // A chosen microphone switched, or the default one the system took away, opened again.
+        // While the system holds the audio, a stream that stopped is waited for, not opened again.
+        let held = devices.held();
+        if held {
+            for reopening in [&mut microphone_reopening, &mut speaker_reopening] {
+                if reopening
+                    .as_ref()
+                    .is_some_and(|due| due.cause == Cause::Stalled)
+                {
+                    *reopening = None;
+                }
+            }
+        }
+        // A chosen microphone switched, the one the system took away or that stopped calling back, opened again.
         let input_switch = devices.take_switch(Kind::Input);
-        let input_rerouted = microphone
-            .as_ref()
-            .is_some_and(|open| open.rerouted.load(Ordering::Acquire));
-        if (input_switch || input_rerouted) && microphone.is_some() {
-            match switched(
-                Microphone::open(
-                    &host,
-                    devices.chosen().input.as_deref(),
-                    sink,
-                    devices,
-                    &changed,
-                ),
-                &speaker,
-            ) {
-                Ok((next, rebuilt)) => (microphone, pipeline) = (Some(next), rebuilt),
-                Err(code) => {
-                    sink.send(IoEvent::InputLost(code));
-                    match pipeline_for(None, &speaker) {
-                        Ok(rebuilt) => (microphone, pipeline) = (None, rebuilt),
-                        Err(code) => return sink.send(IoEvent::Failed(code)),
+        if let Some(open) = &mut microphone {
+            let now = Instant::now();
+            if microphone_reopening.is_none() {
+                microphone_reopening = reopening(
+                    "microphone",
+                    input_switch,
+                    open.rerouted.load(Ordering::Acquire),
+                    held,
+                    &mut open.watch,
+                    open.tally.counts().callbacks,
+                    now,
+                );
+            }
+            if let Some(reopening) = microphone_reopening.as_mut().filter(|due| due.due(now)) {
+                match switched(
+                    Microphone::open(
+                        &host,
+                        devices.chosen().input.as_deref(),
+                        sink,
+                        devices,
+                        &changed,
+                    ),
+                    &speaker,
+                ) {
+                    Ok((next, rebuilt)) => {
+                        reopened("microphone", reopening, now);
+                        (microphone, pipeline) = (Some(next), rebuilt);
+                        microphone_reopening = None;
+                    }
+                    Err(code) => {
+                        if !retried("microphone", reopening, &code, now) {
+                            microphone_reopening = None;
+                            sink.send(IoEvent::InputLost(code));
+                            match pipeline_for(None, &speaker) {
+                                Ok(rebuilt) => (microphone, pipeline) = (None, rebuilt),
+                                Err(code) => return sink.send(IoEvent::Failed(code)),
+                            }
+                        }
                     }
                 }
             }
         }
+        // A speaker chosen anew is switched once nothing is left to play. One that went away, that the system took away
+        // or that stopped calling back plays nothing more (what it was left to play is over) and is opened again at
+        // once, on what is chosen or the default as it is now.
         speaker_switch |= devices.take_switch(Kind::Output);
-        // A speaker that went away plays nothing more: what it was left to play is over. The default one the system took
-        // away is opened again at once, on the default as it is now.
-        let rerouted = speaker.rerouted.load(Ordering::Acquire);
-        speaker_switch |= rerouted;
-        let gone = rerouted || speaker.gone.load(Ordering::Acquire);
-        if speaker_switch && (playout.queue.is_idle() || gone) {
-            speaker_switch = false;
-            for event in playout.queue.abandon() {
-                sink.send(event);
-            }
-            let reopened = Speaker::open(
+        let now = Instant::now();
+        if speaker_reopening.is_none() {
+            let gone = speaker.gone.load(Ordering::Acquire);
+            speaker_reopening = reopening(
+                "speaker",
+                gone || (speaker_switch && playout.queue.is_idle()),
+                speaker.rerouted.load(Ordering::Acquire),
+                held,
+                &mut speaker.watch,
+                speaker.counters.callbacks.load(Ordering::Relaxed),
+                now,
+            );
+        }
+        if let Some(reopening) = speaker_reopening.as_mut().filter(|due| due.due(now)) {
+            let opened = Speaker::open(
                 &host,
                 devices.chosen().output.as_deref(),
                 sink,
@@ -293,13 +340,23 @@ fn run(sink: &IoSink, devices: &NativeDevices, input: bool, control: &Control) {
                 &changed,
             )
             .and_then(|next| Ok((pipeline_for(microphone.as_ref(), &next)?, next)));
-            match reopened {
+            match opened {
                 Ok((rebuilt, next)) => {
+                    reopened("speaker", reopening, now);
+                    speaker_reopening = None;
+                    speaker_switch = false;
+                    for event in playout.queue.abandon() {
+                        sink.send(event);
+                    }
                     (speaker, pipeline) = (next, rebuilt);
                     playout = Playout::new(speaker.rate);
                     sink.send(IoEvent::PlaybackEnded);
                 }
-                Err(code) => return sink.send(IoEvent::Failed(code)),
+                Err(code) => {
+                    if !retried("speaker", reopening, &code, now) {
+                        return sink.send(IoEvent::Failed(code));
+                    }
+                }
             }
         }
         playout.exchange(&mut speaker.playback, &mut speaker.reference);
@@ -352,6 +409,71 @@ fn switched(
     Ok((microphone, pipeline))
 }
 
+/// Whether the `stream` that runs is to be opened again, and why: chosen anew (`switch`), taken away by the system
+/// (`rerouted`), or silent since `watch` last saw its count of callbacks (`callbacks`) change, at `now`. While the
+/// system holds the audio (`held`) a silent stream is waited for, not opened again.
+fn reopening(
+    stream: &str,
+    switch: bool,
+    rerouted: bool,
+    held: bool,
+    watch: &mut Watch,
+    callbacks: u64,
+    now: Instant,
+) -> Option<Reopening> {
+    let stalled = watch.stalled(callbacks, now) && !held;
+    let cause = if switch {
+        Cause::Switched
+    } else if rerouted {
+        Cause::Rerouted
+    } else if stalled {
+        tracing::warn!(
+            stream,
+            callbacks,
+            silent_ms = recovery::STALL.as_millis(),
+            "audio stream stopped calling back; opening it again"
+        );
+        Cause::Stalled
+    } else {
+        return None;
+    };
+    Some(Reopening::new(cause, now))
+}
+
+/// Says that `stream` opened again.
+fn reopened(stream: &str, reopening: &Reopening, now: Instant) {
+    tracing::info!(
+        stream,
+        cause = reopening.cause.as_str(),
+        failures = reopening.failures,
+        after_ms = reopening.elapsed_ms(now) as u64,
+        "audio stream opened again"
+    );
+}
+
+/// `stream` did not open again, for `code`: whether it is tried again.
+fn retried(stream: &str, reopening: &mut Reopening, code: &str, now: Instant) -> bool {
+    let again = reopening.failed(now);
+    if !again {
+        tracing::warn!(
+            stream,
+            cause = reopening.cause.as_str(),
+            failures = reopening.failures,
+            after_ms = reopening.elapsed_ms(now) as u64,
+            code,
+            "audio stream could not be opened again; giving up"
+        );
+    } else if reopening.failures == 1 {
+        tracing::info!(
+            stream,
+            cause = reopening.cause.as_str(),
+            code,
+            "audio stream could not be opened again yet; trying again"
+        );
+    }
+    again
+}
+
 /// The device of `kind` with `id` (the default one with none). A chosen one that is not there any more is lost, and
 /// the default one is opened instead.
 fn device(
@@ -390,6 +512,8 @@ struct Microphone {
     tally: Arc<Tally>,
     /// Whether the system took the default device away under it: it is opened again on the default one.
     rerouted: Arc<AtomicBool>,
+    /// Whether it still calls back.
+    watch: Watch,
 }
 
 impl Microphone {
@@ -437,6 +561,7 @@ impl Microphone {
             failed: failed_flag,
             tally,
             rerouted,
+            watch: Watch::new(Instant::now()),
         })
     }
 }
@@ -452,6 +577,8 @@ struct Speaker {
     gone: Arc<AtomicBool>,
     /// Whether the system took the default device away under it: it is opened again on the default one.
     rerouted: Arc<AtomicBool>,
+    /// Whether it still calls back.
+    watch: Watch,
 }
 
 impl Speaker {
@@ -498,6 +625,7 @@ impl Speaker {
             rate,
             gone,
             rerouted,
+            watch: Watch::new(Instant::now()),
         })
     }
 }
@@ -565,8 +693,8 @@ where
 }
 
 /// What a stream does with its errors: a glitch it goes on from (`goes_on`) is counted in a microphone's `tally` and
-/// is no failure; a device that changed under it starts the canceller over; the default device taken away (no
-/// `chosen`) is marked `rerouted`, to be opened again on the default as it is now, and is no failure either; a chosen
+/// is no failure; a device that changed under it starts the canceller over; a stream the system took away or
+/// invalidated (`reopens`) is marked `rerouted`, to be opened again as the route is now, and is no failure either; a chosen
 /// device (`chosen`: its kind, and the choice) that went away is lost and marked `gone`, and the default one takes
 /// over; any other failure is told once, and the call stops. `tally` is the microphone's, for its stream; the
 /// speaker's has none.
@@ -600,12 +728,13 @@ fn failure(
             return;
         }
         let stream = if input { "microphone" } else { "speaker" };
-        if error.kind() == ErrorKind::DeviceNotAvailable && chosen.is_none() {
+        if reopens(error.kind(), chosen.is_some()) {
             if !rerouted.swap(true, Ordering::AcqRel) {
                 tracing::info!(
                     stream,
+                    kind = ?error.kind(),
                     error = %error,
-                    "default audio device taken away; opening it again"
+                    "audio stream taken away by the system; opening it again"
                 );
             }
             return;
@@ -633,6 +762,15 @@ fn failure(
             sink.send(IoEvent::Failed(code(&error)));
         }
     }
+}
+
+/// Whether a stream error of `kind` is the system taking the stream away, to be opened again as the route is now rather
+/// than lost: a stream it invalidated (iOS: the route changed its category, an override or its configuration, as a car
+/// kit or a headset taking over does; the media services reset; Windows: the resources invalidated), or the default
+/// device taken away (Android's AAudio, on any route or audio mode change; iOS: no route for the category, the media
+/// services lost). A chosen device not available is lost instead (the default one takes over).
+fn reopens(kind: ErrorKind, chosen: bool) -> bool {
+    kind == ErrorKind::StreamInvalidated || (kind == ErrorKind::DeviceNotAvailable && !chosen)
 }
 
 /// Whether a stream error of `kind` leaves the stream running: a buffer overrun or underrun (a glitch, which a
