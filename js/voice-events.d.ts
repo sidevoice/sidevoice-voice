@@ -108,6 +108,9 @@ export type VoiceSayEvent =
       sounding: [number, number] | null;
       heard_chars: number;
     }
+  /** The person started a turn over it: stopped and waiting for that turn, heard up to `heard_chars`. A turn with words
+   *  ends it (`barge-in`); one that comes to nothing lets it go on from there (`progress` again). */
+  | { type: "held"; heard_chars: number }
   | { type: "done"; outcome: VoiceSayOutcome };
 
 /** Something the call is saying: the call's `id` for it, `cancel()`, its steps, and how it ended. */

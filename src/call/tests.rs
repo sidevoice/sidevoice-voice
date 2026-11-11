@@ -37,10 +37,11 @@ struct Seen {
     timings: Option<TurnTimings>,
 }
 
-/// What became of something said, as the tests look at it: playing, then heard, cut, not played or failed.
+/// What became of something said, as the tests look at it: playing, held, then heard, cut, not played or failed.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum PlaybackStatus {
     Playing,
+    Held,
     Heard,
     Interrupted,
     Unplayed,
@@ -190,6 +191,9 @@ impl Run {
             .filter_map(|effect| match effect {
                 Effect::Say { id, event } => match event {
                     SayEvent::Playing => Some((id.clone(), PlaybackStatus::Playing, 0)),
+                    SayEvent::Held { heard_chars } => {
+                        Some((id.clone(), PlaybackStatus::Held, *heard_chars))
+                    }
                     SayEvent::Progress { heard_chars, .. } => {
                         heard.insert(id.clone(), *heard_chars);
                         None
@@ -491,8 +495,9 @@ fn resumed_audio_within_patience_continues_the_same_turn() {
     );
 }
 
-#[test]
-fn speech_over_a_reply_interrupts_it_and_drops_the_queue() {
+/// A reply of two chunks and one after it, the first chunk heard and the second sounding when the person speaks over
+/// it: the run after the barge-in, and the effects of the barge-in.
+fn barged_in() -> (Run, Vec<Effect>) {
     let mut run = Run::new(config());
     run.reply(
         "u1",
@@ -508,13 +513,53 @@ fn speech_over_a_reply_interrupts_it_and_drops_the_queue() {
     run.played("u1", 0);
     run.sound("u1", 1);
     run.take();
-
     run.hear(&continuous_loud_speech(80));
     let effects = run.take();
+    (run, effects)
+}
+
+#[test]
+fn speech_over_a_reply_holds_it_and_its_queue() {
+    let (mut run, effects) = barged_in();
     assert!(effects.contains(&Effect::StopPlayback));
     let turns = Run::turns(&effects);
     assert_eq!(turns[0].phase, TurnPhase::Started);
     assert_eq!(turns[0].turn_id, "c-turn-0", "the call names the turn");
+    assert_eq!(
+        Run::playbacks(&effects),
+        [("u1".into(), PlaybackStatus::Held, 24)],
+        "held at the start of the sentence that was cut, nothing ended"
+    );
+    assert!(
+        effects.contains(&Effect::Event(VoiceEvent::State(CallState {
+            listening: Listening::Speaking,
+            recognising: 0,
+            playback: crate::event::PlaybackState::Idle,
+            microphone: Microphone::Live,
+        })))
+    );
+    // A chunk the output reports after the stop changes nothing.
+    run.played("u1", 1);
+    run.input(Input::Synthesized {
+        utterance: "u1".into(),
+        chunk: 1,
+        result: Ok((vec![0.0; 2_400], 24_000)),
+    });
+    let effects = run.take();
+    assert!(Run::playbacks(&effects).is_empty());
+    assert!(!effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::Play { .. })));
+}
+
+#[test]
+fn a_turn_with_words_over_a_held_reply_ends_it_and_its_queue_before_the_turn_is_told() {
+    let (mut run, _) = barged_in();
+    run.hear(&silence(3_000));
+    let (turn, _) = Run::transcribe(&run.take()).expect("transcribed");
+    run.transcribed(turn, "wait, a question");
+    run.wait(2_000);
+    let effects = run.take();
     assert_eq!(
         Run::playbacks(&effects),
         [
@@ -522,13 +567,113 @@ fn speech_over_a_reply_interrupts_it_and_drops_the_queue() {
             ("u2".into(), PlaybackStatus::Unplayed, 0),
         ]
     );
-    // A chunk the output reports after the stop changes nothing.
-    run.played("u1", 1);
-    assert!(Run::playbacks(&run.take()).is_empty());
+    assert_eq!(
+        Run::outcomes(&effects)[0].1,
+        SayOutcome::HeardUpTo {
+            heard_chars: 24,
+            reason: StopReason::BargeIn
+        }
+    );
+    let ended = effects
+        .iter()
+        .position(|effect| {
+            matches!(
+                effect,
+                Effect::Say {
+                    event: SayEvent::Done { .. },
+                    ..
+                }
+            )
+        })
+        .expect("ended");
+    let finished = effects
+        .iter()
+        .position(|effect| {
+            matches!(
+                effect,
+                Effect::Event(VoiceEvent::Turn(TurnEvent::Finished { .. }))
+            )
+        })
+        .expect("finished");
+    assert!(ended < finished, "the cut is told before the words");
+    assert!(!effects.contains(&Effect::StopPlayback), "stopped already");
+    assert!(Run::synthesize(&effects).is_empty());
 }
 
 #[test]
-fn accepted_before_sounding_is_never_played_after_a_spoken_turn_even_if_it_has_no_words() {
+fn a_turn_that_comes_to_nothing_resumes_the_held_reply_from_the_sentence_that_was_cut() {
+    for ending in ["no words", "cancelled"] {
+        let (mut run, _) = barged_in();
+        if ending == "cancelled" {
+            run.input(Input::Cancel);
+        } else {
+            run.hear(&silence(3_000));
+            let (turn, _) = Run::transcribe(&run.take()).expect("transcribed");
+            run.transcribed(turn, "");
+        }
+        let effects = run.take();
+        assert_eq!(Run::turns(&effects)[0].phase, TurnPhase::Cancelled);
+        assert!(
+            Run::playbacks(&effects).is_empty(),
+            "{ending}: nothing ended"
+        );
+        assert!(
+            Run::synthesize(&effects).is_empty(),
+            "{ending}: not before the grace"
+        );
+        // Asked during the grace, it waits behind what is held.
+        run.reply("u3", "Something asked while the reply waits.");
+        assert!(Run::outcomes(&run.take()).is_empty());
+        run.wait(1_000);
+        let effects = run.take();
+        assert_eq!(
+            Run::synthesize(&effects),
+            [("u1".into(), 1, "The macOS job is still running.".into())],
+            "{ending}"
+        );
+        run.sound("u1", 1);
+        run.played("u1", 1);
+        let effects = run.take();
+        assert_eq!(
+            Run::playbacks(&effects),
+            [("u1".into(), PlaybackStatus::Heard, 56)],
+            "{ending}: no second `playing`, heard to its end"
+        );
+        assert_eq!(
+            Run::synthesize(&effects),
+            [(
+                "u2".into(),
+                0,
+                "And one more thing to say after that.".into()
+            )],
+            "{ending}: the queue goes on"
+        );
+    }
+}
+
+#[test]
+fn a_reply_held_past_the_limit_ends_as_a_barge_in_and_does_not_resume() {
+    let (mut run, _) = barged_in();
+    // The turn ends when the audio stops and its transcript is slow to come.
+    run.wait(5_000);
+    let effects = run.take();
+    let (turn, _) = Run::transcribe(&effects).expect("transcribed");
+    assert!(Run::playbacks(&effects).is_empty(), "held yet");
+    run.wait(super::HOLD_LIMIT_MS);
+    assert_eq!(
+        Run::playbacks(&run.take()),
+        [
+            ("u1".into(), PlaybackStatus::Interrupted, 24),
+            ("u2".into(), PlaybackStatus::Unplayed, 0),
+        ]
+    );
+    run.transcribed(turn, "");
+    run.wait(3_000);
+    assert!(Run::synthesize(&run.take()).is_empty());
+}
+
+#[test]
+fn a_reply_not_sounding_yet_is_held_too_and_resumes_only_after_a_turn_with_no_words() {
     for words in ["new request", ""] {
         let mut run = Run::new(config());
         run.reply(
@@ -539,20 +684,8 @@ fn accepted_before_sounding_is_never_played_after_a_spoken_turn_even_if_it_has_n
         run.hear(&speech());
         let effects = run.take();
         assert_eq!(
-            Run::outcomes(&effects),
-            [(
-                "pending".into(),
-                SayOutcome::NotPlayed {
-                    reason: StopReason::BargeIn
-                }
-            )]
-        );
-        assert_eq!(
-            Run::turns(&effects)
-                .iter()
-                .filter(|turn| turn.phase == TurnPhase::Started)
-                .count(),
-            1
+            Run::playbacks(&effects),
+            [("pending".into(), PlaybackStatus::Held, 0)]
         );
         assert!(
             !effects.contains(&Effect::StopPlayback),
@@ -563,10 +696,28 @@ fn accepted_before_sounding_is_never_played_after_a_spoken_turn_even_if_it_has_n
         run.transcribed(turn, words);
         run.wait(2_000);
         let effects = run.take();
-        assert!(
-            Run::synthesize(&effects).is_empty(),
-            "withdrawn audio cannot start after the turn"
-        );
+        if words.is_empty() {
+            assert!(Run::outcomes(&effects).is_empty());
+            assert_eq!(
+                Run::synthesize(&effects),
+                [(
+                    "pending".into(),
+                    0,
+                    "This accepted reply has not reached the speaker.".into()
+                )]
+            );
+        } else {
+            assert_eq!(
+                Run::outcomes(&effects),
+                [(
+                    "pending".into(),
+                    SayOutcome::NotPlayed {
+                        reason: StopReason::BargeIn
+                    }
+                )]
+            );
+            assert!(Run::synthesize(&effects).is_empty());
+        }
     }
 }
 

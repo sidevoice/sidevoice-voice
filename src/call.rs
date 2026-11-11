@@ -7,8 +7,11 @@
 //! - **Recognition** (`recognition`): turns are transcribed one at a time, filtered, held for the merge window and
 //!   reported finished (with the words), cancelled, or joined into the next one.
 //! - **Playback** (`playback`): `Idle → Synthesizing → Playing → Idle`, one thing said after another. A turn that opens
-//!   while something is on its way is a barge-in: it stops and everything queued is dropped. What is to be said waits
-//!   while the person's turn is open or being transcribed, and for the grace after it.
+//!   while something is on its way is a barge-in: it stops sounding and is held, with everything queued, until the
+//!   person's turns settle. The first of them to finish with words ends it all as a barge-in; if they all come to
+//!   nothing (no words, cancelled), it goes on from the start of the sentence that was cut, after the grace. Nothing is
+//!   held longer than [`HOLD_LIMIT_MS`]. What is to be said waits while the person's turn is open or being
+//!   transcribed, and for the grace after it.
 
 #[cfg(test)]
 mod tests;
@@ -97,6 +100,10 @@ const CANCELS_KEPT: usize = 64;
 /// The end-of-turn probability above which a paused turn is over.
 const END_OF_TURN_LIKELY: f32 = 0.5;
 
+/// The longest a barge-in holds what was being said, from the cut: past it the sentence would come back too late to
+/// follow, so it ends as a barge-in even if the person's turn then comes to nothing.
+const HOLD_LIMIT_MS: u64 = 15_000;
+
 /// What the driver must do.
 #[derive(Debug, PartialEq)]
 pub(crate) enum Effect {
@@ -175,6 +182,8 @@ pub(crate) struct Call {
     continuing_chunk: Option<String>,
     /// Nothing starts to be said before this time (the grace after a turn).
     quiet_until: u64,
+    /// When a barge-in held what was being said, while it does.
+    held_since: Option<u64>,
     /// Ids cancelled before the call heard of them: said later, they never play.
     cancelled: VecDeque<String>,
     /// Samples heard in detector windows since the call started: where the next window falls in a take.
@@ -204,6 +213,7 @@ impl Call {
             playback: Playback::default(),
             continuing_chunk: None,
             quiet_until: 0,
+            held_since: None,
             cancelled: VecDeque::new(),
             state: None,
             heard: 0,
@@ -321,9 +331,10 @@ impl Call {
         self.open.is_none() && !self.segmenter.speaking()
     }
 
-    /// Whether a change of the output half may take effect now: nothing is being said.
+    /// Whether a change of the output half may take effect now: nothing is being said, or what is being said is held
+    /// and nothing of it is at the output.
     pub(crate) fn output_idle(&self) -> bool {
-        !self.playback.busy()
+        !self.playback.busy() || self.playback.held()
     }
 
     fn configure(&mut self, config: CallConfig, out: &mut Vec<Effect>) {
@@ -365,9 +376,8 @@ impl Call {
     /// The earliest time [`Call::poll`] has something to do, if any.
     pub(crate) fn deadline(&self) -> Option<u64> {
         let speaking = self.segmenter.speaking();
-        // The grace is a deadline only when its end is all that holds the next one back.
-        let say = (self.playback.waiting()
-            && !self.playback.busy()
+        // The grace is a deadline only when its end is all that holds the next one, or a held one's resume, back.
+        let say = ((self.playback.waiting() && !self.playback.busy() || self.playback.held())
             && !self.held
             && self.quiet(speaking))
         .then_some(self.quiet_until)
@@ -376,6 +386,7 @@ impl Call {
             self.segmenter.deadline(),
             self.recognition.deadline(speaking),
             say,
+            self.held_since.map(|since| since + HOLD_LIMIT_MS),
         ]
         .into_iter()
         .flatten()
@@ -466,7 +477,9 @@ impl Call {
                     started_at: self.epoch_unix_ms + now,
                 })));
                 let mut actions = Vec::new();
-                self.playback.interrupt(StopReason::BargeIn, &mut actions);
+                if self.playback.hold(&mut actions) {
+                    self.held_since.get_or_insert(now);
+                }
                 self.continuing_chunk = None;
                 self.act(actions, out);
             }
@@ -698,10 +711,20 @@ impl Call {
         if let Some(pending) = self.recognition.due(now, speaking) {
             self.finish_pending(now, pending, out);
         }
-        if self.quiet(speaking) && now >= self.quiet_until && !self.playback.busy() && !self.held {
+        if self
+            .held_since
+            .is_some_and(|since| now >= since + HOLD_LIMIT_MS)
+        {
+            self.commit_held(out);
+        }
+        if self.quiet(speaking) && now >= self.quiet_until && !self.held {
             let mut actions = Vec::new();
+            self.playback.resume(&mut actions);
             self.playback.start(&mut actions);
             self.act(actions, out);
+        }
+        if !self.playback.held() {
+            self.held_since = None;
         }
         let state = CallState {
             listening: if !self.started {
@@ -729,8 +752,19 @@ impl Call {
         }
     }
 
-    /// Reports a turn's end, finished with `text` or cancelled without, and forgets it; the grace before anything is
-    /// said starts now.
+    /// Ends what a barge-in holds, as a barge-in: the person's turn brought words, or the hold ran out.
+    fn commit_held(&mut self, out: &mut Vec<Effect>) {
+        self.held_since = None;
+        if !self.playback.held() {
+            return;
+        }
+        let mut actions = Vec::new();
+        self.playback.interrupt(StopReason::BargeIn, &mut actions);
+        self.act(actions, out);
+    }
+
+    /// Reports a turn's end, finished with `text` (which first ends what a barge-in holds) or cancelled without, and
+    /// forgets it; the grace before anything is said starts now.
     fn close_turn(
         &mut self,
         now: u64,
@@ -742,6 +776,9 @@ impl Call {
         let Some(turn) = self.turns.remove(&number) else {
             return;
         };
+        if text.is_some() {
+            self.commit_held(out);
+        }
         let event = match text {
             Some(text) => {
                 let ended = turn.ended_ms.unwrap_or(now);

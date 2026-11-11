@@ -1,7 +1,8 @@
 //! The playback queue: what the call is asked to say waits in order; the first is spoken chunk by chunk (each
 //! synthesized while the one before plays, never further ahead: at most [`AHEAD`] chunks are at the output unplayed) and
-//! played, and its heard position moves as each chunk finishes playing at the speaker. A barge-in, a stop or a cancel
-//! ends what it reaches, and each ending says how ([`SayOutcome`]).
+//! played, and its heard position moves as each chunk finishes playing at the speaker. A stop or a cancel ends what it
+//! reaches, and each ending says how ([`SayOutcome`]). A barge-in holds it all instead: what sounds stops and the
+//! queue waits, to be resumed from the start of the chunk that was cut, or ended as a barge-in.
 //!
 //! The heard position is counted at chunk boundaries: a chunk counts as heard once its last sample left the speaker,
 //! never in part, since nothing here knows when each word sounded.
@@ -72,6 +73,8 @@ pub(crate) enum Action {
 pub(crate) struct Playback {
     queue: VecDeque<Utterance>,
     current: Option<Current>,
+    /// Held by a barge-in: nothing is synthesized or started until it is resumed or interrupted.
+    held: bool,
 }
 
 impl Playback {
@@ -113,17 +116,23 @@ impl Playback {
         !self.queue.is_empty()
     }
 
+    /// Whether a barge-in holds something being said or waiting.
+    pub(crate) fn held(&self) -> bool {
+        self.held && (self.current.is_some() || !self.queue.is_empty())
+    }
+
     pub(crate) fn state(&self) -> PlaybackState {
         match &self.current {
             None => PlaybackState::Idle,
+            Some(_) if self.held => PlaybackState::Idle,
             Some(current) if current.sounding.is_some() => PlaybackState::Playing,
             Some(_) => PlaybackState::Synthesizing,
         }
     }
 
-    /// Starts the next one, if nothing is being said.
+    /// Starts the next one, if nothing is being said and nothing is held.
     pub(crate) fn start(&mut self, actions: &mut Vec<Action>) {
-        if self.current.is_some() {
+        if self.current.is_some() || self.held {
             return;
         }
         let Some(utterance) = self.queue.pop_front() else {
@@ -240,9 +249,49 @@ impl Playback {
         actions.push(done(utterance, SayOutcome::Heard));
     }
 
-    /// The person spoke over the playback (`BargeIn`), or the call stopped (`Stopped`): what is being said ends (cut
-    /// if it had sounded, not played if not) and everything queued is dropped, not played, for the same reason.
+    /// The person started a turn over the playback: what is being said stops sounding and waits, with everything
+    /// queued, until [`Playback::resume`] or [`Playback::interrupt`]. What of it is at the output goes, and it is told
+    /// [`SayEvent::Held`] with what was heard of it. It resumes from there, the start of the chunk that was cut: that
+    /// sentence is said again whole. Answers whether anything is held; something held already stays as it is.
+    pub(crate) fn hold(&mut self, actions: &mut Vec<Action>) -> bool {
+        if self.held() {
+            return true;
+        }
+        if let Some(current) = &mut self.current {
+            if current.next > current.played || current.sounding.is_some() {
+                actions.push(Action::Stop);
+            }
+            // A synthesis under way is ignored when it comes: the resume asks again from the chunk that was cut.
+            current.next = current.played;
+            current.synthesizing = false;
+            current.sounding = None;
+            let heard_chars = heard(current);
+            let id = current.utterance.id.clone();
+            actions.push(say(&id, SayEvent::Held { heard_chars }));
+        }
+        self.held = self.current.is_some() || !self.queue.is_empty();
+        self.held
+    }
+
+    /// Lets what a barge-in held go on: what was being said is synthesized again from where it was cut, then the
+    /// queue after it.
+    pub(crate) fn resume(&mut self, actions: &mut Vec<Action>) {
+        if !self.held {
+            return;
+        }
+        self.held = false;
+        if self.current.is_some() {
+            self.synthesize_next(actions);
+        } else {
+            self.start(actions);
+        }
+    }
+
+    /// The person spoke over the playback and it is not to go on (`BargeIn`), or the call stopped (`Stopped`): what
+    /// is being said ends (cut if it had sounded, not played if not) and everything queued is dropped, not played, for
+    /// the same reason. Nothing is held after.
     pub(crate) fn interrupt(&mut self, reason: StopReason, actions: &mut Vec<Action>) {
+        self.held = false;
         self.end_current(reason.clone(), actions);
         for utterance in self.queue.drain(..) {
             actions.push(done(
@@ -301,8 +350,11 @@ impl Playback {
             .filter(|current| current.utterance.id == utterance)
     }
 
-    /// Synthesizes the next chunk, unless one is under way or [`AHEAD`] are at the output unplayed.
+    /// Synthesizes the next chunk, unless it is held, one is under way or [`AHEAD`] are at the output unplayed.
     fn synthesize_next(&mut self, actions: &mut Vec<Action>) {
+        if self.held {
+            return;
+        }
         let Some(current) = &mut self.current else {
             return;
         };

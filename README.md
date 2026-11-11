@@ -203,9 +203,9 @@ A `VoiceCall` owns turn segmentation, recognition, saying handles and playback s
 without exchanging text or state. The app decides which call receives real microphone frames. A call that receives
 zeros keeps its own open turn and ends it through the ordinary VAD and patience rules; routing back before that
 endpoint continues the same turn. Routing never forces a transcript to finish. Continuous qualified speech still
-cuts that call's sounding and queued saying handles; each handle's `done` event and flat `outcome` promise report
-`heard`, `heard-up-to` or `not-played` with `reason` (`barge-in`, `cancelled`, `stopped` or `failed`) and `code` for a
-failure. There is no separate cut event.
+holds that call's sounding and queued saying handles (`held`), and its turn decides: words end them (`barge-in`),
+nothing lets them go on. Each handle's `done` event and flat `outcome` promise report `heard`, `heard-up-to` or
+`not-played` with `reason` (`barge-in`, `cancelled`, `stopped` or `failed`) and `code` for a failure.
 
 Natively, `SharedNativeAudio::new(devices)` owns one physical microphone, speaker, and AEC3 instance. `attach()`
 returns `(Box<dyn AudioIo>, InputPort)` for one call. `route_input(Some(&port)).await` acknowledges a next-frame
@@ -321,8 +321,11 @@ time; a task around it (`src/voice_call.rs`) feeds it and does what it answers.
 - **Playback.** What the app asks to say is cut into sentence chunks, each synthesized while the one before plays and
   never further ahead (two chunks at most at the speaker unplayed). It waits while the person's turn is open or being
   transcribed, and for the grace after it. A turn that opens while something is on its way is a barge-in: the speaker
-  stops with a short fade (the host's `output.fade_ms`, 30 ms), what sounded is heard up to where it got, and everything queued is not played
-  (`barge-in`). A cancel through the handle does the same to it alone (`cancelled`); a stop, to all (`stopped`), and
+  stops with a short fade (the host's `output.fade_ms`, 30 ms), and what was being said is held, with everything
+  queued, until the person's turns settle. The first to finish with words ends it all: what sounded is heard up to
+  where it got, and the rest is not played (`barge-in`), before that turn is told finished. If they all come to
+  nothing (no words, or cancelled), it goes on after the grace from the start of the sentence that was cut, which is
+  where its heard position stood. Nothing is held more than 15 s from the cut: past that it ends as a barge-in. A cancel through the handle does the same to it alone (`cancelled`); a stop, to all (`stopped`), and
   what is asked while the call is stopped is not played. What cannot be spoken ends `failed` with its code, which is
   also an error, and what of it was at the speaker is flushed.
 - **The heard position** moves at chunk boundaries: a chunk counts once its last sample left the speaker, never in
@@ -337,7 +340,8 @@ The call knows nothing of the room; the app translates both ways.
   `cancelled {turn_id, merged}` (nothing came of it, or it joined the next turn). Turns may overlap: one can be
   transcribed while the next is spoken.
 - **Things said** (`say(text, {language?})` → a `Saying` handle under the call's own id): `playing`, then
-  `progress {sounding, heard_chars}` as each chunk starts and ends, then `done {outcome}`, the outcome being `heard`,
+  `progress {sounding, heard_chars}` as each chunk starts and ends (`held {heard_chars}` while a barge-in holds it,
+  and `progress` again if it goes on), then `done {outcome}`, the outcome being `heard`,
   `heard-up-to {heard_chars, reason}` or `not-played {reason}`, with `reason` one of `cancelled`, `barge-in`,
   `stopped`, `failed {code}`. `heard_chars` counts Unicode scalar values.
 
