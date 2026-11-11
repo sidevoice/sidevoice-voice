@@ -237,3 +237,73 @@ fn a_failed_synthesis_flushes_audio_queued_before_it_sounded_and_says_why() {
     );
     assert!(!playback.busy());
 }
+
+#[test]
+fn a_hold_stops_the_output_and_a_resume_asks_again_from_the_chunk_that_was_cut() {
+    let mut playback = Playback::default();
+    let mut actions = Vec::new();
+    push(&mut playback, "u", &LONG[..3].join(" "), &mut actions);
+    push(&mut playback, "next", LONG[3], &mut actions);
+    playback.start(&mut actions);
+    playback.synthesized("u", 0, Ok((vec![0.0], 16_000)), &mut actions);
+    playback.chunk_started("u", 0, &mut actions);
+    playback.chunk_played("u", 0, &mut actions);
+    playback.synthesized("u", 1, Ok((vec![0.0], 16_000)), &mut actions);
+    playback.chunk_started("u", 1, &mut actions);
+    actions.clear();
+
+    assert!(playback.hold(&mut actions));
+    assert_eq!(
+        actions,
+        [
+            Action::Stop,
+            Action::Say {
+                utterance: "u".into(),
+                event: SayEvent::Held { heard_chars: 40 }
+            }
+        ]
+    );
+    assert!(playback.held());
+    assert_eq!(playback.state(), PlaybackState::Idle);
+    actions.clear();
+    // Held already: nothing more; and nothing the output or the speaker reports late moves it.
+    assert!(playback.hold(&mut actions));
+    playback.synthesized("u", 2, Ok((vec![0.0], 16_000)), &mut actions);
+    playback.chunk_played("u", 1, &mut actions);
+    playback.start(&mut actions);
+    assert!(actions.is_empty(), "{actions:?}");
+
+    playback.resume(&mut actions);
+    assert!(!playback.held());
+    assert_eq!(synthesized(&actions), [1]);
+}
+
+#[test]
+fn a_held_reply_cancelled_ends_alone_and_its_queue_stays_held() {
+    let mut playback = Playback::default();
+    let mut actions = Vec::new();
+    push(&mut playback, "u", LONG[0], &mut actions);
+    push(&mut playback, "next", LONG[1], &mut actions);
+    playback.start(&mut actions);
+    playback.synthesized("u", 0, Ok((vec![0.0], 16_000)), &mut actions);
+    playback.chunk_started("u", 0, &mut actions);
+    playback.hold(&mut actions);
+    actions.clear();
+
+    assert!(playback.cancel("u", &mut actions));
+    assert_eq!(
+        outcomes(&actions),
+        [(
+            "u".into(),
+            SayOutcome::HeardUpTo {
+                heard_chars: 0,
+                reason: StopReason::Cancelled
+            }
+        )]
+    );
+    assert!(!actions.contains(&Action::Stop), "stopped at the hold");
+    assert!(playback.held());
+    actions.clear();
+    playback.resume(&mut actions);
+    assert_eq!(synthesized(&actions), [0], "the queue goes on");
+}

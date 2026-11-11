@@ -171,7 +171,8 @@ impl WebVoiceCall {
 }
 
 /// Something the call is saying, for JavaScript: its `id`, `cancel()`, `onEvent(listener)` for its steps in order
-/// (`{ type: "playing" }`, `{ type: "progress", sounding, heard_chars }`, `{ type: "done", outcome }`), and `outcome`, a
+/// (`{ type: "playing" }`, `{ type: "progress", sounding, heard_chars }`, `{ type: "held", heard_chars }`,
+/// `{ type: "done", outcome }`), and `outcome`, a
 /// promise of how it ended (`{ status: "heard" }`, `{ status: "heard-up-to", heard_chars, reason }`,
 /// `{ status: "not-played", reason }`).
 #[wasm_bindgen(js_name = Saying)]

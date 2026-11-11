@@ -113,7 +113,7 @@ pub enum Listening {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PlaybackState {
-    /// Nothing to say.
+    /// Nothing is being spoken: nothing to say, or what was being said is held for the person's turn.
     Idle,
     /// Something is being spoken and nothing sounds yet.
     Synthesizing,

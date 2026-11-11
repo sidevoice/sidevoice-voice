@@ -272,7 +272,7 @@ fn rendered_boundaries_precede_qualifying_capture_even_when_the_driver_is_delaye
             .count(),
         1
     );
-    assert!(effects.iter().any(|effect| matches!(effect, Effect::Say { event: SayEvent::Done { outcome: crate::say::SayOutcome::HeardUpTo { heard_chars, reason: crate::say::StopReason::BargeIn } }, .. } if *heard_chars == heard)));
+    assert!(effects.iter().any(|effect| matches!(effect, Effect::Say { event: SayEvent::Held { heard_chars }, .. } if *heard_chars == heard)));
 }
 
 #[test]
