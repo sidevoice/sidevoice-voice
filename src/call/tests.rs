@@ -652,24 +652,25 @@ fn a_turn_that_comes_to_nothing_resumes_the_held_reply_from_the_sentence_that_wa
 }
 
 #[test]
-fn a_reply_held_past_the_limit_ends_as_a_barge_in_and_does_not_resume() {
+fn a_reply_held_through_a_long_turn_resumes_when_it_comes_to_nothing() {
     let (mut run, _) = barged_in();
-    // The turn ends when the audio stops and its transcript is slow to come.
-    run.wait(5_000);
+    // The person speaks for half a minute, then the turn's transcript is slow to come and empty.
+    run.hear(&continuous_loud_speech(30_000 / WINDOW_MS as usize));
+    run.hear(&silence(3_000));
     let effects = run.take();
     let (turn, _) = Run::transcribe(&effects).expect("transcribed");
-    assert!(Run::playbacks(&effects).is_empty(), "held yet");
-    run.wait(super::HOLD_LIMIT_MS);
-    assert_eq!(
-        Run::playbacks(&run.take()),
-        [
-            ("u1".into(), PlaybackStatus::Interrupted, 24),
-            ("u2".into(), PlaybackStatus::Unplayed, 0),
-        ]
-    );
+    assert!(Run::playbacks(&effects).is_empty(), "still held");
+    run.wait(20_000);
+    assert!(Run::playbacks(&run.take()).is_empty(), "no limit ends it");
     run.transcribed(turn, "");
-    run.wait(3_000);
-    assert!(Run::synthesize(&run.take()).is_empty());
+    run.wait(1_000);
+    let effects = run.take();
+    assert!(Run::outcomes(&effects).is_empty());
+    assert_eq!(
+        Run::synthesize(&effects),
+        [("u1".into(), 1, "The macOS job is still running.".into())],
+        "resumed from the sentence that was cut"
+    );
 }
 
 #[test]

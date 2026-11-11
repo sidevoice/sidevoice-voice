@@ -9,9 +9,9 @@
 //! - **Playback** (`playback`): `Idle → Synthesizing → Playing → Idle`, one thing said after another. A turn that opens
 //!   while something is on its way is a barge-in: it stops sounding and is held, with everything queued, until the
 //!   person's turns settle. The first of them to finish with words ends it all as a barge-in; if they all come to
-//!   nothing (no words, cancelled), it goes on from the start of the sentence that was cut, after the grace. Nothing is
-//!   held longer than [`HOLD_LIMIT_MS`]. What is to be said waits while the person's turn is open or being
-//!   transcribed, and for the grace after it.
+//!   nothing (no words, cancelled), it goes on from the start of the sentence that was cut, after the grace, however
+//!   long those turns lasted. What is to be said waits while the person's turn is open or being transcribed, and for
+//!   the grace after it.
 
 #[cfg(test)]
 mod tests;
@@ -100,10 +100,6 @@ const CANCELS_KEPT: usize = 64;
 /// The end-of-turn probability above which a paused turn is over.
 const END_OF_TURN_LIKELY: f32 = 0.5;
 
-/// The longest a barge-in holds what was being said, from the cut: past it the sentence would come back too late to
-/// follow, so it ends as a barge-in even if the person's turn then comes to nothing.
-const HOLD_LIMIT_MS: u64 = 15_000;
-
 /// What the driver must do.
 #[derive(Debug, PartialEq)]
 pub(crate) enum Effect {
@@ -182,8 +178,6 @@ pub(crate) struct Call {
     continuing_chunk: Option<String>,
     /// Nothing starts to be said before this time (the grace after a turn).
     quiet_until: u64,
-    /// When a barge-in held what was being said, while it does.
-    held_since: Option<u64>,
     /// Ids cancelled before the call heard of them: said later, they never play.
     cancelled: VecDeque<String>,
     /// Samples heard in detector windows since the call started: where the next window falls in a take.
@@ -213,7 +207,6 @@ impl Call {
             playback: Playback::default(),
             continuing_chunk: None,
             quiet_until: 0,
-            held_since: None,
             cancelled: VecDeque::new(),
             state: None,
             heard: 0,
@@ -386,7 +379,6 @@ impl Call {
             self.segmenter.deadline(),
             self.recognition.deadline(speaking),
             say,
-            self.held_since.map(|since| since + HOLD_LIMIT_MS),
         ]
         .into_iter()
         .flatten()
@@ -477,9 +469,7 @@ impl Call {
                     started_at: self.epoch_unix_ms + now,
                 })));
                 let mut actions = Vec::new();
-                if self.playback.hold(&mut actions) {
-                    self.held_since.get_or_insert(now);
-                }
+                self.playback.hold(&mut actions);
                 self.continuing_chunk = None;
                 self.act(actions, out);
             }
@@ -711,20 +701,11 @@ impl Call {
         if let Some(pending) = self.recognition.due(now, speaking) {
             self.finish_pending(now, pending, out);
         }
-        if self
-            .held_since
-            .is_some_and(|since| now >= since + HOLD_LIMIT_MS)
-        {
-            self.commit_held(out);
-        }
         if self.quiet(speaking) && now >= self.quiet_until && !self.held {
             let mut actions = Vec::new();
             self.playback.resume(&mut actions);
             self.playback.start(&mut actions);
             self.act(actions, out);
-        }
-        if !self.playback.held() {
-            self.held_since = None;
         }
         let state = CallState {
             listening: if !self.started {
@@ -752,9 +733,8 @@ impl Call {
         }
     }
 
-    /// Ends what a barge-in holds, as a barge-in: the person's turn brought words, or the hold ran out.
+    /// Ends what a barge-in holds, as a barge-in: the person's turn brought words.
     fn commit_held(&mut self, out: &mut Vec<Effect>) {
-        self.held_since = None;
         if !self.playback.held() {
             return;
         }

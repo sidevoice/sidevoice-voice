@@ -34,8 +34,7 @@ pub enum SayEvent {
     /// The person started a turn over it: it stopped sounding, if it had, and waits for that turn, heard so far up to
     /// character `heard_chars`. A turn that comes to nothing (no words, cancelled) lets it go on from there, the start
     /// of the sentence that was cut, told by its next `Progress`; one with words ends it (`heard-up-to` or
-    /// `not-played`, for `barge-in`) before that turn is told finished. Held longer than the call's hold limit, it ends
-    /// the same way.
+    /// `not-played`, for `barge-in`) before that turn is told finished. It waits as long as the turn lasts.
     Held { heard_chars: usize },
     /// How it ended.
     Done { outcome: SayOutcome },
@@ -62,7 +61,7 @@ pub enum SayOutcome {
 pub enum StopReason {
     /// Its handle was cancelled.
     Cancelled,
-    /// The person spoke over it, or before its turn came, and that turn brought words (or outlasted the hold limit).
+    /// The person spoke over it, or before its turn came, and that turn brought words.
     BargeIn,
     /// The call stopped, or was stopped when it was asked.
     Stopped,

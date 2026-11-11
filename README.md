@@ -325,8 +325,9 @@ time; a task around it (`src/voice_call.rs`) feeds it and does what it answers.
   queued, until the person's turns settle. The first to finish with words ends it all: what sounded is heard up to
   where it got, and the rest is not played (`barge-in`), before that turn is told finished. If they all come to
   nothing (no words, or cancelled), it goes on after the grace from the start of the sentence that was cut, which is
-  where its heard position stood. Nothing is held more than 15 s from the cut: past that it ends as a barge-in. A cancel through the handle does the same to it alone (`cancelled`); a stop, to all (`stopped`), and
-  what is asked while the call is stopped is not played. What cannot be spoken ends `failed` with its code, which is
+  where its heard position stood. It waits as long as the person's turns last, with no limit. A cancel through the
+  handle does the same to it alone (`cancelled`); a stop, to all (`stopped`), and what is asked while the call is
+  stopped is not played. What cannot be spoken ends `failed` with its code, which is
   also an error, and what of it was at the speaker is flushed.
 - **The heard position** moves at chunk boundaries: a chunk counts once its last sample left the speaker, never in
   part. It is what a handle's progress and outcome report as `heard_chars`.
