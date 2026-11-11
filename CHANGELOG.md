@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.0](https://github.com/sidevoice/sidevoice-voice/compare/v0.8.2...v0.9.0) (2026-11-11)
+
+
+### Features
+
+* **call:** hold a reply the person speaks over and resume it if their turn comes to nothing ([#103](https://github.com/sidevoice/sidevoice-voice/issues/103)) ([432d1f0](https://github.com/sidevoice/sidevoice-voice/commit/432d1f0fa8285c517bb498934954a3b22ed888a9))
+
 ## [0.8.2](https://github.com/sidevoice/sidevoice-voice/compare/v0.8.1...v0.8.2) (2026-11-02)
 
 
