@@ -1,4 +1,4 @@
-use super::{accepted, Job, Outcome, Recognition, MAX_QUEUE};
+use super::{accepted, join, Job, Outcome, Recognition, MAX_QUEUE};
 
 #[cfg(web)]
 use wasm_bindgen_test::wasm_bindgen_test as test;
@@ -137,4 +137,28 @@ fn a_turn_s_pieces_count_once_against_the_bound_and_the_last_one_is_told() {
     assert_eq!(recognition.push(job(open)).unwrap(), None);
     assert_eq!(recognition.push(job(MAX_QUEUE)), Err(job(MAX_QUEUE)));
     assert_eq!(recognition.clear(), (0..MAX_QUEUE).collect::<Vec<_>>());
+}
+
+#[test]
+fn transcripts_join_with_a_space_unless_a_script_written_without_spaces_meets_it() {
+    assert_eq!(join("hola,", "¿qué tal?"), "hola, ¿qué tal?");
+    assert_eq!(join("你好", "世界"), "你好世界");
+    assert_eq!(
+        join("今日は。", "元気です"),
+        "今日は。元気です",
+        "punctuation is skipped"
+    );
+    assert_eq!(join("สวัสดี", "ครับ"), "สวัสดีครับ");
+    assert_eq!(join("OK", "好的"), "OK好的");
+    assert_eq!(
+        join("안녕하세요", "반가워요"),
+        "안녕하세요 반가워요",
+        "Korean is spaced"
+    );
+    assert_eq!(join("1, 2,", "3"), "1, 2, 3");
+
+    let mut recognition = Recognition::default();
+    recognition.hold(0, "我们".into(), Some("zh".into()), 100);
+    recognition.hold(1, "走吧".into(), Some("zh".into()), 200);
+    assert_eq!(recognition.due(200, false).expect("due").text, "我们走吧");
 }

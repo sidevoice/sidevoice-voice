@@ -20,7 +20,9 @@
 //! - A turn also ends when the audio stops arriving, and when it is closed or cancelled.
 //! - A long turn goes to recognition in pieces, none of them longer than a recogniser takes at once, and nothing of it
 //!   is left out: once its audio reaches 15 s, it is cut in the middle of the next gap of 100 ms or more in its speech,
-//!   where speech goes on again; at 25 s with no such gap, it is cut where it is. The turn goes on with what follows.
+//!   where speech goes on again; at 25 s with no such gap, it is cut where it is, unless it is in a pause. The turn goes
+//!   on with what follows. What is left after a piece when the turn ends, if no speech was heard in it or it lasts no
+//!   more than 300 ms, is no audio to recognise.
 
 mod activity;
 mod overlap;
@@ -58,6 +60,8 @@ const PIECE_FROM: usize = RATE as usize * 15;
 const PIECE_MAX: usize = RATE as usize * 25;
 /// The shortest gap in speech a piece is cut in, in samples: 100 ms.
 const PIECE_GAP: usize = RATE as usize / 10;
+/// The shortest audio a turn's last piece is recognised with, in samples: 300 ms.
+const PIECE_MIN: usize = RATE as usize * 3 / 10;
 /// How long an open turn waits for audio that stopped arriving (a muted or lost microphone) before it ends.
 pub(crate) const AUDIO_IDLE_MS: u64 = 5_000;
 
@@ -104,7 +108,8 @@ pub(crate) enum Segment {
 /// The audio of a turn that ended.
 #[derive(Debug, PartialEq)]
 pub(crate) struct EndedTurn {
-    /// 16 kHz mono samples since its last piece; the pre-roll included when it was cut into none.
+    /// 16 kHz mono samples since its last piece, the pre-roll included when it was cut into none; none when, after a
+    /// piece, nothing voiced or no more than 300 ms of audio was left.
     pub(crate) pcm: Vec<f32>,
     /// The silence that ended it, in milliseconds.
     pub(crate) silence_ms: u64,
@@ -124,13 +129,18 @@ struct Open {
     silent: u64,
     /// The time of the last window, in the call's milliseconds.
     last_audio_ms: u64,
+    /// Whether a piece was cut off it.
+    cut: bool,
+    /// Whether speech was heard in the audio held since the last piece (the turn's opening speech, if none was cut).
+    voiced: bool,
 }
 
 impl Open {
     /// Cuts off the audio held so far as a piece, if it is due one, after a window of `window` samples: `quiet` samples
     /// without speech came before the window, and speech went on again `resumed` samples before the window's end, if it
     /// did. From [`PIECE_FROM`] the cut falls in the middle of a gap of at least [`PIECE_GAP`]; at [`PIECE_MAX`] it takes
-    /// everything held. What follows the cut stays held.
+    /// everything held, though never in a pause (where the turn may end, and leave a piece of nothing but silence).
+    /// What follows the cut stays held.
     fn piece(&mut self, window: usize, quiet: u64, resumed: Option<usize>) -> Option<Vec<f32>> {
         let held = self.pcm.len();
         if let Some(run) = resumed {
@@ -138,10 +148,16 @@ impl Open {
             let gap = held.saturating_sub(run).saturating_sub(gap_from);
             let cut = gap_from + gap / 2;
             if gap >= PIECE_GAP && cut >= PIECE_FROM {
+                self.cut = true;
                 return Some(self.pcm.drain(..cut).collect());
             }
         }
-        (held >= PIECE_MAX).then(|| std::mem::take(&mut self.pcm))
+        if held < PIECE_MAX || self.paused.is_some() {
+            return None;
+        }
+        self.cut = true;
+        self.voiced = false;
+        Some(std::mem::take(&mut self.pcm))
     }
 }
 
@@ -298,12 +314,15 @@ impl Segmenter {
                 paused: None,
                 silent: 0,
                 last_audio_ms: now,
+                cut: false,
+                voiced: true,
             });
             return Some(Segment::Started);
         };
         open.last_audio_ms = now;
         open.heard += pcm.len();
         open.pcm.extend_from_slice(pcm);
+        open.voiced |= self.activity.speaking();
         let quiet = open.silent;
         open.silent = if self.activity.speaking() {
             0
@@ -430,8 +449,10 @@ impl Segmenter {
     fn end(&mut self, silence_ms: u64) -> Segment {
         let open = self.open.take().expect("an open turn");
         self.recent.clear();
+        // After a piece, what is left with no speech in it, or too short to hold a word, is no audio to recognise.
+        let nothing = open.cut && (!open.voiced || open.pcm.len() < PIECE_MIN);
         Segment::Ended(EndedTurn {
-            pcm: open.pcm,
+            pcm: if nothing { Vec::new() } else { open.pcm },
             silence_ms,
         })
     }

@@ -24,7 +24,7 @@ use crate::event::{
     CallState, Listening, Microphone, TurnEvent, TurnTimings, VoiceError, VoiceEvent,
 };
 use crate::playback::{Action, Playback};
-use crate::recognition::{accepted, Job, Outcome, Pending, Recognition};
+use crate::recognition::{accepted, join, Job, Outcome, Pending, Recognition};
 use crate::say::{SayEvent, SayOutcome, StopReason};
 use crate::take::{TakePause, TakeTurn};
 use crate::turns::{duration_ms, Segment, Segmentation, Segmenter, SILENCE_STOP_MS};
@@ -500,7 +500,7 @@ impl Call {
                     language,
                     last: false,
                 }) {
-                    Ok(job) => self.transcribe(job, out),
+                    Ok(job) => self.transcribe(now, job, out),
                     // Its first piece found the queue full: the turn cannot be transcribed whole, and goes.
                     Err(_) => {
                         self.error("transcription-queue-full", out);
@@ -534,7 +534,7 @@ impl Call {
                     language,
                     last: true,
                 }) {
-                    Ok(job) => self.transcribe(job, out),
+                    Ok(job) => self.transcribe(now, job, out),
                     Err(_) => {
                         self.error("transcription-queue-full", out);
                         self.close_turn(now, number, None, false, out);
@@ -573,14 +573,28 @@ impl Call {
         }
     }
 
-    fn transcribe(&mut self, job: Option<Job>, out: &mut Vec<Effect>) {
-        if let Some(job) = job {
-            out.push(Effect::Transcribe {
-                turn: job.turn,
-                pcm: job.pcm,
-                language: job.language,
-            });
+    /// Asks for `job`'s transcript; a job with no audio (a last piece with nothing voiced in it) is heard as nothing at
+    /// once, which finishes its turn with what its pieces held.
+    fn transcribe(&mut self, now: u64, job: Option<Job>, out: &mut Vec<Effect>) {
+        let Some(job) = job else {
+            return;
+        };
+        if job.pcm.is_empty() {
+            self.transcribed(now, job.turn, Ok(String::new()), out);
+            return;
         }
+        out.push(Effect::Transcribe {
+            turn: job.turn,
+            pcm: job.pcm,
+            language: job.language,
+        });
+    }
+
+    /// How many of the person's turns wait for, or are in, transcription: the open turn's pieces are not counted
+    /// until it ends.
+    fn recognising(&self) -> usize {
+        let open = self.open.is_some_and(|turn| self.recognition.holds(turn));
+        self.recognition.len() - usize::from(open)
     }
 
     fn transcribed(
@@ -604,17 +618,19 @@ impl Call {
             }
         };
         let Some(record) = self.turns.get_mut(&turn) else {
-            self.transcribe(next, out);
+            self.transcribe(now, next, out);
             return;
         };
         // A piece's transcript waits for the rest of its turn; the last one carries them all, in order.
         record.heard.extend(text);
         if !last {
-            self.transcribe(next, out);
+            self.transcribe(now, next, out);
             return;
         }
         let heard = std::mem::take(&mut record.heard);
-        let text = (!heard.is_empty()).then(|| heard.join(" "));
+        let text = heard
+            .into_iter()
+            .reduce(|joined, text| join(&joined, &text));
         match text {
             None => self.close_turn(now, turn, None, false, out),
             Some(text) => {
@@ -642,7 +658,7 @@ impl Call {
                 }
             }
         }
-        self.transcribe(next, out);
+        self.transcribe(now, next, out);
     }
 
     fn cancel_input(&mut self, now: u64, out: &mut Vec<Effect>) {
@@ -765,7 +781,7 @@ impl Call {
             } else {
                 Listening::Listening
             },
-            recognising: self.recognition.len(),
+            recognising: self.recognising(),
             playback: self.playback.state(),
             microphone: if self.started && self.microphone_muted {
                 Microphone::Muted

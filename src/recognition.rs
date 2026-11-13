@@ -4,6 +4,7 @@
 //! split by a pause is reported once.
 
 mod filter;
+mod join;
 
 #[cfg(test)]
 mod tests;
@@ -11,6 +12,7 @@ mod tests;
 use std::collections::VecDeque;
 
 pub(crate) use filter::accepted;
+pub(crate) use join::join;
 
 /// The most turns waiting for, or in, recognition, whatever the number of their pieces.
 pub(crate) const MAX_QUEUE: usize = 8;
@@ -62,8 +64,7 @@ impl Recognition {
     /// Queues a turn's audio and returns the job to start, if none is running. `Err` when it is a turn the queue does not
     /// hold yet and it is full: the job is dropped.
     pub(crate) fn push(&mut self, job: Job) -> Result<Option<Job>, Job> {
-        let held = self.turns().contains(&job.turn);
-        if !held && self.len() >= MAX_QUEUE {
+        if !self.holds(job.turn) && self.len() >= MAX_QUEUE {
             return Err(job);
         }
         self.queue.push_back(job);
@@ -73,6 +74,11 @@ impl Recognition {
     /// Whether `turn` is the one in recognition.
     pub(crate) fn is_active(&self, turn: usize) -> bool {
         self.active.is_some_and(|(active, _)| active == turn)
+    }
+
+    /// Whether a job of `turn` waits for, or is in, recognition.
+    pub(crate) fn holds(&self, turn: usize) -> bool {
+        self.turns().contains(&turn)
     }
 
     /// Whether the job in recognition is the last piece of its turn.
@@ -128,7 +134,7 @@ impl Recognition {
             Some(mut held) => {
                 let joined = held.turns.clone();
                 held.turns.push(turn);
-                held.text = format!("{} {text}", held.text);
+                held.text = join(&held.text, &text);
                 held.deadline = deadline;
                 self.pending = Some(held);
                 Outcome::Joined(joined)

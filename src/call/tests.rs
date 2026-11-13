@@ -1979,3 +1979,44 @@ fn a_three_minute_turn_is_transcribed_in_pieces_and_finished_once_with_every_pie
     assert_eq!(timings.audio_ms, audio as u64 / 16);
     assert!(timings.audio_ms > 180_000, "{}", timings.audio_ms);
 }
+
+#[test]
+fn a_turn_closed_just_after_a_piece_finishes_with_the_piece_s_words_and_sends_no_empty_audio() {
+    let mut run = Run::new(config());
+    run.hear(&silence(500));
+    // Speech until the first piece is cut at 25 s: meanwhile the open turn's piece is not counted as recognising.
+    let mut piece = None;
+    while piece.is_none() {
+        run.hear(&continuous_loud_speech(1));
+        piece = Run::transcribe(&run.effects);
+    }
+    let effects = run.take();
+    let recognising: Vec<usize> = effects
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::Event(VoiceEvent::State(state)) => Some(state.recognising),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        recognising.iter().all(|&count| count == 0),
+        "{recognising:?}"
+    );
+    let (turn, samples) = piece.expect("a piece");
+    assert!(samples >= 25 * 16_000);
+    // Closed at once: nothing is left to transcribe, and the turn now counts as recognising.
+    run.input(Input::EndTurn);
+    let effects = run.take();
+    assert_eq!(Run::transcribe(&effects), None, "no empty audio");
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::Event(VoiceEvent::State(state)) if state.recognising == 1
+    )));
+    run.transcribed(turn, "the words of the piece");
+    run.wait(1_000);
+    let turns = Run::turns(&run.take());
+    let [finished] = &turns[..] else {
+        panic!("{turns:?}")
+    };
+    assert_eq!(finished.text.as_deref(), Some("the words of the piece"));
+}

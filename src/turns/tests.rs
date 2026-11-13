@@ -861,3 +861,60 @@ fn a_turn_opens_with_the_configured_pre_roll() {
     let kept = ended_with(0);
     assert_eq!(ended_with(2_000), kept + 32_000 - 12 * WINDOW);
 }
+
+#[test]
+fn speech_that_runs_into_a_pause_is_never_cut_without_a_gap_in_the_pause() {
+    // Speech up to 20 windows short of 25 s of held audio, then a pause: 25 s is reached inside it, and nothing is cut.
+    let mut segmenter = speaking(SILENCE);
+    let speech_windows = (PIECE_MAX - PRE_ROLL_SAMPLES - WINDOW) / WINDOW - 20;
+    let mut windows = times(speech(LOUD), speech_windows);
+    windows.extend(times(silence(), 3_000 * 16 / WINDOW));
+    let segments = hear(&mut segmenter, &windows, false);
+    let [(at, Segment::Ended(ended))] = &segments[..] else {
+        panic!("{segments:?}")
+    };
+    assert!(ended.pcm.len() > PIECE_MAX, "{}", ended.pcm.len());
+    assert_eq!(
+        ended.pcm[PRE_ROLL_SAMPLES + WINDOW..],
+        samples(&windows[..=*at])[..]
+    );
+}
+
+#[test]
+fn what_is_left_after_a_piece_with_no_speech_or_under_300_ms_is_no_audio() {
+    // Cut at 25 s just as speech stops: the pause after it ends the turn with nothing voiced since the piece.
+    let mut segmenter = speaking(SILENCE);
+    let speech_windows = (PIECE_MAX - PRE_ROLL_SAMPLES - WINDOW) / WINDOW;
+    let mut windows = times(speech(LOUD), speech_windows);
+    windows.extend(times(silence(), 3_000 * 16 / WINDOW));
+    let segments = hear(&mut segmenter, &windows, false);
+    let [(_, Segment::Piece(piece)), (_, Segment::Ended(ended))] = &segments[..] else {
+        panic!("{segments:?}")
+    };
+    assert!(piece.len() >= PIECE_MAX);
+    assert!(ended.pcm.is_empty(), "{}", ended.pcm.len());
+
+    // Cut in continuous speech, then the turn closed at once, or 160 ms of speech later.
+    for after in [0, 5] {
+        let mut segmenter = speaking(SMART);
+        let mut cut = false;
+        while !cut {
+            cut = matches!(
+                segmenter.window(0, &tone(LOUD), 0.9, false),
+                Some(Segment::Piece(_))
+            );
+        }
+        hear(&mut segmenter, &times(speech(LOUD), after), false);
+        let Some(Segment::Ended(ended)) = segmenter.end_now() else {
+            panic!("ended")
+        };
+        assert!(ended.pcm.is_empty(), "{after}: {}", ended.pcm.len());
+    }
+
+    // Without a piece, a turn keeps its audio however short.
+    let mut segmenter = speaking(SMART);
+    let Some(Segment::Ended(ended)) = segmenter.end_now() else {
+        panic!("ended")
+    };
+    assert_eq!(ended.pcm.len(), PRE_ROLL_SAMPLES + WINDOW);
+}
