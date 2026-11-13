@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.1](https://github.com/sidevoice/sidevoice-voice/compare/v0.9.0...v0.9.1) (2026-11-13)
+
+
+### Bug Fixes
+
+* **turns:** transcribe long turns in pieces instead of dropping audio after 60 s ([#106](https://github.com/sidevoice/sidevoice-voice/issues/106)) ([c426205](https://github.com/sidevoice/sidevoice-voice/commit/c426205c8034deb918266ad316e16c906a23f4ae))
+
 ## [0.9.0](https://github.com/sidevoice/sidevoice-voice/compare/v0.8.2...v0.9.0) (2026-11-11)
 
 
