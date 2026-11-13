@@ -3,7 +3,9 @@
 
 use crate::test_support::{clip, EnergyVad, FLEURS_ES, QUILTER};
 
-use super::{instant, loudness, Segment, Segmentation, Segmenter, AUDIO_IDLE_MS, MAX_TURN};
+use super::{
+    instant, loudness, Segment, Segmentation, Segmenter, AUDIO_IDLE_MS, PIECE_FROM, PIECE_MAX,
+};
 
 #[cfg(web)]
 use wasm_bindgen_test::wasm_bindgen_test as test;
@@ -629,10 +631,122 @@ fn a_turn_opens_with_its_pre_roll_and_the_model_hears_it_from_before_its_speech(
     assert_eq!(pcm.len(), 8 * 16_000);
 }
 
+/// Hears `windows` in a turn: every piece cut off on the way, and the turn's end once its audio stops arriving.
+fn pieces(segmenter: &mut Segmenter, windows: &[Heard]) -> (Vec<Vec<f32>>, Vec<f32>) {
+    let mut pieces = Vec::new();
+    for (at, segment) in hear(segmenter, windows, false) {
+        match segment {
+            Segment::Piece(pcm) => pieces.push(pcm),
+            Segment::Paused { .. } => {}
+            other => panic!("window {at}: {other:?}"),
+        }
+    }
+    let Some(Segment::Ended(ended)) = segmenter.poll(AUDIO_IDLE_MS) else {
+        panic!("ended")
+    };
+    (pieces, ended.pcm)
+}
+
+/// The samples of `windows`, one after another.
+fn samples(windows: &[Heard]) -> Vec<f32> {
+    windows
+        .iter()
+        .flat_map(|Heard(pcm, _)| pcm.clone())
+        .collect()
+}
+
+/// Phrases of two seconds of speech, `count` of them, each followed by `gap` windows of silence.
+fn phrases(count: usize, gap: usize) -> Vec<Heard> {
+    (0..count)
+        .flat_map(|_| {
+            let mut phrase = times(speech(LOUD), 2 * 16_000 / WINDOW);
+            phrase.extend(times(silence(), gap));
+            phrase
+        })
+        .collect()
+}
+
 #[test]
-fn a_turn_keeps_a_minute_and_ends_when_its_audio_stops() {
+fn a_turn_of_three_minutes_keeps_every_sample_in_pieces_cut_in_the_gaps_of_its_speech() {
     let mut segmenter = speaking(SMART);
-    for _ in 0..(MAX_TURN / WINDOW + 10) {
+    // Three minutes of phrases with 160 ms gaps between them, and its trailing silence.
+    let windows = phrases(90, 5);
+    let (pieces, rest) = pieces(&mut segmenter, &windows);
+    let mut joined: Vec<f32> = pieces.concat();
+    joined.extend(&rest);
+    // The opening second and window, then everything heard, nothing dropped and nothing repeated.
+    assert_eq!(
+        joined.len(),
+        PRE_ROLL_SAMPLES + WINDOW + windows.len() * WINDOW
+    );
+    assert_eq!(joined[PRE_ROLL_SAMPLES + WINDOW..], samples(&windows)[..]);
+    assert!(pieces.len() >= 7, "{}", pieces.len());
+    for (at, piece) in pieces.iter().enumerate() {
+        assert!(
+            (PIECE_FROM..PIECE_MAX).contains(&piece.len()),
+            "piece {at}: {}",
+            piece.len()
+        );
+        // Cut in the middle of a gap: half of it ends this piece, the other half starts the next.
+        let next = pieces.get(at + 1).unwrap_or(&rest);
+        let gap = 5 * WINDOW / 2;
+        assert!(
+            piece[piece.len() - gap..].iter().all(|&s| s == 0.0),
+            "piece {at}"
+        );
+        assert!(piece[piece.len() - gap - 1] != 0.0, "piece {at}");
+        assert!(next[..gap].iter().all(|&s| s == 0.0), "piece {at}");
+        assert!(next[gap + 1] != 0.0, "piece {at}");
+    }
+}
+
+#[test]
+fn a_piece_is_cut_where_speech_goes_on_after_a_pause_and_not_in_gaps_too_short() {
+    let mut segmenter = speaking(SILENCE);
+    // 16 s of phrases with 64 ms gaps (too short to cut in), a pause of 1.2 s that leaves the turn open, then speech.
+    let mut windows = phrases(8, 2);
+    let pause_from = windows.len();
+    windows.extend(times(silence(), 1_200 * 16 / WINDOW));
+    let pause_to = windows.len();
+    windows.extend(times(speech(LOUD), 60));
+    let (pieces, rest) = pieces(&mut segmenter, &windows);
+    let [piece] = &pieces[..] else {
+        panic!("{} pieces", pieces.len())
+    };
+    // The cut falls inside the pause, not in a short gap before it nor in the speech after it.
+    let opening = PRE_ROLL_SAMPLES + WINDOW;
+    assert!(
+        piece.len() > opening + pause_from * WINDOW,
+        "{}",
+        piece.len()
+    );
+    assert!(piece.len() < opening + pause_to * WINDOW, "{}", piece.len());
+    let mut joined = piece.clone();
+    joined.extend(&rest);
+    assert_eq!(joined[opening..], samples(&windows)[..]);
+}
+
+#[test]
+fn speech_with_no_gap_is_cut_at_25_s_and_still_keeps_every_sample() {
+    let mut segmenter = speaking(SMART);
+    let windows = times(speech(LOUD), 70 * 16_000 / WINDOW);
+    let (pieces, rest) = pieces(&mut segmenter, &windows);
+    assert_eq!(pieces.len(), 2);
+    for piece in &pieces {
+        assert!((PIECE_MAX..PIECE_MAX + WINDOW).contains(&piece.len()));
+    }
+    let mut joined: Vec<f32> = pieces.concat();
+    joined.extend(&rest);
+    assert_eq!(
+        joined.len(),
+        PRE_ROLL_SAMPLES + WINDOW + windows.len() * WINDOW
+    );
+}
+
+#[test]
+fn a_turn_ends_when_its_audio_stops() {
+    let mut segmenter = speaking(SMART);
+    for _ in 0..10 {
         segmenter.window(10, &tone(LOUD), 0.9, false);
     }
     assert_eq!(segmenter.deadline(), Some(10 + AUDIO_IDLE_MS));
@@ -640,7 +754,7 @@ fn a_turn_keeps_a_minute_and_ends_when_its_audio_stops() {
     let Some(Segment::Ended(ended)) = segmenter.poll(10 + AUDIO_IDLE_MS) else {
         panic!("ended")
     };
-    assert_eq!(ended.pcm.len(), MAX_TURN);
+    assert_eq!(ended.pcm.len(), PRE_ROLL_SAMPLES + WINDOW + 10 * WINDOW);
     assert_eq!(segmenter.deadline(), None);
     // Speech that went on through it has to start again to open a turn.
     let segments = hear(&mut segmenter, &times(speech(LOUD), 12), false);

@@ -8,6 +8,7 @@ fn job(turn: usize) -> Job {
         turn,
         pcm: Vec::new(),
         language: None,
+        last: true,
     }
 }
 
@@ -113,4 +114,27 @@ fn transcripts_in_different_languages_are_never_joined() {
     assert_eq!((earlier.turns, earlier.text.as_str()), (vec![0], "hello"));
     let due = recognition.due(200, false).expect("due");
     assert_eq!((due.turns, due.text.as_str()), (vec![1], "hola"));
+}
+
+#[test]
+fn a_turn_s_pieces_count_once_against_the_bound_and_the_last_one_is_told() {
+    let piece = |turn| Job {
+        last: false,
+        ..job(turn)
+    };
+    let mut recognition = Recognition::default();
+    assert_eq!(recognition.push(piece(0)).unwrap(), Some(piece(0)));
+    assert!(!recognition.is_last());
+    for turn in 1..MAX_QUEUE - 1 {
+        assert_eq!(recognition.push(job(turn)).unwrap(), None);
+    }
+    // The open turn's pieces keep coming with the queue full of turns that ended before it.
+    let open = MAX_QUEUE - 1;
+    for _ in 0..3 {
+        assert_eq!(recognition.push(piece(open)).unwrap(), None);
+    }
+    assert_eq!(recognition.len(), MAX_QUEUE);
+    assert_eq!(recognition.push(job(open)).unwrap(), None);
+    assert_eq!(recognition.push(job(MAX_QUEUE)), Err(job(MAX_QUEUE)));
+    assert_eq!(recognition.clear(), (0..MAX_QUEUE).collect::<Vec<_>>());
 }

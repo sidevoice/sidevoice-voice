@@ -662,6 +662,15 @@ fn a_reply_held_through_a_long_turn_resumes_when_it_comes_to_nothing() {
     assert!(Run::playbacks(&effects).is_empty(), "still held");
     run.wait(20_000);
     assert!(Run::playbacks(&run.take()).is_empty(), "no limit ends it");
+    // Half a minute goes to recognition in two pieces, each of them empty.
+    run.transcribed(turn, "");
+    let effects = run.take();
+    assert!(
+        Run::playbacks(&effects).is_empty(),
+        "held for the last piece"
+    );
+    let (last, _) = Run::transcribe(&effects).expect("the last piece");
+    assert_eq!(last, turn);
     run.transcribed(turn, "");
     run.wait(1_000);
     let effects = run.take();
@@ -1931,4 +1940,42 @@ fn a_transcript_is_never_merged_with_one_in_another_language() {
     assert_eq!(finished[1].text.as_deref(), Some("Hola amigo"));
     assert_eq!(finished[1].language.as_deref(), Some("es"));
     assert!(!finished[1].merged);
+}
+
+#[test]
+fn a_three_minute_turn_is_transcribed_in_pieces_and_finished_once_with_every_piece_s_words() {
+    let mut run = Run::new(config());
+    run.hear(&silence(500));
+    // Three minutes of phrases with short gaps between them, which no pause ends.
+    for _ in 0..90 {
+        run.hear(&continuous_loud_speech(60));
+        run.hear(&silence(160));
+    }
+    run.hear(&silence(3_000));
+    let mut transcribed = Vec::new();
+    let mut effects = run.take();
+    while let Some((turn, samples)) = Run::transcribe(&effects) {
+        assert_eq!(turn, 0, "one turn");
+        assert!(samples <= 25 * 16_000, "a piece of {samples} samples");
+        transcribed.push(samples);
+        run.transcribed(turn, &format!("piece{}", transcribed.len()));
+        effects = run.take();
+    }
+    run.wait(1_000);
+    effects.extend(run.take());
+    let turns = Run::turns(&effects);
+    let [finished] = &turns[..] else {
+        panic!("{turns:?}")
+    };
+    assert_eq!(finished.phase, TurnPhase::Finished);
+    let words: Vec<String> = (1..=transcribed.len())
+        .map(|n| format!("piece{n}"))
+        .collect();
+    assert!(transcribed.len() >= 7, "{transcribed:?}");
+    assert_eq!(finished.text.as_deref(), Some(words.join(" ").as_str()));
+    // Every sample of the turn reached recognition: its audio is what the pieces hold, three minutes and more.
+    let audio: usize = transcribed.iter().sum();
+    let timings = finished.timings.expect("timings");
+    assert_eq!(timings.audio_ms, audio as u64 / 16);
+    assert!(timings.audio_ms > 180_000, "{}", timings.audio_ms);
 }

@@ -1,6 +1,7 @@
-//! The recognition queue: turns that ended wait here for their transcript, one at a time and in order, at most eight
-//! of them. A transcript passes the acceptance filter (`filter`), then waits out the merge window: a turn that
-//! follows within it is joined to it, so a sentence split by a pause is reported once.
+//! The recognition queue: turns wait here for their transcript, one job at a time and in order, at most eight turns. A
+//! long turn comes as several jobs, its pieces in order, the last one when it ended. A transcript passes the acceptance
+//! filter (`filter`), then waits out the merge window: a turn that follows within it is joined to it, so a sentence
+//! split by a pause is reported once.
 
 mod filter;
 
@@ -11,14 +12,16 @@ use std::collections::VecDeque;
 
 pub(crate) use filter::accepted;
 
-/// The most turns waiting for, or in, recognition.
+/// The most turns waiting for, or in, recognition, whatever the number of their pieces.
 pub(crate) const MAX_QUEUE: usize = 8;
 
-/// A turn's audio, waiting for its transcript.
+/// A turn's audio, or a piece of it, waiting for its transcript.
 #[derive(Debug, PartialEq)]
 pub(crate) struct Job {
     pub(crate) turn: usize,
     pub(crate) pcm: Vec<f32>,
+    /// Whether it is the turn's last piece: the turn ended with it.
+    pub(crate) last: bool,
     /// The language it was recorded in, which the configuration may have left by the time its transcript arrives.
     pub(crate) language: Option<String>,
 }
@@ -38,7 +41,8 @@ pub(crate) struct Pending {
 #[derive(Debug, Default)]
 pub(crate) struct Recognition {
     queue: VecDeque<Job>,
-    active: Option<usize>,
+    /// The turn of the job in recognition, and whether it is that turn's last piece.
+    active: Option<(usize, bool)>,
     pending: Option<Pending>,
 }
 
@@ -55,10 +59,11 @@ pub(crate) enum Outcome {
 }
 
 impl Recognition {
-    /// Queues a turn's audio and returns the job to start, if none is running. `None` when the queue is full: the turn
-    /// is dropped.
+    /// Queues a turn's audio and returns the job to start, if none is running. `Err` when it is a turn the queue does not
+    /// hold yet and it is full: the job is dropped.
     pub(crate) fn push(&mut self, job: Job) -> Result<Option<Job>, Job> {
-        if self.queue.len() + usize::from(self.active.is_some()) >= MAX_QUEUE {
+        let held = self.turns().contains(&job.turn);
+        if !held && self.len() >= MAX_QUEUE {
             return Err(job);
         }
         self.queue.push_back(job);
@@ -67,7 +72,12 @@ impl Recognition {
 
     /// Whether `turn` is the one in recognition.
     pub(crate) fn is_active(&self, turn: usize) -> bool {
-        self.active == Some(turn)
+        self.active.is_some_and(|(active, _)| active == turn)
+    }
+
+    /// Whether the job in recognition is the last piece of its turn.
+    pub(crate) fn is_last(&self) -> bool {
+        self.active.is_some_and(|(_, last)| last)
     }
 
     /// Ends the active job and returns the next one to start.
@@ -78,7 +88,18 @@ impl Recognition {
 
     /// How many turns wait for, or are in, recognition.
     pub(crate) fn len(&self) -> usize {
-        self.queue.len() + usize::from(self.active.is_some())
+        self.turns().len()
+    }
+
+    /// The turns waiting for, or in, recognition, in order, each once: a turn's pieces follow one another.
+    fn turns(&self) -> Vec<usize> {
+        let active = self.active.map(|(turn, _)| turn);
+        let mut turns: Vec<usize> = active
+            .into_iter()
+            .chain(self.queue.iter().map(|job| job.turn))
+            .collect();
+        turns.dedup();
+        turns
     }
 
     /// Holds a transcript for the merge window, joined to the one already held.
@@ -141,10 +162,11 @@ impl Recognition {
         self.pending.take()
     }
 
-    /// Drops every job, the active one included, and returns their turns.
+    /// Drops every job, the active one included, and returns their turns, each once.
     pub(crate) fn clear(&mut self) -> Vec<usize> {
-        let mut turns: Vec<usize> = self.active.take().into_iter().collect();
-        turns.extend(self.queue.drain(..).map(|job| job.turn));
+        let turns = self.turns();
+        self.active = None;
+        self.queue.clear();
         turns
     }
 
@@ -153,7 +175,7 @@ impl Recognition {
             return None;
         }
         let job = self.queue.pop_front()?;
-        self.active = Some(job.turn);
+        self.active = Some((job.turn, job.last));
         Some(job)
     }
 }

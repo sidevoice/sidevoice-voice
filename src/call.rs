@@ -4,8 +4,9 @@
 //!
 //! - **Listening** (`turns`): `Idle → Listening ⇄ Speaking`: `Speaking` while the person speaks in an open turn, back
 //!   to `Listening` when they pause in it and when it ends. A turn's audio goes to recognition.
-//! - **Recognition** (`recognition`): turns are transcribed one at a time, filtered, held for the merge window and
-//!   reported finished (with the words), cancelled, or joined into the next one.
+//! - **Recognition** (`recognition`): turns are transcribed one at a time (a long one in pieces as it goes, their
+//!   transcripts joined), filtered, held for the merge window and reported finished (with the words), cancelled, or
+//!   joined into the next one.
 //! - **Playback** (`playback`): `Idle → Synthesizing → Playing → Idle`, one thing said after another. A turn that opens
 //!   while something is on its way is a barge-in: it stops sounding and is held, with everything queued, until the
 //!   person's turns settle. The first of them to finish with words ends it all as a barge-in; if they all come to
@@ -146,6 +147,10 @@ struct Turn {
     audio_ms: u64,
     silence_ms: u64,
     recognised_ms: Option<u64>,
+    /// The samples of the pieces of its audio sent to recognition before it ended.
+    pieces: usize,
+    /// The accepted transcripts of those pieces, in order.
+    heard: Vec<String>,
     /// The input language it was recorded in: what its transcript is checked and labelled with, whatever the
     /// configuration says by then.
     language: Option<String>,
@@ -459,6 +464,8 @@ impl Call {
                         audio_ms: 0,
                         silence_ms: 0,
                         recognised_ms: None,
+                        pieces: 0,
+                        heard: Vec::new(),
                         language: self.config.input_language(),
                         mark,
                     },
@@ -478,13 +485,38 @@ impl Call {
                     out.push(Effect::EndOfTurn { turn, pause, pcm });
                 }
             }
+            Segment::Piece(pcm) => {
+                let Some(number) = self.open else {
+                    return;
+                };
+                let Some(turn) = self.turns.get_mut(&number) else {
+                    return;
+                };
+                turn.pieces += pcm.len();
+                let language = turn.language.clone();
+                match self.recognition.push(Job {
+                    turn: number,
+                    pcm,
+                    language,
+                    last: false,
+                }) {
+                    Ok(job) => self.transcribe(job, out),
+                    // Its first piece found the queue full: the turn cannot be transcribed whole, and goes.
+                    Err(_) => {
+                        self.error("transcription-queue-full", out);
+                        self.segmenter.cancel();
+                        self.open = None;
+                        self.close_turn(now, number, None, false, out);
+                    }
+                }
+            }
             Segment::Ended(ended) => {
                 let Some(number) = self.open.take() else {
                     return;
                 };
                 if let Some(turn) = self.turns.get_mut(&number) {
                     turn.ended_ms = Some(now);
-                    turn.audio_ms = duration_ms(ended.pcm.len());
+                    turn.audio_ms = duration_ms(turn.pieces + ended.pcm.len());
                     turn.silence_ms = ended.silence_ms;
                 }
                 // Decided here: what was heard so far.
@@ -500,6 +532,7 @@ impl Call {
                     turn: number,
                     pcm: ended.pcm,
                     language,
+                    last: true,
                 }) {
                     Ok(job) => self.transcribe(job, out),
                     Err(_) => {
@@ -560,6 +593,7 @@ impl Call {
         if !self.recognition.is_active(turn) {
             return;
         }
+        let last = self.recognition.is_last();
         let next = self.recognition.done();
         let language = self.turns.get(&turn).and_then(|turn| turn.language.clone());
         let text = match result {
@@ -569,6 +603,18 @@ impl Call {
                 None
             }
         };
+        let Some(record) = self.turns.get_mut(&turn) else {
+            self.transcribe(next, out);
+            return;
+        };
+        // A piece's transcript waits for the rest of its turn; the last one carries them all, in order.
+        record.heard.extend(text);
+        if !last {
+            self.transcribe(next, out);
+            return;
+        }
+        let heard = std::mem::take(&mut record.heard);
+        let text = (!heard.is_empty()).then(|| heard.join(" "));
         match text {
             None => self.close_turn(now, turn, None, false, out),
             Some(text) => {
