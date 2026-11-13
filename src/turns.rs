@@ -17,8 +17,12 @@
 //!   end-of-turn model, at each stop; the turn ends when it says the turn is over, or once the pause has lasted
 //!   `end_ms` whatever it says. With `silence`, the pause ends the turn once it has lasted `end_ms`. Speech that starts
 //!   again ends the pause, and the turn goes on.
-//! - A turn also ends when the audio stops arriving, and when it is closed or cancelled. It holds at most a minute of
-//!   audio: what comes after is not kept.
+//! - A turn also ends when the audio stops arriving, and when it is closed or cancelled.
+//! - A long turn goes to recognition in pieces, none of them longer than a recogniser takes at once, and nothing of it
+//!   is left out: once its audio reaches 15 s, it is cut in the middle of the next gap of 100 ms or more in its speech,
+//!   where speech goes on again; at 25 s with no such gap, it is cut where it is, unless it is in a pause. The turn goes
+//!   on with what follows. What is left after a piece when the turn ends, if no speech was heard in it or it lasts no
+//!   more than 300 ms, is no audio to recognise.
 
 mod activity;
 mod overlap;
@@ -49,8 +53,15 @@ pub(crate) const SILENCE_STOP_MS: u32 = 200;
 const PRE_SPEECH_MS: usize = 500;
 /// The most audio an end-of-turn model is given: the last eight seconds.
 const END_OF_TURN_AUDIO: usize = RATE as usize * 8;
-/// The most audio one turn keeps.
-const MAX_TURN: usize = RATE as usize * 60;
+/// From how long a turn's audio is cut into a piece in the next gap in its speech, in samples. Recognisers take a
+/// limited length at once: Whisper hears 30-second windows, and some builds of it keep only the first.
+const PIECE_FROM: usize = RATE as usize * 15;
+/// How long a turn's audio gets before it is cut into a piece without a gap, in samples.
+const PIECE_MAX: usize = RATE as usize * 25;
+/// The shortest gap in speech a piece is cut in, in samples: 100 ms.
+const PIECE_GAP: usize = RATE as usize / 10;
+/// The shortest audio a turn's last piece is recognised with, in samples: 300 ms.
+const PIECE_MIN: usize = RATE as usize * 3 / 10;
 /// How long an open turn waits for audio that stopped arriving (a muted or lost microphone) before it ends.
 pub(crate) const AUDIO_IDLE_MS: u64 = 5_000;
 
@@ -89,12 +100,16 @@ pub(crate) enum Segment {
     /// Speech stopped in the open turn: its audio for an end-of-turn model, and the pause's number in the turn, to
     /// ask whether it is over.
     Paused { pcm: Vec<f32>, pause: u32 },
+    /// The open turn's audio since its last piece, cut off to be recognised on its own: the turn goes on, and what it
+    /// holds next follows this audio without a sample left out.
+    Piece(Vec<f32>),
 }
 
 /// The audio of a turn that ended.
 #[derive(Debug, PartialEq)]
 pub(crate) struct EndedTurn {
-    /// 16 kHz mono samples, the pre-roll included.
+    /// 16 kHz mono samples since its last piece, the pre-roll included when it was cut into none; none when, after a
+    /// piece, nothing voiced or no more than 300 ms of audio was left.
     pub(crate) pcm: Vec<f32>,
     /// The silence that ended it, in milliseconds.
     pub(crate) silence_ms: u64,
@@ -114,6 +129,36 @@ struct Open {
     silent: u64,
     /// The time of the last window, in the call's milliseconds.
     last_audio_ms: u64,
+    /// Whether a piece was cut off it.
+    cut: bool,
+    /// Whether speech was heard in the audio held since the last piece (the turn's opening speech, if none was cut).
+    voiced: bool,
+}
+
+impl Open {
+    /// Cuts off the audio held so far as a piece, if it is due one, after a window of `window` samples: `quiet` samples
+    /// without speech came before the window, and speech went on again `resumed` samples before the window's end, if it
+    /// did. From [`PIECE_FROM`] the cut falls in the middle of a gap of at least [`PIECE_GAP`]; at [`PIECE_MAX`] it takes
+    /// everything held, though never in a pause (where the turn may end, and leave a piece of nothing but silence).
+    /// What follows the cut stays held.
+    fn piece(&mut self, window: usize, quiet: u64, resumed: Option<usize>) -> Option<Vec<f32>> {
+        let held = self.pcm.len();
+        if let Some(run) = resumed {
+            let gap_from = held.saturating_sub(window + quiet as usize);
+            let gap = held.saturating_sub(run).saturating_sub(gap_from);
+            let cut = gap_from + gap / 2;
+            if gap >= PIECE_GAP && cut >= PIECE_FROM {
+                self.cut = true;
+                return Some(self.pcm.drain(..cut).collect());
+            }
+        }
+        if held < PIECE_MAX || self.paused.is_some() {
+            return None;
+        }
+        self.cut = true;
+        self.voiced = false;
+        Some(std::mem::take(&mut self.pcm))
+    }
 }
 
 /// Turns out of the detector's windows.
@@ -269,33 +314,42 @@ impl Segmenter {
                 paused: None,
                 silent: 0,
                 last_audio_ms: now,
+                cut: false,
+                voiced: true,
             });
             return Some(Segment::Started);
         };
         open.last_audio_ms = now;
         open.heard += pcm.len();
-        let room = MAX_TURN.saturating_sub(open.pcm.len());
-        open.pcm.extend_from_slice(&pcm[..pcm.len().min(room)]);
+        open.pcm.extend_from_slice(pcm);
+        open.voiced |= self.activity.speaking();
+        let quiet = open.silent;
         open.silent = if self.activity.speaking() {
             0
         } else {
             open.silent + pcm.len() as u64
+        };
+        // Where speech goes on again in this window, from its end: the run that started it, or this window after a gap.
+        let resumed = match change {
+            Some(Change::Started) => Some(self.start_run),
+            _ if self.activity.speaking() && quiet > 0 => Some(pcm.len()),
+            _ => None,
         };
         match change {
             Some(Change::Started) => open.paused = None,
             Some(Change::Stopped) => {
                 open.pauses += 1;
                 open.paused = Some(0);
-                if self.numbers.ask {
-                    let pre_speech =
-                        (PRE_SPEECH_MS + self.numbers.start_ms as usize) * PER_MS as usize;
-                    let length = (open.heard + pre_speech).min(END_OF_TURN_AUDIO);
-                    let from = self.recent.len().saturating_sub(length);
-                    return Some(Segment::Paused {
-                        pcm: self.recent.range(from..).copied().collect(),
-                        pause: open.pauses,
-                    });
+                if !self.numbers.ask {
+                    return None;
                 }
+                let pre_speech = (PRE_SPEECH_MS + self.numbers.start_ms as usize) * PER_MS as usize;
+                let length = (open.heard + pre_speech).min(END_OF_TURN_AUDIO);
+                let from = self.recent.len().saturating_sub(length);
+                return Some(Segment::Paused {
+                    pcm: self.recent.range(from..).copied().collect(),
+                    pause: open.pauses,
+                });
             }
             None => {
                 if let Some(paused) = &mut open.paused {
@@ -307,7 +361,7 @@ impl Segmenter {
                 }
             }
         }
-        None
+        open.piece(pcm.len(), quiet, resumed).map(Segment::Piece)
     }
 
     /// Playback started or stopped with no turn open, in a window of `window` samples: the speech heard so far keeps
@@ -395,8 +449,10 @@ impl Segmenter {
     fn end(&mut self, silence_ms: u64) -> Segment {
         let open = self.open.take().expect("an open turn");
         self.recent.clear();
+        // After a piece, what is left with no speech in it, or too short to hold a word, is no audio to recognise.
+        let nothing = open.cut && (!open.voiced || open.pcm.len() < PIECE_MIN);
         Segment::Ended(EndedTurn {
-            pcm: open.pcm,
+            pcm: if nothing { Vec::new() } else { open.pcm },
             silence_ms,
         })
     }

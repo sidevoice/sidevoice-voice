@@ -25,6 +25,9 @@ futures-util = { version = "0.3.31", default-features = false, features = ["std"
 # The script a language is likely written in, from CLDR's likely subtags in its compiled data
 # (src/recognition/filter.rs).
 icu_locale = "2.3.1"
+# The script each character is written in, from Unicode's Script property in its compiled data: transcripts in a
+# script written without spaces (Chinese, Japanese, Thai...) are joined without one (src/recognition/join.rs).
+icu_properties = "2.4.0"
 # The room's messages and the configuration, read and written as JSON (src/room.rs, src/config.rs).
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
