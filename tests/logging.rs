@@ -274,7 +274,7 @@ fn what_a_call_logs_shows_its_operations_and_holds_no_canary() {
     drop(runtime);
 
     let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
-    // Positive controls: the sites ran, the lines inside the call's task carry its id, and a code that is not plain
+    // Positive controls: the sites ran, the lines inside the call's task carry its id, and an app code that is not plain
     // words is `invalid`.
     for expected in [
         "the call started",
@@ -294,7 +294,7 @@ fn what_a_call_logs_shows_its_operations_and_holds_no_canary() {
         "error.type=\"voice.synthesis-failed\"",
         "transcription{turn=",
         "synthesis{utterance=",
-        "reason=\"invalid\"",
+        "app_code=\"invalid\"",
     ] {
         assert!(log.contains(expected), "{expected} missing from:\n{log}");
     }

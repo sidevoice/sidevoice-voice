@@ -182,7 +182,7 @@ pub(super) async fn loading<T>(
             Ok(_) => debug!(duration_ms, "a model was loaded"),
             Err(code) => warn!(
                 error.type = Failure::ModelLoad.code(),
-                reason = redact::code(code),
+                app_code = redact::code(code),
                 duration_ms,
                 "a model could not be loaded, so its half of the call is unavailable"
             ),

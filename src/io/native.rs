@@ -469,7 +469,7 @@ fn retried(stream: &str, reopening: &mut Reopening, code: &str, now: Instant) ->
             failures = reopening.failures,
             after_ms = reopening.elapsed_ms(now) as u64,
             error.type = Failure::AudioStreamReopen.code(),
-            reason = redact::code(code),
+            app_code = redact::code(code),
             "an audio stream could not be opened again, so it stays closed"
         );
     } else if reopening.failures == 1 {
@@ -477,7 +477,7 @@ fn retried(stream: &str, reopening: &mut Reopening, code: &str, now: Instant) ->
             stream,
             cause = reopening.cause.as_str(),
             error.type = Failure::AudioStreamReopen.code(),
-            reason = redact::code(code),
+            app_code = redact::code(code),
             "an audio stream could not be opened again yet; trying again"
         );
     }

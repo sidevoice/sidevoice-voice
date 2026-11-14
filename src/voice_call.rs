@@ -816,7 +816,7 @@ impl Driver {
         }
         debug!(
             error.type = Failure::InputLost.code(),
-            reason = redact::code(&code),
+            app_code = redact::code(&code),
             "the microphone was lost, so the call loses its input"
         );
         if self.output.is_none() {
@@ -1087,7 +1087,7 @@ impl Driver {
                                 Ok(_) => debug!(samples, duration_ms, "a turn was transcribed"),
                                 Err(code) => warn!(
                                     error.type = Failure::Transcription.code(),
-                                    reason = redact::code(code),
+                                    app_code = redact::code(code),
                                     samples,
                                     duration_ms,
                                     "a turn could not be transcribed, so it gets no text"
@@ -1122,7 +1122,7 @@ impl Driver {
                                 Ok(_) => debug!(duration_ms, "a reply chunk was synthesized"),
                                 Err(code) => warn!(
                                     error.type = Failure::Synthesis.code(),
-                                    reason = redact::code(code),
+                                    app_code = redact::code(code),
                                     duration_ms,
                                     "a reply chunk could not be spoken, so the reply is cut short"
                                 ),
@@ -1218,7 +1218,7 @@ fn log_event(event: &VoiceEvent) {
         }
         VoiceEvent::Error(error) => debug!(
             error.type = Failure::Reported.code(),
-            reason = redact::code(&error.code),
+            app_code = redact::code(&error.code),
             "a failure was handed to the app"
         ),
         _ => {}
