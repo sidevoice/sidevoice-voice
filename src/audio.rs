@@ -4,6 +4,8 @@
 #[cfg(test)]
 mod tests;
 
+use crate::redact::opaque_debug;
+
 /// Samples in one 10 ms frame at 16 kHz.
 pub(crate) const FRAME: usize = 160;
 
@@ -121,7 +123,7 @@ impl Biquad {
 }
 
 /// Cuts a stream into whole 10 ms frames, keeping the rest for the next samples.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(crate) struct Framer {
     pending: Vec<f32>,
 }
@@ -140,3 +142,5 @@ impl Framer {
         self.pending.clear();
     }
 }
+
+opaque_debug!(Framer);

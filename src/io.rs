@@ -2,6 +2,8 @@
 //! the echo of the call's own playback already cancelled, and the speaker plays the chunks of what is said in order
 //! and says when each starts and ends. The platform's implementations are in `io/`; each file says where it runs.
 
+use crate::redact::{opaque_debug, samples};
+use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use futures_channel::mpsc::UnboundedSender;
@@ -17,7 +19,7 @@ pub use native::{
 };
 
 /// What the microphone and the speaker tell the call.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum IoEvent {
     /// What was asked for is open (the speaker, and the microphone when asked): the call listens from now.
     Ready,
@@ -71,7 +73,6 @@ pub(crate) struct RenderedMailbox {
     latest: Option<RenderedFrame>,
 }
 
-#[derive(Debug)]
 pub(crate) struct RenderedFrame {
     pub(crate) samples: Vec<f32>,
     pub(crate) skipped: bool,
@@ -211,5 +212,32 @@ mod tests {
         mailbox.lock().unwrap().advance(2);
         sink.send(IoEvent::Rendered(vec![0.8; 160]));
         assert!(mailbox.lock().unwrap().take(2).is_none());
+    }
+}
+
+opaque_debug!(RenderedFrame);
+
+/// Everything but the audio: its sample count stands for it.
+impl fmt::Debug for IoEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ready => f.write_str("Ready"),
+            Self::Captured(audio) => f.debug_tuple("Captured").field(&samples(audio)).finish(),
+            Self::Rendered(audio) => f.debug_tuple("Rendered").field(&samples(audio)).finish(),
+            Self::PlaybackEnded => f.write_str("PlaybackEnded"),
+            Self::ChunkStarted { utterance, chunk } => f
+                .debug_struct("ChunkStarted")
+                .field("utterance", utterance)
+                .field("chunk", chunk)
+                .finish(),
+            Self::ChunkPlayed { utterance, chunk } => f
+                .debug_struct("ChunkPlayed")
+                .field("utterance", utterance)
+                .field("chunk", chunk)
+                .finish(),
+            Self::MicrophoneMuted(muted) => f.debug_tuple("MicrophoneMuted").field(muted).finish(),
+            Self::InputLost(code) => f.debug_tuple("InputLost").field(code).finish(),
+            Self::Failed(code) => f.debug_tuple("Failed").field(code).finish(),
+        }
     }
 }

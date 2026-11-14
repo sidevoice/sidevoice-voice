@@ -9,6 +9,7 @@
 #[cfg(test)]
 mod tests;
 
+use crate::redact::opaque_debug;
 use std::fmt;
 
 use serde::Serialize;
@@ -58,7 +59,6 @@ pub struct TakePause {
 }
 
 /// The audio of a take being kept.
-#[derive(Debug)]
 pub(crate) struct Recording {
     started_at: u64,
     samples: Vec<f32>,
@@ -127,3 +127,5 @@ impl fmt::Debug for Take {
             .finish()
     }
 }
+
+opaque_debug!(Recording);

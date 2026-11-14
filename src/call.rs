@@ -17,6 +17,7 @@
 #[cfg(test)]
 mod tests;
 
+use crate::redact::opaque_debug;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 
@@ -99,7 +100,10 @@ impl fmt::Debug for Input {
         match self {
             Self::Start { take } => f.debug_struct("Start").field("take", take).finish(),
             Self::Stop => f.write_str("Stop"),
-            Self::Config(config) => f.debug_tuple("Config").field(config).finish(),
+            Self::Config(_) => f
+                .debug_tuple("Config")
+                .field(&format_args!("<config>"))
+                .finish(),
             Self::HoldOutput(held) => f.debug_tuple("HoldOutput").field(held).finish(),
             Self::Window {
                 pcm,
@@ -267,7 +271,6 @@ impl fmt::Debug for Effect {
 }
 
 /// A turn of the person's, until it is finished or cancelled.
-#[derive(Debug)]
 struct Turn {
     id: String,
     started_ms: u64,
@@ -287,7 +290,6 @@ struct Turn {
 }
 
 /// One call.
-#[derive(Debug)]
 pub(crate) struct Call {
     config: CallConfig,
     /// The prefix of every id this call makes.
@@ -1049,3 +1051,5 @@ fn segmentation(config: &CallConfig) -> Segmentation {
         pre_roll_ms: config.pre_roll_ms,
     }
 }
+
+opaque_debug!(Call, Turn);

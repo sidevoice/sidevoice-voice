@@ -10,6 +10,7 @@
 #[cfg(test)]
 mod tests;
 
+use crate::redact::opaque_debug;
 use std::collections::VecDeque;
 use std::fmt;
 
@@ -22,7 +23,6 @@ use crate::speech::{chunks, Chunk};
 pub(crate) const AHEAD: usize = 2;
 
 /// Something to say, in the queue.
-#[derive(Debug)]
 pub(crate) struct Utterance {
     pub(crate) id: String,
     pub(crate) language: Option<String>,
@@ -31,7 +31,6 @@ pub(crate) struct Utterance {
 }
 
 /// What is being said.
-#[derive(Debug)]
 struct Current {
     utterance: Utterance,
     /// The next chunk to synthesize, and whether its synthesis is under way.
@@ -71,7 +70,7 @@ pub(crate) enum Action {
 }
 
 /// The queue and what is being said.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(crate) struct Playback {
     queue: VecDeque<Utterance>,
     current: Option<Current>,
@@ -433,3 +432,5 @@ impl fmt::Debug for Action {
         }
     }
 }
+
+opaque_debug!(Utterance, Current, Playback);

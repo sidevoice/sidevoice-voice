@@ -138,3 +138,19 @@ fn an_audio_device_shows_neither_its_label_nor_its_id() {
     };
     assert_hidden(&format!("{device:?}"));
 }
+
+#[test]
+fn a_code_is_kept_only_when_it_is_lowercase_words() {
+    use super::code;
+    assert_eq!(code("transcription-failed"), "transcription-failed");
+    assert_eq!(code("a.b_c-9"), "a.b_c-9");
+    for refused in [
+        "",
+        "Canary words 7f3a",
+        "x y",
+        "/home/canary",
+        &"a".repeat(65),
+    ] {
+        assert_eq!(code(refused), "invalid");
+    }
+}

@@ -6,10 +6,11 @@ use std::sync::Arc;
 use std::future::Future;
 
 use futures_util::future::join3;
-use tracing::{debug, info_span, Instrument};
+use tracing::{debug, info_span, warn, Instrument};
 
 use crate::config::{InputConfig, OutputConfig};
 use crate::models::{EndOfTurnModel, InputModels, OutputModels, Speaker, Transcriber, Vad};
+use crate::redact;
 use crate::runtime::monotonic_ms;
 
 /// The input half: where its models come from, and those it loaded.
@@ -178,7 +179,7 @@ pub(super) async fn loading<T>(
         let duration_ms = monotonic_ms().saturating_sub(start);
         match &result {
             Ok(_) => debug!(duration_ms, "model loaded"),
-            Err(code) => debug!(code = code.as_str(), duration_ms, "model load failed"),
+            Err(code) => warn!(code = redact::code(code), duration_ms, "model load failed"),
         }
         result
     }

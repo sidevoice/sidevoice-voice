@@ -9,6 +9,7 @@ mod join;
 #[cfg(test)]
 mod tests;
 
+use crate::redact::opaque_debug;
 use std::collections::VecDeque;
 use std::fmt;
 
@@ -21,7 +22,7 @@ pub(crate) use join::join;
 pub(crate) const MAX_QUEUE: usize = 8;
 
 /// A turn's audio, or a piece of it, waiting for its transcript.
-#[derive(Debug, PartialEq)]
+#[derive(PartialEq)]
 pub(crate) struct Job {
     pub(crate) turn: usize,
     pub(crate) pcm: Vec<f32>,
@@ -43,7 +44,7 @@ pub(crate) struct Pending {
 }
 
 /// The queue, the job in recognition, and the transcript held for the merge window.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(crate) struct Recognition {
     queue: VecDeque<Job>,
     /// The turn of the job in recognition, and whether it is that turn's last piece.
@@ -200,3 +201,5 @@ impl fmt::Debug for Pending {
             .finish()
     }
 }
+
+opaque_debug!(Recognition, Job);

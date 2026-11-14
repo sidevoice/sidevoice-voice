@@ -34,6 +34,7 @@ use crate::io::{AudioIo, IoEvent, IoSink, RenderedMailbox};
 use crate::level::{instant, Level};
 use crate::maybe_send::MaybeSend;
 use crate::models::{Speaker, VadFrame};
+use crate::redact;
 use crate::residency::Residency;
 use crate::runtime::{monotonic_ms, sleep, spawn, unix_ms};
 use crate::say::{SayEvent, SayOptions, Saying};
@@ -809,7 +810,7 @@ impl Driver {
         if self.input.is_none() {
             return;
         }
-        debug!(code = code.as_str(), "input lost");
+        debug!(code = redact::code(&code), "input lost");
         if self.output.is_none() {
             self.end_take();
             self.reset_playback();
@@ -1076,7 +1077,7 @@ impl Driver {
                             Ok(_) => debug!(samples, duration_ms, "transcribed"),
                             Err(code) => {
                                 warn!(
-                                    code = code.as_str(),
+                                    code = redact::code(code),
                                     samples, duration_ms, "transcription failed"
                                 )
                             }
@@ -1105,7 +1106,10 @@ impl Driver {
                         match &result {
                             Ok(_) => debug!(chunk, duration_ms, "synthesized"),
                             Err(code) => {
-                                warn!(code = code.as_str(), chunk, duration_ms, "synthesis failed")
+                                warn!(
+                                    code = redact::code(code),
+                                    chunk, duration_ms, "synthesis failed"
+                                )
                             }
                         }
                         let _ = messages.unbounded_send(Message::Synthesized {
@@ -1160,18 +1164,17 @@ impl Driver {
     }
 
     fn error(&self, code: String) {
-        debug!(code = code.as_str(), "voice error");
-        let _ = self
-            .events
-            .unbounded_send(VoiceEvent::Error(VoiceError { code }));
+        let event = VoiceEvent::Error(VoiceError { code });
+        log_event(&event);
+        let _ = self.events.unbounded_send(event);
     }
 }
 
-/// What a host is told, as events: where the call is, and its turns by id and numbers, never the words. A failure is
-/// logged where it is made (`Driver::error`).
+/// What a host is told, as log lines: where the call is, and its turns by id and numbers, never the words. A failure
+/// the host gets (`Driver::error` too) is a `debug` line: the library returns it and the app reports it.
 fn log_event(event: &VoiceEvent) {
     match event {
-        VoiceEvent::State(state) => info!(
+        VoiceEvent::State(state) => debug!(
             listening = ?state.listening,
             recognising = state.recognising,
             playback = ?state.playback,
@@ -1196,6 +1199,7 @@ fn log_event(event: &VoiceEvent) {
         VoiceEvent::Turn(TurnEvent::Cancelled { turn_id, merged }) => {
             info!(turn = turn_id.as_str(), merged, "turn cancelled")
         }
+        VoiceEvent::Error(error) => debug!(code = redact::code(&error.code), "voice error"),
         _ => {}
     }
 }
