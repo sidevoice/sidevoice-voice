@@ -6,7 +6,10 @@
 #[cfg(test)]
 mod tests;
 
+use std::fmt;
 use std::ops::Range;
+
+use crate::redact;
 
 /// The shortest chunk spoken alone, in characters.
 const MIN_CHUNK: usize = 24;
@@ -14,7 +17,7 @@ const MIN_CHUNK: usize = 24;
 const MAX_CHUNK: usize = 240;
 
 /// One chunk of a text: its words, trimmed, and where it sits in the text, in characters.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct Chunk {
     pub(crate) text: String,
     pub(crate) chars: Range<usize>,
@@ -96,4 +99,14 @@ fn cut(chars: &[char], range: Range<usize>) -> Vec<Range<usize>> {
         pieces.push(piece);
     }
     pieces
+}
+
+/// Everything but the words: their length stands for them.
+impl fmt::Debug for Chunk {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Chunk")
+            .field("text", &redact::chars(&self.text))
+            .field("chars", &self.chars)
+            .finish()
+    }
 }

@@ -9,15 +9,18 @@
 #[cfg(test)]
 mod tests;
 
+use std::fmt;
+
 use serde::Serialize;
 
+use crate::redact::samples;
 use crate::turns::{duration_ms, RATE};
 
 /// The most audio one take keeps: two minutes.
 const MAX_TAKE: usize = RATE as usize * 120;
 
 /// What the microphone gave a call over one stretch of listening, and where the person's turns fell in it.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Clone, PartialEq, Serialize)]
 pub struct Take {
     /// The samples' rate, in Hz: the call's own, 16 000.
     #[serde(rename = "sampleRate")]
@@ -109,5 +112,18 @@ impl Recording {
             ended_at: self.started_at + length,
             turns,
         }
+    }
+}
+
+/// Everything but the audio: its sample count stands for it.
+impl fmt::Debug for Take {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Take")
+            .field("sample_rate", &self.sample_rate)
+            .field("samples", &samples(&self.samples))
+            .field("started_at", &self.started_at)
+            .field("ended_at", &self.ended_at)
+            .field("turns", &self.turns)
+            .finish()
     }
 }

@@ -6,6 +6,7 @@
 #[cfg(test)]
 mod tests;
 
+use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -15,11 +16,18 @@ use serde::Serialize;
 use crate::platform::audio_session::{AudioSession, Session};
 
 /// A microphone or speaker as the system lists it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct AudioDevice {
     /// The cpal device id, as text: what [`NativeDevices::choose`] takes.
     pub id: String,
     pub label: String,
+}
+
+/// Neither the label nor the id: a device's name can be the person's, and its id can hold a Bluetooth address.
+impl fmt::Debug for AudioDevice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AudioDevice").finish_non_exhaustive()
+    }
 }
 
 /// A chosen device that went away, by kind: the default one has been used since.

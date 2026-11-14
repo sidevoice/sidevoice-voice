@@ -11,6 +11,7 @@ Rules for any coding agent (and person) working in this repository.
   never parsed. No other language, Spanish included, is ever hard-coded, and nothing here picks a language for the
   person.
 - Logs and developer-facing errors are English; they are not UI.
+- Logging: see docs/logging.md in sidevoice/.github-private.
 
 ## Before changing things
 

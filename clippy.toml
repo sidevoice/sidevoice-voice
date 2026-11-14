@@ -1,0 +1,6 @@
+# A library only emits (`tracing`): nothing here prints.
+disallowed-macros = [
+  { path = "std::dbg", reason = "use tracing" },
+  { path = "std::eprintln", reason = "use tracing" },
+  { path = "std::println", reason = "use tracing" },
+]

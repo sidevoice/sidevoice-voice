@@ -25,10 +25,11 @@ use futures_channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures_channel::oneshot;
 use futures_util::future::{abortable, join, ready, select, AbortHandle, Either};
 use futures_util::{stream, Stream, StreamExt};
+use tracing::{debug, info, info_span, warn, Instrument};
 
 use crate::call::{Call, Effect, Input};
 use crate::config::{CallConfig, EndOfTurn};
-use crate::event::{VoiceError, VoiceEvent};
+use crate::event::{TurnEvent, VoiceError, VoiceEvent};
 use crate::io::{AudioIo, IoEvent, IoSink, RenderedMailbox};
 use crate::level::{instant, Level};
 use crate::maybe_send::MaybeSend;
@@ -40,7 +41,7 @@ use crate::setup::{VoiceInput, VoiceOutput, VoiceSetup};
 use crate::take::Recording;
 use crate::turns::RATE;
 
-use halves::{load_input, InputHalf, InputSlots, OutputHalf, PendingInput, PendingOutput};
+use halves::{load_input, loading, InputHalf, InputSlots, OutputHalf, PendingInput, PendingOutput};
 
 /// How long a stop, or the owner gone, waits behind a message the task is handling (a model that does not answer)
 /// before that message is abandoned.
@@ -174,7 +175,11 @@ impl VoiceCall {
             events,
             sayers: HashMap::new(),
         };
-        spawn(driver.run(inbox, reported));
+        spawn(
+            driver
+                .run(inbox, reported)
+                .instrument(info_span!("call", call = %call_id)),
+        );
         let call = Self {
             messages,
             internal,
@@ -329,6 +334,7 @@ impl Driver {
                                 self.apply_pending(false);
                                 if self.residency.due(now) {
                                     // Dropping them is what unloads them; the next start loads them again.
+                                    info!(reason = "idle", "models unloaded");
                                     self.unload();
                                 }
                                 continue;
@@ -709,7 +715,7 @@ impl Driver {
         if let (Some((models, _)), true) = (&target, load) {
             let (models, messages) = (Arc::clone(models), self.messages.clone());
             self.track(async move {
-                let result = models.speaker().await;
+                let result = loading("speaker", models.speaker()).await;
                 let _ = messages.unbounded_send(Message::OutputLoaded { serial, result });
             });
         }
@@ -803,6 +809,7 @@ impl Driver {
         if self.input.is_none() {
             return;
         }
+        debug!(code = code.as_str(), "input lost");
         if self.output.is_none() {
             self.end_take();
             self.reset_playback();
@@ -863,7 +870,7 @@ impl Driver {
             .filter(|half| half.speaker.is_none())
             .map(|half| {
                 let models = Arc::clone(&half.models);
-                async move { models.speaker().await }
+                async move { loading("speaker", models.speaker()).await }
             });
         let input = async move {
             match input {
@@ -918,6 +925,7 @@ impl Driver {
         }
         // The call listens once the microphone and the speaker say they work (`IoEvent::Ready`).
         self.running = true;
+        info!("call started");
         self.opening = true;
     }
 
@@ -926,6 +934,7 @@ impl Driver {
         if !self.running {
             return;
         }
+        info!("call stopped");
         self.end_take();
         self.reset_playback();
         self.generation = self.generation.wrapping_add(1);
@@ -1038,6 +1047,7 @@ impl Driver {
         for effect in effects {
             match effect {
                 Effect::Event(event) => {
+                    log_event(&event);
                     let _ = self.events.unbounded_send(event);
                 }
                 Effect::Say { id, event } => {
@@ -1059,7 +1069,18 @@ impl Driver {
                     let transcriber = Arc::clone(&loaded.transcriber);
                     let messages = self.messages.clone();
                     self.track(async move {
+                        let (start, samples) = (monotonic_ms(), pcm.len());
                         let result = transcriber.transcribe(pcm, RATE, language).await;
+                        let duration_ms = monotonic_ms().saturating_sub(start);
+                        match &result {
+                            Ok(_) => debug!(samples, duration_ms, "transcribed"),
+                            Err(code) => {
+                                warn!(
+                                    code = code.as_str(),
+                                    samples, duration_ms, "transcription failed"
+                                )
+                            }
+                        }
                         let _ = messages.unbounded_send(Message::Transcribed { turn, result });
                     });
                 }
@@ -1078,7 +1099,15 @@ impl Driver {
                     let (voice, speed) = (output.voice.clone(), output.speed);
                     let language = language.or_else(|| self.config.say_language());
                     self.track(async move {
+                        let start = monotonic_ms();
                         let result = speaker.speak(text, voice, language, speed).await;
+                        let duration_ms = monotonic_ms().saturating_sub(start);
+                        match &result {
+                            Ok(_) => debug!(chunk, duration_ms, "synthesized"),
+                            Err(code) => {
+                                warn!(code = code.as_str(), chunk, duration_ms, "synthesis failed")
+                            }
+                        }
                         let _ = messages.unbounded_send(Message::Synthesized {
                             utterance,
                             chunk,
@@ -1122,15 +1151,52 @@ impl Driver {
             self.tasks.pop_front();
         }
         self.tasks.push_back(handle);
-        spawn(async move {
-            let _ = task.await;
-        });
+        spawn(
+            async move {
+                let _ = task.await;
+            }
+            .in_current_span(),
+        );
     }
 
     fn error(&self, code: String) {
+        debug!(code = code.as_str(), "voice error");
         let _ = self
             .events
             .unbounded_send(VoiceEvent::Error(VoiceError { code }));
+    }
+}
+
+/// What a host is told, as events: where the call is, and its turns by id and numbers, never the words. A failure is
+/// logged where it is made (`Driver::error`).
+fn log_event(event: &VoiceEvent) {
+    match event {
+        VoiceEvent::State(state) => info!(
+            listening = ?state.listening,
+            recognising = state.recognising,
+            playback = ?state.playback,
+            microphone = ?state.microphone,
+            "call state"
+        ),
+        VoiceEvent::Turn(TurnEvent::Started { turn_id, .. }) => {
+            info!(turn = turn_id.as_str(), "turn started")
+        }
+        VoiceEvent::Turn(TurnEvent::Finished {
+            turn_id,
+            merged,
+            timings,
+            ..
+        }) => info!(
+            turn = turn_id.as_str(),
+            merged,
+            audio_ms = timings.audio_ms,
+            recognition_ms = timings.recognition_ms,
+            "turn finished"
+        ),
+        VoiceEvent::Turn(TurnEvent::Cancelled { turn_id, merged }) => {
+            info!(turn = turn_id.as_str(), merged, "turn cancelled")
+        }
+        _ => {}
     }
 }
 

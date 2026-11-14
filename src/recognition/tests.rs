@@ -162,3 +162,18 @@ fn transcripts_join_with_a_space_unless_a_script_written_without_spaces_meets_it
     recognition.hold(1, "走吧".into(), Some("zh".into()), 200);
     assert_eq!(recognition.due(200, false).expect("due").text, "我们走吧");
 }
+
+#[test]
+fn a_held_transcript_shows_the_length_of_its_words_and_not_the_words() {
+    let held = super::Pending {
+        turns: vec![0],
+        text: "canary words 7f3a".into(),
+        language: None,
+        deadline: 0,
+    };
+    let debug = format!("{held:?}");
+    assert!(
+        !debug.contains("canary") && debug.contains("<17 chars>"),
+        "{debug}"
+    );
+}

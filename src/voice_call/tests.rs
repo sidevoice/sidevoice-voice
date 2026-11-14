@@ -1539,3 +1539,93 @@ fn the_detector_warms_up_while_the_other_models_load() {
         assert_eq!(log.lock().unwrap().last().unwrap(), "transcriber loaded");
     });
 }
+
+/// What a subscriber wrote, shared with the test that reads it.
+#[derive(Clone, Default)]
+struct Captured(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+    type Writer = Captured;
+
+    fn make_writer(&'a self) -> Captured {
+        self.clone()
+    }
+}
+
+#[test]
+fn a_call_logs_its_operations_and_never_what_was_said_or_heard() {
+    let captured = Captured::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_ansi(false)
+        .with_writer(captured.clone())
+        .finish();
+    // One thread runs the call's tasks, so the thread's subscriber sees every line.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    tracing::subscriber::with_default(subscriber, || {
+        runtime.block_on(async {
+            let (call, mut events, speakers) = call(FakeModels::default());
+            call.start(StartOptions::default());
+            next(&mut events, |event| match event {
+                VoiceEvent::State(state) if state.listening == crate::Listening::Listening => {
+                    Some(())
+                }
+                _ => None,
+            })
+            .await;
+            let sink = speakers.lock().unwrap().sink.clone().expect("started");
+            for frame in [silence(300), clip(QUILTER, 0.9), silence(2_600)]
+                .concat()
+                .chunks(160)
+            {
+                sink.send(IoEvent::Captured(frame.to_vec()));
+            }
+            next(&mut events, |event| match event {
+                VoiceEvent::Turn(TurnEvent::Finished { .. }) => Some(()),
+                _ => None,
+            })
+            .await;
+            outcome(call.say("canary words 7f3a, read aloud.", SayOptions::default())).await;
+            call.stop();
+            next(&mut events, |event| match event {
+                VoiceEvent::State(state) if state.listening == crate::Listening::Idle => Some(()),
+                _ => None,
+            })
+            .await;
+        });
+    });
+    let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    // The lines that show the sites ran, with the call's id on those inside its task.
+    for expected in [
+        "call started",
+        "call stopped",
+        "call state",
+        "turn started",
+        "turn finished",
+        "transcribed",
+        "synthesized",
+        "model loaded",
+        "model_load{slot=\"vad\"}",
+        "call{call=",
+    ] {
+        assert!(log.contains(expected), "{expected} missing from:\n{log}");
+    }
+    // Neither the transcript the fake transcriber returned nor the text said.
+    for secret in ["Quilter", "apostle", "canary", "7f3a"] {
+        assert!(!log.contains(secret), "{secret} leaked into:\n{log}");
+    }
+}

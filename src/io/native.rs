@@ -365,7 +365,7 @@ fn run(sink: &IoSink, devices: &NativeDevices, input: bool, control: &Control) {
             Some(microphone) => {
                 drain(&mut microphone.capture, &mut heard, microphone.channels);
                 if let Some(counts) = microphone.tally.due(Instant::now()) {
-                    tracing::info!(
+                    tracing::debug!(
                         seconds = tally::FIRST_SECONDS.as_secs(),
                         callbacks = counts.callbacks,
                         samples = counts.samples,
@@ -734,7 +734,6 @@ fn failure(
                 tracing::info!(
                     stream,
                     kind = ?error.kind(),
-                    error = %error,
                     "audio stream taken away by the system; opening it again"
                 );
             }

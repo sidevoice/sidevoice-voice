@@ -60,16 +60,11 @@ impl AudioSession for Os {
     }
 }
 
-/// The stable code of the step that failed; the system's own error (its domain and code, such as `561015905` for
-/// recording that cannot start from the background) goes to the log.
+/// The stable code of the step that failed; the system's own error code (such as `561015905` for
+/// recording that cannot start from the background) goes to the log, never its description.
 fn failed(step: &str, error: Option<&NSError>) -> String {
     match error {
-        Some(error) => tracing::warn!(
-            step,
-            code = error.code(),
-            description = %error.localizedDescription(),
-            "the audio session refused"
-        ),
+        Some(error) => tracing::warn!(step, code = error.code(), "the audio session refused"),
         None => tracing::warn!(step, "the audio session's category or mode is missing"),
     }
     format!("audio-session-{step}-failed")

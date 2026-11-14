@@ -31,6 +31,10 @@ icu_properties = "2.4.0"
 # The room's messages and the configuration, read and written as JSON (src/room.rs, src/config.rs).
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+# What the call does, as structured events and the spans of its operations (src/voice_call.rs, src/io/native.rs): the
+# module only emits, a subscriber is the app's. The `log` feature hands them to the `log` facade too, for an app that
+# records through it.
+tracing = { version = "=0.1.44", default-features = false, features = ["std", "log"] }
 
 # Which platform code a build contains is decided by these tables and one `#![cfg]` per platform file, which must
 # agree.
@@ -50,9 +54,6 @@ wasm-bindgen-futures = "0.4.79"
 #   gain control and the high-pass filter on every native OS (src/echo/native.rs).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 cpal = "=0.18.2"
-# What the microphone stream opened with and delivered in its first seconds, as structured events (src/io/native.rs).
-# The `log` feature hands them to the `log` facade too, for an app that records through it.
-tracing = { version = "=0.1.44", default-features = false, features = ["std", "log"] }
 rtrb = "=0.4.0"
 sonora = "=0.2.0"
 tokio = { version = "1.53.2", default-features = false, features = ["rt", "sync", "time"] }
@@ -64,6 +65,8 @@ objc2-avf-audio = { version = "0.3", default-features = false, features = ["std"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSError", "NSString"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+# Captures what the call logs, in the tests that look at it.
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
 tokio = { version = "1.53.2", default-features = false, features = ["rt-multi-thread", "time"] }
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]

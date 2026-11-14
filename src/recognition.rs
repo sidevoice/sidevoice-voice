@@ -10,6 +10,9 @@ mod join;
 mod tests;
 
 use std::collections::VecDeque;
+use std::fmt;
+
+use crate::redact::chars;
 
 pub(crate) use filter::accepted;
 pub(crate) use join::join;
@@ -29,7 +32,7 @@ pub(crate) struct Job {
 }
 
 /// A transcript held for the merge window.
-#[derive(Debug, PartialEq)]
+#[derive(PartialEq)]
 pub(crate) struct Pending {
     /// The turns it holds, oldest first; the last one carries the transcript.
     pub(crate) turns: Vec<usize>,
@@ -183,5 +186,17 @@ impl Recognition {
         let job = self.queue.pop_front()?;
         self.active = Some((job.turn, job.last));
         Some(job)
+    }
+}
+
+/// Everything but the transcript: its length stands for it.
+impl fmt::Debug for Pending {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Pending")
+            .field("turns", &self.turns)
+            .field("text", &chars(&self.text))
+            .field("language", &self.language)
+            .field("deadline", &self.deadline)
+            .finish()
     }
 }

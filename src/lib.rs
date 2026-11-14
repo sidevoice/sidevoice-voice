@@ -25,6 +25,7 @@ mod models;
 mod platform;
 mod playback;
 mod recognition;
+mod redact;
 mod residency;
 mod runtime;
 mod say;
