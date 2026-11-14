@@ -6,6 +6,7 @@
 //! their count is the clock of the heard position. Stopping fades out over a few milliseconds, then drops what was
 //! queued before the stop and nothing after it.
 
+use crate::redact::opaque_debug;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -182,7 +183,6 @@ impl Schedule {
 }
 
 /// A chunk waiting to be wholly in the playback ring.
-#[derive(Debug)]
 struct Pending {
     utterance: String,
     chunk: usize,
@@ -195,7 +195,7 @@ struct Pending {
 /// What the audio thread queues for the speaker: chunks go into the playback ring as room frees up, never in part
 /// and never dropped, and each is placed in the schedule once its last sample is in, so a chunk is never reported
 /// played before all of it was taken.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(crate) struct Queue {
     pending: VecDeque<Pending>,
     /// Samples ever pushed into the ring.
@@ -262,3 +262,5 @@ impl Queue {
         }
     }
 }
+
+opaque_debug!(Pending, Queue);

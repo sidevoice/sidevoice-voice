@@ -31,7 +31,9 @@ mod volume;
 #[cfg(test)]
 mod tests;
 
+use crate::redact::{opaque_debug, samples};
 use std::collections::VecDeque;
+use std::fmt;
 
 #[cfg(test)]
 pub(crate) use crate::level::instant;
@@ -91,7 +93,7 @@ pub(crate) struct Segmentation {
 }
 
 /// What one window did to the turn.
-#[derive(Debug, PartialEq)]
+#[derive(PartialEq)]
 pub(crate) enum Segment {
     /// A turn opened.
     Started,
@@ -106,7 +108,7 @@ pub(crate) enum Segment {
 }
 
 /// The audio of a turn that ended.
-#[derive(Debug, PartialEq)]
+#[derive(PartialEq)]
 pub(crate) struct EndedTurn {
     /// 16 kHz mono samples since its last piece, the pre-roll included when it was cut into none; none when, after a
     /// piece, nothing voiced or no more than 300 ms of audio was left.
@@ -116,7 +118,6 @@ pub(crate) struct EndedTurn {
 }
 
 /// The turn being spoken.
-#[derive(Debug)]
 struct Open {
     pcm: Vec<f32>,
     /// Samples heard since the window that opened it.
@@ -162,7 +163,6 @@ impl Open {
 }
 
 /// Turns out of the detector's windows.
-#[derive(Debug)]
 pub(crate) struct Segmenter {
     numbers: Segmentation,
     level: Level,
@@ -461,4 +461,32 @@ impl Segmenter {
 /// Milliseconds of 16 kHz audio in `samples`.
 pub(crate) fn duration_ms(samples: usize) -> u64 {
     samples as u64 / PER_MS
+}
+
+opaque_debug!(Segmenter, Open);
+
+/// Everything but the audio: its sample count stands for it.
+impl fmt::Debug for Segment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Started => f.write_str("Started"),
+            Self::Ended(ended) => f.debug_tuple("Ended").field(ended).finish(),
+            Self::Paused { pcm, pause } => f
+                .debug_struct("Paused")
+                .field("pcm", &samples(pcm))
+                .field("pause", pause)
+                .finish(),
+            Self::Piece(pcm) => f.debug_tuple("Piece").field(&samples(pcm)).finish(),
+        }
+    }
+}
+
+/// Everything but the audio: its sample count stands for it.
+impl fmt::Debug for EndedTurn {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EndedTurn")
+            .field("pcm", &samples(&self.pcm))
+            .field("silence_ms", &self.silence_ms)
+            .finish()
+    }
 }

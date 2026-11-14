@@ -10,9 +10,12 @@
 #[cfg(test)]
 mod tests;
 
+use crate::redact::opaque_debug;
 use std::collections::VecDeque;
+use std::fmt;
 
 use crate::event::PlaybackState;
+use crate::redact::{chars, samples};
 use crate::say::{SayEvent, SayOutcome, StopReason};
 use crate::speech::{chunks, Chunk};
 
@@ -20,7 +23,6 @@ use crate::speech::{chunks, Chunk};
 pub(crate) const AHEAD: usize = 2;
 
 /// Something to say, in the queue.
-#[derive(Debug)]
 pub(crate) struct Utterance {
     pub(crate) id: String,
     pub(crate) language: Option<String>,
@@ -29,7 +31,6 @@ pub(crate) struct Utterance {
 }
 
 /// What is being said.
-#[derive(Debug)]
 struct Current {
     utterance: Utterance,
     /// The next chunk to synthesize, and whether its synthesis is under way.
@@ -44,7 +45,7 @@ struct Current {
 }
 
 /// What the playback asks for, and what it reports.
-#[derive(Debug, PartialEq)]
+#[derive(PartialEq)]
 pub(crate) enum Action {
     /// Speak this chunk.
     Synthesize {
@@ -69,7 +70,7 @@ pub(crate) enum Action {
 }
 
 /// The queue and what is being said.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(crate) struct Playback {
     queue: VecDeque<Utterance>,
     current: Option<Current>,
@@ -392,3 +393,44 @@ fn say(utterance: &str, event: SayEvent) -> Action {
 fn done(utterance: &str, outcome: SayOutcome) -> Action {
     say(utterance, SayEvent::Done { outcome })
 }
+
+/// Everything but the words and the audio: their length and count stand for them.
+impl fmt::Debug for Action {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Synthesize {
+                utterance,
+                chunk,
+                text,
+                language,
+            } => f
+                .debug_struct("Synthesize")
+                .field("utterance", utterance)
+                .field("chunk", chunk)
+                .field("text", &chars(text))
+                .field("language", language)
+                .finish(),
+            Self::Play {
+                utterance,
+                chunk,
+                samples: audio,
+                sample_rate,
+            } => f
+                .debug_struct("Play")
+                .field("utterance", utterance)
+                .field("chunk", chunk)
+                .field("samples", &samples(audio))
+                .field("sample_rate", sample_rate)
+                .finish(),
+            Self::Stop => f.write_str("Stop"),
+            Self::Say { utterance, event } => f
+                .debug_struct("Say")
+                .field("utterance", utterance)
+                .field("event", event)
+                .finish(),
+            Self::Error(code) => f.debug_tuple("Error").field(code).finish(),
+        }
+    }
+}
+
+opaque_debug!(Utterance, Current, Playback);

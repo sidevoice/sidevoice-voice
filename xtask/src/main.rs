@@ -13,6 +13,9 @@
 //! - `publish DIR TAG`: DIR attached to the GitHub Release TAG, read back, verified, and the Release published.
 //! - `npm-publish TAG`: the tarball of the Release TAG (a `vX.Y.Z`), verified, staged on npm for the operator to approve.
 
+// The build tooling prints for people; the ban on printing is for the library.
+#![allow(clippy::disallowed_macros)]
+
 mod comparison;
 mod mobile;
 mod npm;

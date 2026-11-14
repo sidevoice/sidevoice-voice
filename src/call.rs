@@ -17,7 +17,9 @@
 #[cfg(test)]
 mod tests;
 
+use crate::redact::opaque_debug;
 use std::collections::{HashMap, VecDeque};
+use std::fmt;
 
 use crate::config::{CallConfig, EndOfTurn};
 use crate::event::{
@@ -25,12 +27,12 @@ use crate::event::{
 };
 use crate::playback::{Action, Playback};
 use crate::recognition::{accepted, join, Job, Outcome, Pending, Recognition};
+use crate::redact::{chars, samples};
 use crate::say::{SayEvent, SayOutcome, StopReason};
 use crate::take::{TakePause, TakeTurn};
 use crate::turns::{duration_ms, Segment, Segmentation, Segmenter, SILENCE_STOP_MS};
 
 /// What happens to the call.
-#[derive(Debug)]
 pub(crate) enum Input {
     /// Start listening; with `take`, keep where the turns fall in what is heard from now ([`Call::take_marks`]).
     Start { take: bool },
@@ -92,6 +94,81 @@ pub(crate) enum Input {
     },
 }
 
+/// Everything but the words and the audio: their length and count stand for them.
+impl fmt::Debug for Input {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Start { take } => f.debug_struct("Start").field("take", take).finish(),
+            Self::Stop => f.write_str("Stop"),
+            Self::Config(_) => f
+                .debug_tuple("Config")
+                .field(&format_args!("<config>"))
+                .finish(),
+            Self::HoldOutput(held) => f.debug_tuple("HoldOutput").field(held).finish(),
+            Self::Window {
+                pcm,
+                speech,
+                probability,
+            } => f
+                .debug_struct("Window")
+                .field("pcm", &samples(pcm))
+                .field("speech", speech)
+                .field("probability", probability)
+                .finish(),
+            Self::Transcribed { turn, result } => f
+                .debug_struct("Transcribed")
+                .field("turn", turn)
+                .field("result", &result.as_ref().map(|text| chars(text)))
+                .finish(),
+            Self::Say { id, text, language } => f
+                .debug_struct("Say")
+                .field("id", id)
+                .field("text", &chars(text))
+                .field("language", language)
+                .finish(),
+            Self::CancelSay(id) => f.debug_tuple("CancelSay").field(id).finish(),
+            Self::Synthesized {
+                utterance,
+                chunk,
+                result,
+            } => f
+                .debug_struct("Synthesized")
+                .field("utterance", utterance)
+                .field("chunk", chunk)
+                .field(
+                    "result",
+                    &result.as_ref().map(|(audio, rate)| (samples(audio), rate)),
+                )
+                .finish(),
+            Self::ChunkStarted { utterance, chunk } => f
+                .debug_struct("ChunkStarted")
+                .field("utterance", utterance)
+                .field("chunk", chunk)
+                .finish(),
+            Self::ChunkPlayed { utterance, chunk } => f
+                .debug_struct("ChunkPlayed")
+                .field("utterance", utterance)
+                .field("chunk", chunk)
+                .finish(),
+            Self::PlaybackEnded => f.write_str("PlaybackEnded"),
+            Self::Mute(muted) => f.debug_tuple("Mute").field(muted).finish(),
+            Self::MicrophoneMuted(muted) => f.debug_tuple("MicrophoneMuted").field(muted).finish(),
+            Self::Cancel => f.write_str("Cancel"),
+            Self::EndTurn => f.write_str("EndTurn"),
+            Self::EndOfTurn {
+                turn,
+                pause,
+                result,
+            } => f
+                .debug_struct("EndOfTurn")
+                .field("turn", turn)
+                .field("pause", pause)
+                .field("result", result)
+                .finish(),
+        }
+    }
+}
+
 /// The failure of something said to a call without an output half.
 const OUTPUT_MISSING: &str = "output-missing";
 
@@ -102,7 +179,7 @@ const CANCELS_KEPT: usize = 64;
 const END_OF_TURN_LIKELY: f32 = 0.5;
 
 /// What the driver must do.
-#[derive(Debug, PartialEq)]
+#[derive(PartialEq)]
 pub(crate) enum Effect {
     /// Tell the host.
     Event(VoiceEvent),
@@ -138,8 +215,62 @@ pub(crate) enum Effect {
     },
 }
 
+/// Everything but the words and the audio: their length and count stand for them.
+impl fmt::Debug for Effect {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Event(event) => f.debug_tuple("Event").field(event).finish(),
+            Self::Say { id, event } => f
+                .debug_struct("Say")
+                .field("id", id)
+                .field("event", event)
+                .finish(),
+            Self::Transcribe {
+                turn,
+                pcm,
+                language,
+            } => f
+                .debug_struct("Transcribe")
+                .field("turn", turn)
+                .field("pcm", &samples(pcm))
+                .field("language", language)
+                .finish(),
+            Self::Synthesize {
+                utterance,
+                chunk,
+                text,
+                language,
+            } => f
+                .debug_struct("Synthesize")
+                .field("utterance", utterance)
+                .field("chunk", chunk)
+                .field("text", &chars(text))
+                .field("language", language)
+                .finish(),
+            Self::Play {
+                utterance,
+                chunk,
+                samples: audio,
+                sample_rate,
+            } => f
+                .debug_struct("Play")
+                .field("utterance", utterance)
+                .field("chunk", chunk)
+                .field("samples", &samples(audio))
+                .field("sample_rate", sample_rate)
+                .finish(),
+            Self::StopPlayback => f.write_str("StopPlayback"),
+            Self::EndOfTurn { turn, pause, pcm } => f
+                .debug_struct("EndOfTurn")
+                .field("turn", turn)
+                .field("pause", pause)
+                .field("pcm", &samples(pcm))
+                .finish(),
+        }
+    }
+}
+
 /// A turn of the person's, until it is finished or cancelled.
-#[derive(Debug)]
 struct Turn {
     id: String,
     started_ms: u64,
@@ -159,7 +290,6 @@ struct Turn {
 }
 
 /// One call.
-#[derive(Debug)]
 pub(crate) struct Call {
     config: CallConfig,
     /// The prefix of every id this call makes.
@@ -921,3 +1051,5 @@ fn segmentation(config: &CallConfig) -> Segmentation {
         pre_roll_ms: config.pre_roll_ms,
     }
 }
+
+opaque_debug!(Call, Turn);

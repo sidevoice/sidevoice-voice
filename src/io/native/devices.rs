@@ -6,6 +6,8 @@
 #[cfg(test)]
 mod tests;
 
+use crate::redact::opaque_debug;
+use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -15,15 +17,22 @@ use serde::Serialize;
 use crate::platform::audio_session::{AudioSession, Session};
 
 /// A microphone or speaker as the system lists it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct AudioDevice {
     /// The cpal device id, as text: what [`NativeDevices::choose`] takes.
     pub id: String,
     pub label: String,
 }
 
+/// Neither the label nor the id: a device's name can be the person's, and its id can hold a Bluetooth address.
+impl fmt::Debug for AudioDevice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AudioDevice").finish_non_exhaustive()
+    }
+}
+
 /// A chosen device that went away, by kind: the default one has been used since.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize)]
 pub struct LostDevices {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input: Option<String>,
@@ -38,7 +47,7 @@ impl LostDevices {
 }
 
 /// The system's microphones and speakers, and which are chosen (`None`: the system's default, not an entry).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct AudioDevices {
     pub inputs: Vec<AudioDevice>,
     pub outputs: Vec<AudioDevice>,
@@ -61,7 +70,7 @@ pub(crate) enum Kind {
 }
 
 /// What is chosen: `None` is the system's default.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub(crate) struct Choice {
     pub(crate) input: Option<String>,
     pub(crate) output: Option<String>,
@@ -263,3 +272,5 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
+
+opaque_debug!(AudioDevices, LostDevices, Choice);

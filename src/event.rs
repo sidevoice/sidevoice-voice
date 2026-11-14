@@ -2,8 +2,11 @@
 //! what failed, and the take of a start that asked for one. What becomes of something the call was asked to say comes
 //! through its own handle (`say`).
 
+use std::fmt;
+
 use serde::Serialize;
 
+use crate::redact::chars;
 use crate::take::Take;
 
 /// Something the host must know.
@@ -27,7 +30,7 @@ pub enum VoiceEvent {
 }
 
 /// One step of a turn of the person's speech, under the call's own id for the turn.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Clone, PartialEq, Serialize)]
 #[serde(tag = "phase", rename_all = "lowercase")]
 pub enum TurnEvent {
     /// The person started speaking.
@@ -126,4 +129,43 @@ pub enum PlaybackState {
 pub struct VoiceError {
     /// The code: `transcription-queue-full`, or the app's models' own (`transcription-failed`, `speech-failed`, ...).
     pub code: String,
+}
+
+/// Everything but the transcript: its length stands for it.
+impl fmt::Debug for TurnEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Started {
+                turn_id,
+                started_at,
+            } => f
+                .debug_struct("Started")
+                .field("turn_id", turn_id)
+                .field("started_at", started_at)
+                .finish(),
+            Self::Finished {
+                turn_id,
+                text,
+                language,
+                started_at,
+                ended_at,
+                merged,
+                timings,
+            } => f
+                .debug_struct("Finished")
+                .field("turn_id", turn_id)
+                .field("text", &chars(text))
+                .field("language", language)
+                .field("started_at", started_at)
+                .field("ended_at", ended_at)
+                .field("merged", merged)
+                .field("timings", timings)
+                .finish(),
+            Self::Cancelled { turn_id, merged } => f
+                .debug_struct("Cancelled")
+                .field("turn_id", turn_id)
+                .field("merged", merged)
+                .finish(),
+        }
+    }
 }

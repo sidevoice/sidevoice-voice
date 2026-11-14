@@ -3,10 +3,15 @@
 
 use std::sync::Arc;
 
+use std::future::Future;
+
 use futures_util::future::join3;
+use tracing::{debug, info_span, warn, Instrument};
 
 use crate::config::{InputConfig, OutputConfig};
 use crate::models::{EndOfTurnModel, InputModels, OutputModels, Speaker, Transcriber, Vad};
+use crate::redact;
+use crate::runtime::monotonic_ms;
 
 /// The input half: where its models come from, and those it loaded.
 pub(super) struct InputHalf {
@@ -65,19 +70,19 @@ pub(super) async fn load_input(
 ) -> InputSlots {
     let detector = async {
         match whole {
-            true => Some(warm(models.as_ref()).await),
+            true => Some(loading("vad", warm(models.as_ref())).await),
             false => None,
         }
     };
     let transcriber = async {
         match whole {
-            true => Some(models.transcriber().await),
+            true => Some(loading("transcriber", models.transcriber()).await),
             false => None,
         }
     };
     let classifier = async {
         match end_of_turn {
-            true => Some(models.end_of_turn().await),
+            true => Some(loading("end_of_turn", models.end_of_turn()).await),
             false => None,
         }
     };
@@ -161,4 +166,23 @@ pub(super) struct PendingOutput {
     pub(super) speaker: Option<Arc<dyn Speaker>>,
     pub(super) ready: bool,
     pub(super) serial: u64,
+}
+
+/// Runs one model's load in a `model_load` span, and says how long it took and, if it failed, the code.
+pub(super) async fn loading<T>(
+    slot: &'static str,
+    load: impl Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    async {
+        let start = monotonic_ms();
+        let result = load.await;
+        let duration_ms = monotonic_ms().saturating_sub(start);
+        match &result {
+            Ok(_) => debug!(duration_ms, "model loaded"),
+            Err(code) => warn!(code = redact::code(code), duration_ms, "model load failed"),
+        }
+        result
+    }
+    .instrument(info_span!("model_load", slot))
+    .await
 }
