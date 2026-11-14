@@ -47,7 +47,9 @@ use self::playout::{Command, Playout};
 use self::recovery::{Cause, Reopening, Watch};
 pub use self::shared::{InputPort, SharedNativeAudio};
 use self::tally::Tally;
+use crate::failure::Failure;
 use crate::io::{AudioIo, IoEvent, IoSink};
+use crate::redact;
 
 /// How long a stop fades out, in milliseconds.
 const FADE_MS: u32 = 30;
@@ -374,7 +376,7 @@ fn run(sink: &IoSink, devices: &NativeDevices, input: bool, control: &Control) {
                         callbacks = counts.callbacks,
                         samples = counts.samples,
                         glitches = counts.glitches,
-                        "microphone stream first seconds"
+                        "the microphone stream delivered its first seconds"
                     );
                 }
             }
@@ -433,10 +435,11 @@ fn reopening(
         Cause::Rerouted
     } else if stalled {
         tracing::warn!(
+            error.type = Failure::AudioStreamStalled.code(),
             stream,
             callbacks,
             silent_ms = recovery::STALL.as_millis(),
-            "audio stream stopped calling back; opening it again"
+            "an audio stream stopped calling back; opening it again"
         );
         Cause::Stalled
     } else {
@@ -452,7 +455,7 @@ fn reopened(stream: &str, reopening: &Reopening, now: Instant) {
         cause = reopening.cause.as_str(),
         failures = reopening.failures,
         after_ms = reopening.elapsed_ms(now) as u64,
-        "audio stream opened again"
+        "an audio stream was opened again"
     );
 }
 
@@ -465,15 +468,17 @@ fn retried(stream: &str, reopening: &mut Reopening, code: &str, now: Instant) ->
             cause = reopening.cause.as_str(),
             failures = reopening.failures,
             after_ms = reopening.elapsed_ms(now) as u64,
-            code,
-            "audio stream could not be opened again; giving up"
+            error.type = Failure::AudioStreamReopen.code(),
+            reason = redact::code(code),
+            "an audio stream could not be opened again, so it stays closed"
         );
     } else if reopening.failures == 1 {
         tracing::info!(
             stream,
             cause = reopening.cause.as_str(),
-            code,
-            "audio stream could not be opened again yet; trying again"
+            error.type = Failure::AudioStreamReopen.code(),
+            reason = redact::code(code),
+            "an audio stream could not be opened again yet; trying again"
         );
     }
     again
@@ -548,7 +553,7 @@ impl Microphone {
             rate,
             channels,
             format = %config.sample_format(),
-            "microphone stream opened"
+            "the microphone stream was opened"
         );
         let stream = match config.sample_format() {
             SampleFormat::F32 => listen::<f32>(&input, config.config(), capture_in, &tally, failed),
@@ -739,9 +744,10 @@ fn failure(
         if reopens(error.kind(), chosen.is_some()) {
             if !rerouted.swap(true, Ordering::AcqRel) {
                 tracing::info!(
+                    error.type = Failure::AudioStreamTaken.code(),
                     stream,
                     kind = ?error.kind(),
-                    "audio stream taken away by the system; opening it again"
+                    "the system took an audio stream away; opening it again"
                 );
             }
             return;
@@ -750,7 +756,12 @@ fn failure(
             return;
         }
         told = true;
-        tracing::warn!(stream, kind = ?error.kind(), "audio stream error");
+        tracing::warn!(
+            error.type = Failure::AudioStreamError.code(),
+            stream,
+            kind = ?error.kind(),
+            "an audio stream failed"
+        );
         let lost = error.kind() == ErrorKind::DeviceNotAvailable
             && chosen
                 .as_ref()

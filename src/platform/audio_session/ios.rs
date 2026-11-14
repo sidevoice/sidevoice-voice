@@ -5,6 +5,7 @@ use objc2_avf_audio::{
 use objc2_foundation::NSError;
 
 use super::{AudioSession, SessionConfig, SessionMode};
+use crate::failure::Failure;
 
 /// iOS: `AVAudioSession.sharedInstance()`, the process's one session. The category is play-and-record, whatever the
 /// mode and the options. cpal's Core Audio host sets no category and no mode of its own (it only asks for a buffer
@@ -65,12 +66,16 @@ impl AudioSession for Os {
 fn failed(step: &str, error: Option<&NSError>) -> String {
     match error {
         Some(error) => tracing::warn!(
+            error.type = Failure::AudioSession.code(),
             step,
-            domain = %error.domain(),
-            code = error.code(),
-            "the audio session refused"
+            os_error = error.code(),
+            "the audio session refused a step, so the call cannot use the audio"
         ),
-        None => tracing::warn!(step, "the audio session's category or mode is missing"),
+        None => tracing::warn!(
+            error.type = Failure::AudioSession.code(),
+            step,
+            "the audio session's category or mode is missing, so the call cannot use the audio"
+        ),
     }
     format!("audio-session-{step}-failed")
 }

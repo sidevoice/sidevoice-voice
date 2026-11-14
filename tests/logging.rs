@@ -277,20 +277,24 @@ fn what_a_call_logs_shows_its_operations_and_holds_no_canary() {
     // Positive controls: the sites ran, the lines inside the call's task carry its id, and a code that is not plain
     // words is `invalid`.
     for expected in [
-        "call started",
-        "call stopped",
-        "call state",
-        "turn started",
-        "turn finished",
-        "transcribed",
-        "transcription failed",
-        "synthesized",
-        "synthesis failed",
-        "voice error",
-        "model loaded",
+        "the call started",
+        "the call stopped",
+        "the call state changed",
+        "a turn started",
+        "a turn finished",
+        "a turn was transcribed",
+        "a turn could not be transcribed",
+        "a reply chunk was synthesized",
+        "a reply chunk could not be spoken",
+        "a failure was handed to the app",
+        "a model was loaded",
         "model_load{slot=\"vad\"}",
         "call{call=",
-        "code=\"invalid\"",
+        "error.type=\"voice.transcription-failed\"",
+        "error.type=\"voice.synthesis-failed\"",
+        "transcription{turn=",
+        "synthesis{utterance=",
+        "reason=\"invalid\"",
     ] {
         assert!(log.contains(expected), "{expected} missing from:\n{log}");
     }

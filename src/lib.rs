@@ -17,6 +17,7 @@ mod call;
 mod config;
 mod echo;
 mod event;
+mod failure;
 mod io;
 mod level;
 mod maybe_send;
