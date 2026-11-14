@@ -38,7 +38,8 @@ macro_rules! opaque_debug {
 }
 pub(crate) use opaque_debug;
 
-/// A failure's stable code as a log field: the code itself when it is lowercase words (`[a-z0-9_.-]`, 1 to 64 long),
+/// The app's own code for a failure, as the `app_code` log field: the code itself when it is lowercase words
+/// (`[a-z0-9_.-]`, 1 to 64 long),
 /// else `invalid`. Models are the app's, and a rejection from one can hold whatever its code field was given.
 pub(crate) fn code(code: &str) -> &str {
     let plain =

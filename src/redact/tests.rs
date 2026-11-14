@@ -144,6 +144,9 @@ fn a_code_is_kept_only_when_it_is_lowercase_words() {
     use super::code;
     assert_eq!(code("transcription-failed"), "transcription-failed");
     assert_eq!(code("a.b_c-9"), "a.b_c-9");
+    // Known limit: the grammar cannot tell a code from any other lowercase word, so a name the app's model put in its
+    // code field passes. Restricting it to a list of known codes is the stricter option.
+    assert_eq!(code("canary-user-7f3a"), "canary-user-7f3a");
     for refused in [
         "",
         "Canary words 7f3a",

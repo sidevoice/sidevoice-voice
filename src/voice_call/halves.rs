@@ -9,6 +9,7 @@ use futures_util::future::join3;
 use tracing::{debug, info_span, warn, Instrument};
 
 use crate::config::{InputConfig, OutputConfig};
+use crate::failure::Failure;
 use crate::models::{EndOfTurnModel, InputModels, OutputModels, Speaker, Transcriber, Vad};
 use crate::redact;
 use crate::runtime::monotonic_ms;
@@ -178,8 +179,13 @@ pub(super) async fn loading<T>(
         let result = load.await;
         let duration_ms = monotonic_ms().saturating_sub(start);
         match &result {
-            Ok(_) => debug!(duration_ms, "model loaded"),
-            Err(code) => warn!(code = redact::code(code), duration_ms, "model load failed"),
+            Ok(_) => debug!(duration_ms, "a model was loaded"),
+            Err(code) => warn!(
+                error.type = Failure::ModelLoad.code(),
+                app_code = redact::code(code),
+                duration_ms,
+                "a model could not be loaded, so its half of the call is unavailable"
+            ),
         }
         result
     }

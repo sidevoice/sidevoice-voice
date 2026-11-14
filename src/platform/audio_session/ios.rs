@@ -5,6 +5,7 @@ use objc2_avf_audio::{
 use objc2_foundation::NSError;
 
 use super::{AudioSession, SessionConfig, SessionMode};
+use crate::failure::Failure;
 
 /// iOS: `AVAudioSession.sharedInstance()`, the process's one session. The category is play-and-record, whatever the
 /// mode and the options. cpal's Core Audio host sets no category and no mode of its own (it only asks for a buffer
@@ -60,17 +61,33 @@ impl AudioSession for Os {
     }
 }
 
-/// The stable code of the step that failed; the system's own error (its domain and code, such as `561015905` for
-/// recording that cannot start from the background) goes to the log, never its description.
+/// Logs the failed step with the system's error as a fixed short domain name (`os_error.domain`) and its integer code
+/// (`os_error.code`, such as `561015905` for recording that cannot start from the background), never its description,
+/// and returns the stable code of the step.
 fn failed(step: &str, error: Option<&NSError>) -> String {
     match error {
         Some(error) => tracing::warn!(
+            error.type = Failure::AudioSession.code(),
             step,
-            domain = %error.domain(),
-            code = error.code(),
-            "the audio session refused"
+            os_error.domain = domain(&error.domain().to_string()),
+            os_error.code = error.code(),
+            "the audio session refused a step, so the call cannot use the audio"
         ),
-        None => tracing::warn!(step, "the audio session's category or mode is missing"),
+        None => tracing::warn!(
+            error.type = Failure::AudioSession.code(),
+            step,
+            "the audio session's category or mode is missing, so the call cannot use the audio"
+        ),
     }
     format!("audio-session-{step}-failed")
+}
+
+/// A known system error domain as a short fixed string; any other domain, which could be anything, is `other`.
+fn domain(domain: &str) -> &'static str {
+    match domain {
+        "NSOSStatusErrorDomain" => "os_status",
+        "AVAudioSessionErrorDomain" | "AVFoundationErrorDomain" => "av_audio",
+        "NSCocoaErrorDomain" => "cocoa",
+        _ => "other",
+    }
 }

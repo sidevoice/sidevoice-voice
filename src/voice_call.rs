@@ -30,6 +30,7 @@ use tracing::{debug, info, info_span, warn, Instrument};
 use crate::call::{Call, Effect, Input};
 use crate::config::{CallConfig, EndOfTurn};
 use crate::event::{TurnEvent, VoiceError, VoiceEvent};
+use crate::failure::Failure;
 use crate::io::{AudioIo, IoEvent, IoSink, RenderedMailbox};
 use crate::level::{instant, Level};
 use crate::maybe_send::MaybeSend;
@@ -335,7 +336,10 @@ impl Driver {
                                 self.apply_pending(false);
                                 if self.residency.due(now) {
                                     // Dropping them is what unloads them; the next start loads them again.
-                                    info!(reason = "idle", "models unloaded");
+                                    info!(
+                                        reason = "idle",
+                                        "the idle models were unloaded to free memory"
+                                    );
                                     self.unload();
                                 }
                                 continue;
@@ -810,7 +814,11 @@ impl Driver {
         if self.input.is_none() {
             return;
         }
-        debug!(code = redact::code(&code), "input lost");
+        debug!(
+            error.type = Failure::InputLost.code(),
+            app_code = redact::code(&code),
+            "the microphone was lost, so the call loses its input"
+        );
         if self.output.is_none() {
             self.end_take();
             self.reset_playback();
@@ -926,7 +934,7 @@ impl Driver {
         }
         // The call listens once the microphone and the speaker say they work (`IoEvent::Ready`).
         self.running = true;
-        info!("call started");
+        info!("the call started");
         self.opening = true;
     }
 
@@ -935,7 +943,7 @@ impl Driver {
         if !self.running {
             return;
         }
-        info!("call stopped");
+        info!("the call stopped");
         self.end_take();
         self.reset_playback();
         self.generation = self.generation.wrapping_add(1);
@@ -1069,21 +1077,26 @@ impl Driver {
                     let Some(loaded) = loaded else { continue };
                     let transcriber = Arc::clone(&loaded.transcriber);
                     let messages = self.messages.clone();
-                    self.track(async move {
-                        let (start, samples) = (monotonic_ms(), pcm.len());
-                        let result = transcriber.transcribe(pcm, RATE, language).await;
-                        let duration_ms = monotonic_ms().saturating_sub(start);
-                        match &result {
-                            Ok(_) => debug!(samples, duration_ms, "transcribed"),
-                            Err(code) => {
-                                warn!(
-                                    code = redact::code(code),
-                                    samples, duration_ms, "transcription failed"
-                                )
+                    let span = info_span!("transcription", turn);
+                    self.track(
+                        async move {
+                            let (start, samples) = (monotonic_ms(), pcm.len());
+                            let result = transcriber.transcribe(pcm, RATE, language).await;
+                            let duration_ms = monotonic_ms().saturating_sub(start);
+                            match &result {
+                                Ok(_) => debug!(samples, duration_ms, "a turn was transcribed"),
+                                Err(code) => warn!(
+                                    error.type = Failure::Transcription.code(),
+                                    app_code = redact::code(code),
+                                    samples,
+                                    duration_ms,
+                                    "a turn could not be transcribed, so it gets no text"
+                                ),
                             }
+                            let _ = messages.unbounded_send(Message::Transcribed { turn, result });
                         }
-                        let _ = messages.unbounded_send(Message::Transcribed { turn, result });
-                    });
+                        .instrument(span),
+                    );
                 }
                 Effect::Synthesize {
                     utterance,
@@ -1099,25 +1112,29 @@ impl Driver {
                     let messages = self.messages.clone();
                     let (voice, speed) = (output.voice.clone(), output.speed);
                     let language = language.or_else(|| self.config.say_language());
-                    self.track(async move {
-                        let start = monotonic_ms();
-                        let result = speaker.speak(text, voice, language, speed).await;
-                        let duration_ms = monotonic_ms().saturating_sub(start);
-                        match &result {
-                            Ok(_) => debug!(chunk, duration_ms, "synthesized"),
-                            Err(code) => {
-                                warn!(
-                                    code = redact::code(code),
-                                    chunk, duration_ms, "synthesis failed"
-                                )
+                    let span = info_span!("synthesis", utterance = utterance.as_str(), chunk);
+                    self.track(
+                        async move {
+                            let start = monotonic_ms();
+                            let result = speaker.speak(text, voice, language, speed).await;
+                            let duration_ms = monotonic_ms().saturating_sub(start);
+                            match &result {
+                                Ok(_) => debug!(duration_ms, "a reply chunk was synthesized"),
+                                Err(code) => warn!(
+                                    error.type = Failure::Synthesis.code(),
+                                    app_code = redact::code(code),
+                                    duration_ms,
+                                    "a reply chunk could not be spoken, so the reply is cut short"
+                                ),
                             }
+                            let _ = messages.unbounded_send(Message::Synthesized {
+                                utterance,
+                                chunk,
+                                result,
+                            });
                         }
-                        let _ = messages.unbounded_send(Message::Synthesized {
-                            utterance,
-                            chunk,
-                            result,
-                        });
-                    });
+                        .instrument(span),
+                    );
                 }
                 Effect::Play {
                     utterance,
@@ -1179,10 +1196,10 @@ fn log_event(event: &VoiceEvent) {
             recognising = state.recognising,
             playback = ?state.playback,
             microphone = ?state.microphone,
-            "call state"
+            "the call state changed"
         ),
         VoiceEvent::Turn(TurnEvent::Started { turn_id, .. }) => {
-            info!(turn = turn_id.as_str(), "turn started")
+            info!(turn = turn_id.as_str(), "a turn started")
         }
         VoiceEvent::Turn(TurnEvent::Finished {
             turn_id,
@@ -1194,12 +1211,16 @@ fn log_event(event: &VoiceEvent) {
             merged,
             audio_ms = timings.audio_ms,
             recognition_ms = timings.recognition_ms,
-            "turn finished"
+            "a turn finished"
         ),
         VoiceEvent::Turn(TurnEvent::Cancelled { turn_id, merged }) => {
-            info!(turn = turn_id.as_str(), merged, "turn cancelled")
+            info!(turn = turn_id.as_str(), merged, "a turn was cancelled")
         }
-        VoiceEvent::Error(error) => debug!(code = redact::code(&error.code), "voice error"),
+        VoiceEvent::Error(error) => debug!(
+            error.type = Failure::Reported.code(),
+            app_code = redact::code(&error.code),
+            "a failure was handed to the app"
+        ),
         _ => {}
     }
 }
