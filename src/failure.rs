@@ -32,7 +32,7 @@ pub(crate) enum Failure {
     #[cfg(native)]
     AudioStreamReopen,
     /// The iOS audio session refused a step.
-    #[cfg(target_os = "ios")]
+    #[allow(dead_code, reason = "only the iOS platform module raises it")]
     AudioSession,
 }
 
@@ -53,7 +53,6 @@ impl Failure {
         Self::AudioStreamError,
         #[cfg(native)]
         Self::AudioStreamReopen,
-        #[cfg(target_os = "ios")]
         Self::AudioSession,
     ];
 
@@ -73,7 +72,6 @@ impl Failure {
             Self::AudioStreamError => "voice.audio-stream-error",
             #[cfg(native)]
             Self::AudioStreamReopen => "voice.audio-stream-reopen-failed",
-            #[cfg(target_os = "ios")]
             Self::AudioSession => "voice.audio-session-refused",
         }
     }
